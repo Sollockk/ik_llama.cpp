@@ -938,6 +938,16 @@ static generation_result run_moe_combination_generation(
     int     n_unique_experts_total = 0;
     int     n_expert_slots_total   = 0; // n_layers * n_expert for comparison
 
+    // Per-layer work descriptor for batch expert query + selective prefetch.
+    // Defined outside the loop to reuse the vector allocation across iterations.
+    struct layer_work {
+        int     layer_idx;
+        int32_t n_experts;               // >0 = MoE, 0 = dense/unreached
+        std::vector<int32_t> expert_ids; // populated only when n_experts > 0
+    };
+    std::vector<layer_work> work_items;
+    work_items.reserve(n_layers);
+
     const auto t_start = ggml_time_us();
 
     while (n_cur < (int)prompt_tokens.size() + n_predict) {
@@ -1030,49 +1040,58 @@ static generation_result run_moe_combination_generation(
         // ================================================================
         n_verify_batches++;
 
-        // Apply combination expert sharpening per layer, using the exact
-        // expert IDs recorded by the router hooks.
-        //
-        // Lookahead prefetch: issue madvise(WILLNEED) for layers ahead of
-        // the current apply position.  This gives the kernel time to bring
-        // mmap pages into the page cache (from disk, swap, or RAM cache)
-        // before we actually need them, avoiding synchronous page-fault
-        // stalls.  Works for all memory tiers: mmap (disk), RAM cache
-        // (swap-backed anonymous pages), and GPU (source data still comes
-        // from mmap/cache before PCIe DMA).
+        // ---- Phase 2a: Batch expert query ----
+        // Collect all expert sets upfront so we know exactly which layers
+        // need sharpening and can prefetch selectively.  This avoids
+        // issuing WILLNEED for layers we'll never touch.
+        work_items.clear();
+
+        for (int il = 0; il < n_layers; ++il) {
+            layer_work w;
+            w.layer_idx = il;
+            w.n_experts = llama_router_get_layer_experts(ctx, il, nullptr, 0);
+            if (w.n_experts > 0) {
+                w.expert_ids.resize(w.n_experts);
+                llama_router_get_layer_experts(ctx, il, w.expert_ids.data(), w.n_experts);
+            }
+            work_items.push_back(std::move(w));
+        }
+
+        // ---- Phase 2b: Apply with selective lookahead prefetch ----
+        // Only prefetch layers that will actually be sharpened.  The
+        // prefetch pipeline gives the kernel lead time to bring mmap
+        // pages into the page cache (from disk, swap, or RAM cache)
+        // before we need them.  Works for all memory tiers: mmap (disk),
+        // RAM cache (swap-backed), and GPU (source data comes from
+        // mmap/cache before PCIe DMA to VRAM).
         constexpr int PREFETCH_LOOKAHEAD = 4;
+        const int n_work = (int)work_items.size();
 
         // Seed the prefetch pipeline
-        for (int il = 0; il < std::min(PREFETCH_LOOKAHEAD, n_layers); ++il) {
-            llama_blurry_sharp_prefetch_layer(bsctx, il);
+        for (int i = 0; i < std::min(PREFETCH_LOOKAHEAD, n_work); ++i) {
+            llama_blurry_sharp_prefetch_layer(bsctx, work_items[i].layer_idx);
         }
 
         int n_sharpened = 0;
-        for (int il = 0; il < n_layers; ++il) {
+        for (int i = 0; i < n_work; ++i) {
             // Prefetch the next layer in the pipeline (non-blocking)
-            if (il + PREFETCH_LOOKAHEAD < n_layers) {
-                llama_blurry_sharp_prefetch_layer(bsctx, il + PREFETCH_LOOKAHEAD);
+            if (i + PREFETCH_LOOKAHEAD < n_work) {
+                llama_blurry_sharp_prefetch_layer(bsctx, work_items[i + PREFETCH_LOOKAHEAD].layer_idx);
             }
 
-            // Query how many unique experts this layer used during drafting
-            int32_t n_layer_experts = llama_router_get_layer_experts(ctx, il, nullptr, 0);
+            const auto & w = work_items[i];
 
-            if (n_layer_experts > 0) {
-                // Retrieve the exact expert IDs (sorted ascending)
-                std::vector<int32_t> expert_set(n_layer_experts);
-                llama_router_get_layer_experts(ctx, il, expert_set.data(), n_layer_experts);
-
+            if (w.n_experts > 0) {
                 int32_t ret = llama_blurry_sharp_apply_experts(
-                    bsctx, il, expert_set.data(), n_layer_experts);
+                    bsctx, w.layer_idx, w.expert_ids.data(), w.n_experts);
                 if (ret == 0) {
                     ++n_sharpened;
                 }
-
-                n_unique_experts_total += n_layer_experts;
+                n_unique_experts_total += w.n_experts;
             } else {
                 // Dense layer (no MoE routing) or layer not reached during draft.
                 // Sharpen the full layer.
-                if (llama_blurry_sharp_apply_layer(bsctx, il) == 0) {
+                if (llama_blurry_sharp_apply_layer(bsctx, w.layer_idx) == 0) {
                     ++n_sharpened;
                 }
                 n_unique_experts_total += n_expert;
