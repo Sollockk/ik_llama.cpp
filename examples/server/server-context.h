@@ -2,6 +2,7 @@
 #include "server-queue.h"
 #include "speculative.h"
 #include "json-schema-to-grammar.h"
+#include "llama.h"
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
@@ -230,6 +231,14 @@ struct server_context {
     llama_model* model_draft = nullptr;
     llama_context* ctx_draft = nullptr;
     llama_context_params cparams_dft;
+
+    // Blurry-sharp overlay
+    // When --sharp is provided, this context manages the overlay of high-quality
+    // weights onto the loaded (blurry) model.  In static mode the sharp weights
+    // are applied once at startup.  In MoE combination mode (--bs-moe-combination)
+    // expert-selective sharpening happens per-decode step (requires -np 1).
+    llama_blurry_sharp_context * bsctx = nullptr;
+    bool bs_moe_dynamic = false;  // true when MoE combination mode is active
 
     int32_t n_ctx; // total context for all clients / slots
 

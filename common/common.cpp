@@ -2160,6 +2160,159 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
 
+    // blurry-sharp overlay arguments
+    if (arg == "-ms" || arg == "--sharp" || arg == "--sharp-model") {
+        CHECK_ARG
+        params.sharp_model = argv[i];
+        return true;
+    }
+    if (arg == "--bs-router" || arg == "--router") {
+        CHECK_ARG
+        std::string strat = argv[i];
+        if (strat == "always")      params.bs_router_strategy = 0;
+        else if (strat == "never")  params.bs_router_strategy = 1;
+        else if (strat == "norm")   params.bs_router_strategy = 2;
+        else { invalid_param = true; }
+        return true;
+    }
+    if (arg == "--bs-confidence" || arg == "--confidence") {
+        CHECK_ARG
+        params.bs_router_confidence = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-max-sharp-layers" || arg == "--max-sharp-layers") {
+        CHECK_ARG
+        params.bs_max_sharp_layers = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-memory-budget-mb" || arg == "--memory-budget-mb") {
+        CHECK_ARG
+        params.bs_memory_budget_mb = std::stoll(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-gpu-budget-mb" || arg == "--gpu-budget-mb") {
+        CHECK_ARG
+        params.bs_gpu_budget_mb = std::stoll(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-no-restore" || arg == "--no-restore") {
+        params.bs_restore_after_fwd = false;
+        return true;
+    }
+    if (arg == "--bs-verbose" || arg == "--verbose-overlay") {
+        params.bs_verbose = true;
+        return true;
+    }
+    if (arg == "--bs-no-mmap") {
+        params.bs_use_mmap = false;
+        return true;
+    }
+    if (arg == "--bs-precache-ram" || arg == "--precache-ram") {
+        params.bs_precache_ram = true;
+        return true;
+    }
+    if (arg == "--bs-stage-swap" || arg == "--stage-swap") {
+        params.bs_stage_swap = true;
+        return true;
+    }
+    if (arg == "--bs-lazy-swap" || arg == "--lazy-swap") {
+        params.bs_lazy_swap = true;
+        return true;
+    }
+    if (arg == "--bs-compare" || arg == "--compare") {
+        params.bs_compare = true;
+        return true;
+    }
+    if (arg == "--bs-dynamic" || arg == "--dynamic") {
+        params.bs_dynamic = true;
+        return true;
+    }
+    if (arg == "--bs-entropy-threshold" || arg == "--entropy-threshold") {
+        CHECK_ARG
+        params.bs_entropy_threshold = std::stof(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-dynamic-top-k" || arg == "--dynamic-top-k") {
+        CHECK_ARG
+        params.bs_dynamic_top_k = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-allow-layers" || arg == "--allow-layers") {
+        CHECK_ARG
+        // parse comma-separated int list
+        params.bs_layer_allowlist.clear();
+        std::string s(argv[i]);
+        size_t pos = 0;
+        while (pos < s.size()) {
+            size_t next = s.find(',', pos);
+            if (next == std::string::npos) next = s.size();
+            std::string tok = s.substr(pos, next - pos);
+            if (!tok.empty()) {
+                params.bs_layer_allowlist.push_back(std::stoi(tok));
+            }
+            pos = next + 1;
+        }
+        return true;
+    }
+    if (arg == "--bs-probe-interval" || arg == "--probe-interval") {
+        CHECK_ARG
+        params.bs_probe_interval = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-probe-hold" || arg == "--probe-hold") {
+        CHECK_ARG
+        params.bs_probe_hold = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-speculative" || arg == "--speculative-sharp") {
+        params.bs_speculative = true;
+        return true;
+    }
+    if (arg == "--bs-spec-draft" || arg == "--spec-draft") {
+        CHECK_ARG
+        params.bs_spec_draft = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-retain-buffers" || arg == "--retain-buffers") {
+        params.bs_retain_buffers = true;
+        return true;
+    }
+    if (arg == "--bs-combined") {
+        params.bs_combined = true;
+        return true;
+    }
+    if (arg == "--bs-combined-probe-stride") {
+        CHECK_ARG
+        params.bs_combined_probe_stride = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-moe-combination" || arg == "--bs-moe") {
+        params.bs_moe_combination = true;
+        return true;
+    }
+    if (arg == "--bs-moe-top-k") {
+        CHECK_ARG
+        params.bs_moe_top_k_override = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-deny-layers" || arg == "--deny-layers") {
+        CHECK_ARG
+        // parse comma-separated int list
+        params.bs_layer_denylist.clear();
+        std::string s(argv[i]);
+        size_t pos = 0;
+        while (pos < s.size()) {
+            size_t next = s.find(',', pos);
+            if (next == std::string::npos) next = s.size();
+            std::string tok = s.substr(pos, next - pos);
+            if (!tok.empty()) {
+                params.bs_layer_denylist.push_back(std::stoi(tok));
+            }
+            pos = next + 1;
+        }
+        return true;
+    }
+
 #ifndef LOG_DISABLE_LOGS
     // Parse args for logging parameters
     if (log_param_single_parse(argv[i])) {
@@ -2519,6 +2672,56 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*", "--spec-ngram-size-m N", "ngram size M for ngram-simple/ngram-map speculative decoding, length of draft m-gram (default: %d)\n", params.speculative.ngram_size_m });
 
     options.push_back({ "*", "--spec-ngram-min-hits N", "minimum hits for ngram-map speculative decoding (default: %d)\n", params.speculative.ngram_min_hits });
+
+    options.push_back({ "blurry-sharp overlay" });
+    options.push_back({ "*",           "-ms,   --sharp FILE",           "path to sharp (high-quality) GGUF model for overlay" });
+    options.push_back({ "*",           "       --bs-router STRATEGY",   "overlay router: always|never|norm (default: always)" });
+    options.push_back({ "*",           "       --bs-confidence FLOAT",  "min confidence for norm router (default: %.1f)", (double)params.bs_router_confidence });
+    options.push_back({ "*",           "       --bs-max-sharp-layers N","max simultaneously sharpened layers, 0=unlimited (default: %d)", params.bs_max_sharp_layers });
+    options.push_back({ "*",           "       --bs-memory-budget-mb N","memory budget in MiB for backups, 0=unlimited (default: %" PRId64 ")", params.bs_memory_budget_mb });
+    options.push_back({ "*",           "       --bs-gpu-budget-mb N",  "max GPU MiB for sharp device buffers, 0=unlimited (default: %" PRId64 ")\n"
+                                                                        "when exceeded, device tensors are skipped (CPU tensors still use zero-copy mmap)", params.bs_gpu_budget_mb });
+    options.push_back({ "*",           "       --bs-no-restore",        "keep sharp weights between layers (default: restore)" });
+    options.push_back({ "*",           "       --bs-verbose",           "verbose overlay logging" });
+    options.push_back({ "*",           "       --bs-no-mmap",           "disable mmap for sharp file (default: mmap enabled)" });
+    options.push_back({ "*",           "       --bs-precache-ram",      "pre-read sharp data into anonymous heap memory (swap-backed).\n"
+                                                                        "under memory pressure, anonymous pages go to SWAP (fast SSD)\n"
+                                                                        "instead of being dropped like file-backed mmap pages.\n"
+                                                                        "enables memory tier: VRAM > RAM > Swap > Disk" });
+    options.push_back({ "*",           "       --bs-stage-swap",        "after precache, proactively move sharp data to swap via\n"
+                                                                        "MADV_PAGEOUT (Linux 5.4+), freeing RAM for blurry model/KV cache.\n"
+                                                                        "sharp data stays quickly accessible via swap-in from SSD.\n"
+                                                                        "implies --bs-precache-ram" });
+    options.push_back({ "*",           "       --bs-compare",           "run blurry-only then blurry+sharp and compare" });
+    options.push_back({ "*",           "       --bs-dynamic",           "per-token entropy-based dynamic sharpening" });
+    options.push_back({ "*",           "       --bs-entropy-threshold FLOAT",
+                                                                        "logit entropy above this triggers sharpening (default: %.1f)", (double)params.bs_entropy_threshold });
+    options.push_back({ "*",           "       --bs-dynamic-top-k N",  "number of layers to sharpen when uncertain (default: %d)", params.bs_dynamic_top_k });
+    options.push_back({ "*",           "       --bs-allow-layers L1,L2,...",
+                                                                        "only sharpen these layers (default: all)" });
+    options.push_back({ "*",           "       --bs-deny-layers L1,L2,...",
+                                                                        "never sharpen these layers (default: none)" });
+    options.push_back({ "*",           "       --bs-probe-interval N",  "every N tokens, probe with sharp model to check blurry quality (default: %d, 0=disabled)\n"
+                                                                        "when sharp disagrees, stays sharp for --bs-probe-hold tokens", params.bs_probe_interval });
+    options.push_back({ "*",           "       --bs-probe-hold N",      "after probe disagreement, stay sharp for N tokens (default: %d)", params.bs_probe_hold });
+    options.push_back({ "*",           "       --bs-speculative",       "speculative verification: draft with blurry, verify with sharp\n"
+                                                                        "accepts longest agreeing prefix, takes sharp token at divergence" });
+    options.push_back({ "*",           "       --bs-spec-draft N",      "number of draft (blurry) tokens per speculative batch (default: %d)", params.bs_spec_draft });
+    options.push_back({ "*",           "       --bs-retain-buffers",    "keep sharp GPU buffers across restore cycles (faster re-sharpen)\n"
+                                                                        "uses persistent VRAM but eliminates cudaMalloc/Free churn\n"
+                                                                        "recommended for combined/speculative/probe modes" });
+    options.push_back({ "*",           "       --bs-combined",          "combined adaptive mode: entropy + probing + speculative verification\n"
+                                                                        "drafts up to --bs-spec-draft tokens, adaptively shortens draft via\n"
+                                                                        "entropy monitoring and periodic sharp probes, then verifies with sharp.\n"
+                                                                        "Result: sharp-level quality at a fraction of the compute cost" });
+    options.push_back({ "*",           "       --bs-combined-probe-stride N",
+                                                                        "within a draft, probe with sharp every N tokens to detect errors early (default: %d)", params.bs_combined_probe_stride });
+    options.push_back({ "*",           "       --bs-moe-combination",   "MoE combination expert mode: for MoE models, only sharpen the\n"
+                                                                        "experts activated by the router instead of all experts in a layer.\n"
+                                                                        "Creates 'combination tensors' that are mostly blurry with selected\n"
+                                                                        "expert slices replaced by sharp data. Reduces I/O by n_expert/n_used" });
+    options.push_back({ "*",           "       --bs-moe-top-k N",       "override the number of active experts per token for MoE combination\n"
+                                                                        "mode (default: 0 = use model's n_expert_used)" });
 
     options.push_back({ "retrieval" });
     options.push_back({ "retrieval",   "       --context-file FNAME",   "file to load context from (repeat to specify multiple files)" });

@@ -57,6 +57,8 @@ add_library(llama
             llama-hparams.cpp
             llama-delta-net.h
             llama-delta-net.cpp
+            llama-blurry-sharp.h
+            llama-blurry-sharp.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp

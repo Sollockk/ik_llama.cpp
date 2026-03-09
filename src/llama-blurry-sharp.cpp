@@ -1,0 +1,4417 @@
+//
+// Blurry→Sharp overlay engine for ik_llama.cpp / GGUF
+//
+// See llama-blurry-sharp.h for the design overview.
+//
+
+#include "llama-blurry-sharp.h"
+#include "llama-model.h"
+#include "llama-model-loader.h"
+#include "llama-impl.h"
+
+#include "ggml.h"
+#include "ggml-backend.h"
+
+#ifdef GGML_USE_CUDA
+#  include "ggml-cuda.h"
+#endif
+
+// madvise for mmap page lifecycle management (Linux / macOS / POSIX)
+// Used for MADV_DONTNEED (release consumed pages), MADV_SEQUENTIAL (readahead hint)
+#ifndef _WIN32
+#  include <sys/mman.h>
+#  include <unistd.h>   // sysconf(_SC_PAGESIZE)
+#endif
+
+#include <algorithm>
+#include <cassert>
+#include <cinttypes>
+#include <cmath>
+#include <cstring>
+#include <numeric>
+#include <regex>
+#include <set>
+
+// ---------------------------------------------------------------------------
+// Helpers (file-local)
+// ---------------------------------------------------------------------------
+
+static int64_t bs_time_us() {
+    return ggml_time_us();
+}
+
+// ---------------------------------------------------------------------------
+// Device synchronization before GPU buffer eviction
+//
+// In JIT mode, CUDA kernels from a previous layer may still be executing
+// asynchronously when we try to evict cached device buffers to make room
+// for the next layer's sharp data.  Freeing a GPU buffer while a kernel
+// is still reading from it causes "CUDA error: an illegal memory access".
+//
+// This helper synchronizes the GPU device to ensure all pending kernels
+// have completed before we free any cached buffers.  It's only called
+// when we're about to evict — not on every apply — so the overhead is
+// limited to eviction situations (which already involve GPU alloc/free).
+//
+// Uses ggml_backend_cuda_device_synchronize() (declared in ggml-cuda.h,
+// implemented in ggml-cuda.cu) which wraps cudaDeviceSynchronize().
+// This avoids including <cuda_runtime.h> in this .cpp translation unit
+// while still performing a full device barrier across ALL CUDA streams.
+// ---------------------------------------------------------------------------
+static void bs_sync_device_before_eviction(
+        [[maybe_unused]] const llama_blurry_sharp_context * bsctx) {
+#ifdef GGML_USE_CUDA
+    int gpu = 0;
+    if (bsctx && bsctx->model) {
+        gpu = bsctx->model->main_gpu;
+    }
+    ggml_backend_cuda_device_synchronize(gpu);
+#endif
+}
+
+// Check whether a tensor name corresponds to a merged expert tensor.
+// Merged expert tensors have names like:
+//   blk.N.ffn_gate_exps, blk.N.ffn_up_exps, blk.N.ffn_down_exps
+//   blk.N.ffn_norm_exps
+// These are 3D tensors where ne[2] = n_expert.
+static bool bs_is_expert_tensor(const std::string & name) {
+    // Match tensor names ending with "_exps" (the merged expert format)
+    // but NOT "_shexp" (shared expert) or "_inp" (gate input)
+    if (name.find("ffn_gate_exps") != std::string::npos) return true;
+    if (name.find("ffn_up_exps")   != std::string::npos) return true;
+    if (name.find("ffn_down_exps") != std::string::npos) return true;
+    if (name.find("ffn_norm_exps") != std::string::npos) return true;
+    return false;
+}
+
+// Extract layer index from a GGUF tensor name.
+// Handles patterns like "blk.3.attn_norm.weight" or "layers.12.ffn_up.weight".
+int llama_blurry_sharp_extract_layer_idx(const std::string & name) {
+    // pattern: blk.<N>.  or  layers.<N>.
+    static const std::regex re_blk(R"(blk\.(\d+)\.)");
+    static const std::regex re_layers(R"(layers\.(\d+)\.)");
+    std::smatch m;
+    if (std::regex_search(name, m, re_blk)) {
+        return std::stoi(m[1].str());
+    }
+    if (std::regex_search(name, m, re_layers)) {
+        return std::stoi(m[1].str());
+    }
+    return -1;
+}
+
+// Check shape compatibility.
+//
+// We require a per-dimension match, not just the same total element count.
+// Two tensors with the same number of elements but different shapes (e.g.
+// [4096, 4096, 1, 1] vs [16384, 1024, 1, 1]) have incompatible memory
+// layouts for quantized types — quantization blocks are organized row-by-row,
+// so the kernel would read the data with wrong row boundaries, producing
+// garbage or NaN.  A total-element-only check would silently accept tensors
+// from a completely different model architecture that happen to share a
+// tensor name and parameter count.
+bool llama_blurry_sharp_shapes_compatible(
+        const ggml_tensor           * blurry_tensor,
+        const blurry_sharp_tensor_info & sharp_info) {
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (blurry_tensor->ne[d] != sharp_info.ne[d]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Find a tensor in the base model by name.
+// NOTE: This is O(n) in the number of model tensors.  Hot paths should use
+// the cached blurry_sharp_tensor_info::base_tensor pointer instead.
+static ggml_tensor * bs_find_model_tensor(llama_model * model, const char * name) {
+    for (auto & kv : model->tensors_by_name) {
+        if (kv.first == name) {
+            return kv.second;
+        }
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Per-layer mmap prefetch for selective sharpening
+//
+// Instead of prefetching the entire 60+ GiB sharp model (which would evict
+// the blurry model from RAM), we prefetch only the specific layer's data
+// ranges right before apply_layer processes them.  This gives the kernel a
+// head start on reading ~1-2 GiB of data per layer from disk, while the
+// MADV_DONTNEED calls in bs_read_to_staging / bs_read_sharp_tensor release
+// each tensor's pages immediately after consumption.
+//
+// Net effect: RAM usage stays bounded to roughly one layer's worth of sharp
+// data at a time, regardless of how many layers are sharpened.
+// ---------------------------------------------------------------------------
+static void bs_prefetch_layer_mmap(
+        llama_blurry_sharp_context * bsctx,
+        int                          layer_idx) {
+#ifndef _WIN32
+    auto lt_it = bsctx->layer_tensor_names.find(layer_idx);
+    if (lt_it == bsctx->layer_tensor_names.end()) return;
+
+    for (const auto & tensor_name : lt_it->second) {
+        auto info_it = bsctx->sharp_index.find(tensor_name);
+        if (info_it == bsctx->sharp_index.end()) continue;
+        const auto & si = info_it->second;
+
+        int split = si.split_idx;
+        if (split < 0 || split >= (int)bsctx->sharp_mmaps.size()) continue;
+        if (!bsctx->sharp_mmaps[split]) continue;
+
+        const uint8_t * base = (const uint8_t *)bsctx->sharp_mmaps[split]->addr();
+        size_t file_size = bsctx->sharp_mmaps[split]->size();
+        size_t end = si.file_offset + si.nbytes;
+        if (end > file_size) end = file_size;
+        if (si.file_offset >= end) continue;
+
+        posix_madvise((void *)(base + si.file_offset), end - si.file_offset,
+                      POSIX_MADV_WILLNEED);
+    }
+#else
+    GGML_UNUSED(bsctx);
+    GGML_UNUSED(layer_idx);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Memory-tier helpers: GPU > RAM > Swap > Disk
+//
+// The sharp model can be 60+ GiB.  There are two pathologies to avoid:
+//
+//   1. MMAP BLOAT: Reading via mmap fills the page cache with file-backed
+//      sharp pages, evicting the blurry model (and everything else) into
+//      swap.  Every subsequent access then hits disk through swap — slow.
+//
+//   2. MMAP DROP: Calling MADV_DONTNEED on file-backed pages simply drops
+//      them — they must be re-faulted from the GGUF file on disk, which
+//      can be extremely slow for random access on HDDs or network storage.
+//
+// Strategy (with RAM cache enabled):
+//   - Pre-read sharp tensor data into anonymous heap buffers at init time.
+//   - Anonymous pages go to SWAP under pressure (not dropped entirely).
+//   - Re-access from swap (SSD) is 10-50x faster than from GGUF on disk.
+//   - Still release file-backed mmap pages after copying to avoid bloat.
+//   - Use MADV_PAGEOUT to proactively stage anonymous pages to swap,
+//     freeing RAM for active data (blurry model, KV cache).
+//
+// Strategy (without RAM cache — legacy behavior):
+//   - Release mmap pages with MADV_DONTNEED after consumption.
+//   - Keeps RSS bounded but re-access requires full disk I/O.
+// ---------------------------------------------------------------------------
+
+// Release file-backed mmap pages back to the OS.
+// For clean (unmodified) file-backed pages this simply drops them from the
+// page cache — no swap I/O, no data loss.  Next access re-faults from the
+// backing file.  Safe to call on any address; silently ignored if the range
+// isn't a valid mapping.
+static void bs_release_mmap_pages(const void * addr, size_t len) {
+#ifdef __linux__
+    if (!addr || len == 0) return;
+    static const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    uintptr_t start = (uintptr_t)addr & ~(uintptr_t)(page_size - 1);
+    uintptr_t end   = ((uintptr_t)addr + len + page_size - 1)
+                    & ~(uintptr_t)(page_size - 1);
+    madvise((void *)start, end - start, MADV_DONTNEED);
+#elif defined(__APPLE__)
+    if (!addr || len == 0) return;
+    madvise((void *)addr, len, MADV_DONTNEED);
+#else
+    GGML_UNUSED(addr);
+    GGML_UNUSED(len);
+#endif
+}
+
+// Compute the byte size of a tensor with the given type and shape.
+static size_t bs_tensor_nbytes(ggml_type type, const int64_t ne[GGML_MAX_DIMS]) {
+    // ggml row_size already handles quantized block sizes
+    int64_t nrows = 1;
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        nrows *= ne[d];
+    }
+    return ggml_row_size(type, ne[0]) * (size_t)nrows;
+}
+
+// Compute the number of elements from a shape array.
+static int64_t bs_nelements(const int64_t ne[GGML_MAX_DIMS]) {
+    int64_t n = 1;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        n *= ne[d];
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: detect CUDA split buffers and obtain a usable (regular) buffer type.
+//
+// In ik_llama.cpp, GPU-offloaded weight tensors are typically placed in a
+// "split buffer" designed for multi-GPU tensor parallelism.  Split buffers
+// have fundamentally different semantics from regular CUDA buffers:
+//
+//   - alloc_buffer()  → allocates NO device memory (just a context object)
+//   - get_base()      → returns 0x1000 (a dummy, never-dereference pointer)
+//   - clear()         → NO-OP
+//   - set_tensor()    → writes to the ORIGINAL device memory via tensor->extra
+//
+// If the overlay naively uses the split buffer type, tensor->data ends up as
+// 0x1000 (invalid) and the CUDA compute kernel reads garbage → all NaN.
+//
+// This helper detects split buffers by name and returns the regular CUDA
+// buffer type for the model's main GPU instead.
+// ---------------------------------------------------------------------------
+static ggml_backend_buffer_type_t bs_get_device_buft(
+        const llama_blurry_sharp_context * bsctx,
+        ggml_backend_buffer_t              original_buffer) {
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(original_buffer);
+
+#ifdef GGML_USE_CUDA
+    // Check if this is a split buffer by examining its name.
+    // Split buffer names contain "_Split" (e.g. "CUDA_Split").
+    const char * buf_name = ggml_backend_buffer_name(original_buffer);
+    if (buf_name && strstr(buf_name, "Split")) {
+        int gpu = 0;
+        if (bsctx->model) {
+            gpu = bsctx->model->main_gpu;
+        }
+        ggml_backend_buffer_type_t regular_buft = ggml_backend_cuda_buffer_type(gpu);
+        if (regular_buft) {
+            buft = regular_buft;
+        }
+    }
+#else
+    GGML_UNUSED(bsctx);
+#endif
+
+    return buft;
+}
+
+// Read tensor data from the appropriate sharp split file (via RAM cache, mmap, or file read).
+static bool bs_read_sharp_tensor(
+        llama_blurry_sharp_context * bsctx,
+        const blurry_sharp_tensor_info & info,
+        std::vector<uint8_t> & dest) {
+    dest.resize(info.nbytes);
+
+    // Fast path: RAM cache hit — data is in anonymous heap memory (swap-backed).
+    // This avoids mmap page faults and file I/O entirely.  If the pages were
+    // swapped out by the OS, swap-in from SSD is much faster than re-reading
+    // from the GGUF file.
+    if (bsctx->ram_cache_populated) {
+        auto cache_it = bsctx->ram_cache.find(info.name);
+        if (cache_it != bsctx->ram_cache.end() && cache_it->second.size() >= info.nbytes) {
+            std::memcpy(dest.data(), cache_it->second.data(), info.nbytes);
+            return true;
+        }
+    }
+
+    int si = info.split_idx;
+
+    // Bounds-check the split index
+    if (si < 0 || si >= (int)bsctx->sharp_files.size() || !bsctx->sharp_files[si]) {
+        LLAMA_LOG_ERROR("%s: no file handle for split %d (tensor '%s')\n",
+                       __func__, si, info.name.c_str());
+        return false;
+    }
+
+    // Try mmap first, fall back to file read
+    if (si < (int)bsctx->sharp_mmaps.size() && bsctx->sharp_mmaps[si]) {
+        const uint8_t * base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+        if (info.file_offset + info.nbytes > bsctx->sharp_mmaps[si]->size()) {
+            LLAMA_LOG_ERROR("%s: mmap read out of bounds for tensor '%s' "
+                           "(split=%d, offset=%zu, nbytes=%zu, file_size=%zu)\n",
+                           __func__, info.name.c_str(), si,
+                           info.file_offset, info.nbytes,
+                           bsctx->sharp_mmaps[si]->size());
+            return false;
+        }
+        std::memcpy(dest.data(), base + info.file_offset, info.nbytes);
+        // Data is now in `dest` — release the mmap pages so they don't
+        // accumulate in the page cache and push other data into swap.
+        bs_release_mmap_pages(base + info.file_offset, info.nbytes);
+    } else {
+        bsctx->sharp_files[si]->seek(info.file_offset, SEEK_SET);
+        bsctx->sharp_files[si]->read_raw(dest.data(), info.nbytes);
+    }
+    return true;
+}
+
+// Read sharp tensor data directly into a staging buffer suitable for GPU upload.
+// When RAM cache or mmap + pinned staging are available, this copies directly
+// into pinned memory in a single memcpy, skipping the intermediate heap buffer.
+// Returns a pointer to the staging data, or nullptr on failure.
+static const void * bs_read_to_staging(
+        llama_blurry_sharp_context       * bsctx,
+        const blurry_sharp_tensor_info   & info) {
+    int si = info.split_idx;
+
+    // Fastest path: RAM cache → pinned staging (one memcpy, data from swap-backed heap)
+    if ((bsctx->ram_cache_populated || bsctx->lazy_swap_enabled) && bsctx->pinned_staging_buf && info.nbytes <= bsctx->pinned_staging_size) {
+        auto cache_it = bsctx->ram_cache.find(info.name);
+        if (cache_it != bsctx->ram_cache.end() && cache_it->second.size() >= info.nbytes) {
+            memcpy(bsctx->pinned_staging_ptr, cache_it->second.data(), info.nbytes);
+            return bsctx->pinned_staging_ptr;
+        }
+    }
+
+    // Fast path: RAM cache → direct return (no pinned staging, OR tensor larger than staging)
+    // Anonymous heap memory works fine as a source for ggml_backend_tensor_set —
+    // it's just slower than pinned memory for DMA transfers.
+    if (bsctx->ram_cache_populated || bsctx->lazy_swap_enabled) {
+        auto cache_it = bsctx->ram_cache.find(info.name);
+        if (cache_it != bsctx->ram_cache.end() && cache_it->second.size() >= info.nbytes) {
+            return cache_it->second.data();
+        }
+    }
+
+    // Lazy swap: populate the RAM cache on demand for device tensors too.
+    // This ensures GPU tensor data is also swap-backed after the first access,
+    // so subsequent sharpen cycles read from swap (fast SSD) instead of the
+    // GGUF file (slow).  The data is read once from disk into anonymous heap
+    // memory, then staged to swap on restore via MADV_PAGEOUT.
+    if (bsctx->lazy_swap_enabled) {
+        std::vector<uint8_t> buf(info.nbytes);
+        bool ok = false;
+
+        bool have_mmap = (si >= 0 && si < (int)bsctx->sharp_mmaps.size()
+                          && bsctx->sharp_mmaps[si]);
+        if (have_mmap) {
+            const uint8_t * base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+            if (info.file_offset + info.nbytes <= bsctx->sharp_mmaps[si]->size()) {
+                std::memcpy(buf.data(), base + info.file_offset, info.nbytes);
+                bs_release_mmap_pages(base + info.file_offset, info.nbytes);
+                ok = true;
+            }
+        }
+        if (!ok && si >= 0 && si < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si]) {
+            bsctx->sharp_files[si]->seek(info.file_offset, SEEK_SET);
+            bsctx->sharp_files[si]->read_raw(buf.data(), info.nbytes);
+            ok = true;
+        }
+
+        if (ok) {
+            bsctx->ram_cache[info.name] = std::move(buf);
+            bsctx->ram_cache_bytes += (int64_t)info.nbytes;
+
+            if (bsctx->params.verbose) {
+                LLAMA_LOG_INFO("%s: lazy-swap: cached device tensor '%s' (%zu bytes, "
+                              "total cache %.2f MiB)\n",
+                              __func__, info.name.c_str(), info.nbytes,
+                              bsctx->ram_cache_bytes / (1024.0 * 1024.0));
+            }
+
+            // Now use the freshly cached data via the normal paths above
+            auto cache_it = bsctx->ram_cache.find(info.name);
+            if (cache_it != bsctx->ram_cache.end()) {
+                if (bsctx->pinned_staging_buf && info.nbytes <= bsctx->pinned_staging_size) {
+                    memcpy(bsctx->pinned_staging_ptr, cache_it->second.data(), info.nbytes);
+                    return bsctx->pinned_staging_ptr;
+                }
+                return cache_it->second.data();
+            }
+        }
+    }
+
+    // Fast path: mmap → pinned staging (one memcpy instead of two)
+    if (bsctx->pinned_staging_buf && info.nbytes <= bsctx->pinned_staging_size) {
+        bool have_mmap = (si >= 0 && si < (int)bsctx->sharp_mmaps.size()
+                          && bsctx->sharp_mmaps[si]);
+        if (have_mmap) {
+            const uint8_t * base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+            if (info.file_offset + info.nbytes <= bsctx->sharp_mmaps[si]->size()) {
+                memcpy(bsctx->pinned_staging_ptr, base + info.file_offset, info.nbytes);
+                // Data is now in pinned staging — release mmap pages immediately
+                // to avoid accumulating the entire sharp model in the page cache.
+                bs_release_mmap_pages(base + info.file_offset, info.nbytes);
+                return bsctx->pinned_staging_ptr;
+            }
+        }
+        // Fallback: file read → read_buf → pinned
+        if (bs_read_sharp_tensor(bsctx, info, bsctx->read_buf)) {
+            memcpy(bsctx->pinned_staging_ptr, bsctx->read_buf.data(), info.nbytes);
+            return bsctx->pinned_staging_ptr;
+        }
+        return nullptr;
+    }
+
+    // No pinned staging: read into heap buffer and use that directly
+    if (bs_read_sharp_tensor(bsctx, info, bsctx->read_buf)) {
+        return bsctx->read_buf.data();
+    }
+    return nullptr;
+}
+
+// Dequantize a quantized buffer to f32.
+// Returns the number of floats written.
+static int64_t bs_dequantize_to_f32(
+        ggml_type         src_type,
+        const void      * src_data,
+        size_t            src_nbytes,
+        const int64_t     ne[GGML_MAX_DIMS],
+        std::vector<float> & dest) {
+    int64_t nel = bs_nelements(ne);
+    dest.resize((size_t)nel);
+
+    if (src_type == GGML_TYPE_F32) {
+        std::memcpy(dest.data(), src_data, nel * sizeof(float));
+        return nel;
+    }
+
+    if (src_type == GGML_TYPE_F16) {
+        const ggml_fp16_t * src = (const ggml_fp16_t *)src_data;
+        for (int64_t i = 0; i < nel; ++i) {
+            dest[(size_t)i] = ggml_fp16_to_fp32(src[i]);
+        }
+        return nel;
+    }
+
+    // Use ggml type traits to_float
+    ggml_type_traits_t traits = ggml_internal_get_type_traits(src_type);
+    if (!traits.to_float) {
+        LLAMA_LOG_ERROR("%s: no to_float for type %s\n",
+                        __func__, ggml_type_name(src_type));
+        return -1;
+    }
+
+    // Dequantize row by row
+    int64_t n_rows = 1;
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        n_rows *= ne[d];
+    }
+    int64_t row_elements = ne[0];
+    size_t  src_row_size = ggml_row_size(src_type, row_elements);
+
+    const uint8_t * src_ptr = (const uint8_t *)src_data;
+    float * dst_ptr = dest.data();
+
+    for (int64_t row = 0; row < n_rows; ++row) {
+        traits.to_float(src_ptr, dst_ptr, (int)row_elements);
+        src_ptr += src_row_size;
+        dst_ptr += row_elements;
+    }
+
+    return nel;
+}
+
+// Quantize f32 data to a target quantized type.
+// Returns the number of bytes written.
+static size_t bs_quantize_from_f32(
+        ggml_type           dst_type,
+        const float       * src_data,
+        int64_t             nel,
+        const int64_t       ne[GGML_MAX_DIMS],
+        std::vector<uint8_t> & dest) {
+    if (dst_type == GGML_TYPE_F32) {
+        size_t sz = (size_t)nel * sizeof(float);
+        dest.resize(sz);
+        std::memcpy(dest.data(), src_data, sz);
+        return sz;
+    }
+
+    if (dst_type == GGML_TYPE_F16) {
+        size_t sz = (size_t)nel * sizeof(ggml_fp16_t);
+        dest.resize(sz);
+        ggml_fp16_t * dst = (ggml_fp16_t *)dest.data();
+        for (int64_t i = 0; i < nel; ++i) {
+            dst[i] = ggml_fp32_to_fp16(src_data[i]);
+        }
+        return sz;
+    }
+
+    // Use ggml_quantize_chunk for quantized types
+    size_t dst_nbytes = bs_tensor_nbytes(dst_type, ne);
+    dest.resize(dst_nbytes);
+
+    // ggml_quantize_chunk expects (type, src_f32, dst, start, nrows, n_per_row, imatrix)
+    int64_t n_rows = 1;
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        n_rows *= ne[d];
+    }
+    int64_t n_per_row = ne[0];
+
+    ggml_quantize_init(dst_type);
+    size_t result = ggml_quantize_chunk(
+        dst_type,
+        src_data,
+        dest.data(),
+        0,           // start
+        (int)n_rows,
+        (int)n_per_row,
+        nullptr      // no importance matrix
+    );
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Initialization
+// ---------------------------------------------------------------------------
+
+llama_blurry_sharp_context * llama_blurry_sharp_init(
+        llama_model              * model,
+        llama_blurry_sharp_params  params) {
+
+    if (!model) {
+        LLAMA_LOG_ERROR("%s: model is null\n", __func__);
+        return nullptr;
+    }
+    if (!params.sharp_model_path || params.sharp_model_path[0] == '\0') {
+        LLAMA_LOG_ERROR("%s: sharp_model_path is empty\n", __func__);
+        return nullptr;
+    }
+
+    LLAMA_LOG_INFO("%s: initializing blurry-sharp overlay system\n", __func__);
+    LLAMA_LOG_INFO("%s: sharp model path: %s\n", __func__, params.sharp_model_path);
+    if (params.permanent) {
+        LLAMA_LOG_INFO("%s: PERMANENT mode enabled — sharp overlay is one-way, blurry data will be discarded\n", __func__);
+        LLAMA_LOG_INFO("%s:   same-type GPU tensors: in-place overwrite (zero extra VRAM)\n", __func__);
+        LLAMA_LOG_INFO("%s:   different-type GPU tensors: new buffer, no backup\n", __func__);
+        LLAMA_LOG_INFO("%s:   CPU tensors: pointer-swap to sharp mmap, release blurry pages\n", __func__);
+    }
+
+    auto * bsctx = new llama_blurry_sharp_context();
+    bsctx->model  = model;
+    bsctx->params = params;
+    bsctx->retain_device_buffers = params.retain_device_buffers;
+    bsctx->lazy_swap_enabled     = params.lazy_swap;
+
+    // -----------------------------------------------------------------------
+    // 1) Open the primary sharp GGUF and read metadata (no tensor data alloc)
+    // -----------------------------------------------------------------------
+    {
+        ggml_context * tensor_ctx = nullptr;
+        struct gguf_init_params gguf_params = {
+            /* .no_alloc = */ true,
+            /* .ctx      = */ &tensor_ctx,
+        };
+        gguf_context * primary_gguf = gguf_init_from_file(params.sharp_model_path, gguf_params);
+        if (!primary_gguf) {
+            LLAMA_LOG_ERROR("%s: failed to open sharp GGUF file '%s'\n",
+                           __func__, params.sharp_model_path);
+            delete bsctx;
+            return nullptr;
+        }
+        bsctx->sharp_ggufs.push_back(primary_gguf);
+        bsctx->sharp_tensor_ctxs.push_back(tensor_ctx);
+    }
+
+    // -----------------------------------------------------------------------
+    // 2) Open primary sharp file for data reading
+    // -----------------------------------------------------------------------
+    try {
+        bsctx->sharp_files.push_back(
+            std::make_unique<llama_file>(params.sharp_model_path, "rb"));
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: failed to open sharp file for reading: %s\n",
+                       __func__, e.what());
+        gguf_free(bsctx->sharp_ggufs[0]);
+        if (bsctx->sharp_tensor_ctxs[0]) ggml_free(bsctx->sharp_tensor_ctxs[0]);
+        delete bsctx;
+        return nullptr;
+    }
+
+    // -----------------------------------------------------------------------
+    // 2b) Detect split GGUF and open additional split files
+    // -----------------------------------------------------------------------
+    {
+        // Check if the primary GGUF declares a split count > 1
+        int n_split_key = gguf_find_key(bsctx->sharp_ggufs[0], "split.count");
+        uint16_t n_split = 1;
+        if (n_split_key >= 0) {
+            n_split = (uint16_t)gguf_get_val_u16(bsctx->sharp_ggufs[0], n_split_key);
+        }
+        bsctx->n_sharp_splits = (int)n_split;
+
+        if (n_split > 1) {
+            // Derive the split prefix from the primary filename
+            char split_prefix[PATH_MAX] = {0};
+            if (!llama_split_prefix(split_prefix, sizeof(split_prefix),
+                                    params.sharp_model_path, 0, n_split)) {
+                LLAMA_LOG_ERROR("%s: could not extract split prefix from '%s'\n",
+                               __func__, params.sharp_model_path);
+                // Fall back to treating it as a single file
+                bsctx->n_sharp_splits = 1;
+            } else {
+                LLAMA_LOG_INFO("%s: sharp model is split across %d files\n",
+                              __func__, n_split);
+
+                for (uint16_t idx = 1; idx < n_split; ++idx) {
+                    char split_path[PATH_MAX] = {0};
+                    llama_split_path(split_path, sizeof(split_path),
+                                    split_prefix, idx, n_split);
+
+                    // Open GGUF metadata for this split
+                    ggml_context * split_tensor_ctx = nullptr;
+                    struct gguf_init_params split_gp = {
+                        /* .no_alloc = */ true,
+                        /* .ctx      = */ &split_tensor_ctx,
+                    };
+                    gguf_context * split_gguf = gguf_init_from_file(split_path, split_gp);
+                    if (!split_gguf) {
+                        LLAMA_LOG_ERROR("%s: failed to open split GGUF '%s'\n",
+                                       __func__, split_path);
+                        // Continue without this split — tensors in it won't be available
+                        bsctx->sharp_ggufs.push_back(nullptr);
+                        bsctx->sharp_tensor_ctxs.push_back(nullptr);
+                        bsctx->sharp_files.push_back(nullptr);
+                        continue;
+                    }
+
+                    bsctx->sharp_ggufs.push_back(split_gguf);
+                    bsctx->sharp_tensor_ctxs.push_back(split_tensor_ctx);
+
+                    // Open file handle for this split
+                    try {
+                        bsctx->sharp_files.push_back(
+                            std::make_unique<llama_file>(split_path, "rb"));
+                    } catch (const std::exception & e) {
+                        LLAMA_LOG_WARN("%s: failed to open split file '%s': %s\n",
+                                      __func__, split_path, e.what());
+                        bsctx->sharp_files.push_back(nullptr);
+                    }
+
+                    LLAMA_LOG_INFO("%s: opened split %d/%d: %s\n",
+                                  __func__, idx + 1, n_split, split_path);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 3) Optionally mmap each sharp file (prefetch = 0 → demand-paged)
+    // -----------------------------------------------------------------------
+    if (params.use_mmap && llama_mmap::SUPPORTED) {
+        size_t total_mmap_size = 0;
+        for (size_t si = 0; si < bsctx->sharp_files.size(); ++si) {
+            if (!bsctx->sharp_files[si]) {
+                bsctx->sharp_mmaps.push_back(nullptr);
+                continue;
+            }
+            try {
+                auto mmap = std::make_unique<llama_mmap>(
+                    bsctx->sharp_files[si].get(),
+                    0,     // prefetch = 0 (don't prefetch everything)
+                    false  // numa = false
+                );
+                total_mmap_size += mmap->size();
+                bsctx->sharp_mmaps.push_back(std::move(mmap));
+            } catch (const std::exception & e) {
+                LLAMA_LOG_WARN("%s: mmap failed for sharp split %zu, "
+                              "falling back to file reads: %s\n",
+                              __func__, si, e.what());
+                bsctx->sharp_mmaps.push_back(nullptr);
+            }
+        }
+        LLAMA_LOG_INFO("%s: sharp model mmap'd (%zu bytes across %zu file%s)\n",
+                      __func__, total_mmap_size,
+                      bsctx->sharp_files.size(),
+                      bsctx->sharp_files.size() > 1 ? "s" : "");
+    } else {
+        // Fill with nullptrs so indexing by split_idx works
+        for (size_t si = 0; si < bsctx->sharp_files.size(); ++si) {
+            bsctx->sharp_mmaps.push_back(nullptr);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4) Build the tensor index (across all splits)
+    // -----------------------------------------------------------------------
+    {
+        int total_tensors = 0;
+
+        for (int si = 0; si < (int)bsctx->sharp_ggufs.size(); ++si) {
+            gguf_context  * sgguf = bsctx->sharp_ggufs[si];
+            ggml_context  * stctx = bsctx->sharp_tensor_ctxs[si];
+            if (!sgguf || !stctx) continue;
+
+            int n_tensors = gguf_get_n_tensors(sgguf);
+            size_t data_offset = gguf_get_data_offset(sgguf);
+
+            for (int i = 0; i < n_tensors; ++i) {
+                const char * name = gguf_get_tensor_name(sgguf, i);
+                ggml_type    type = gguf_get_tensor_type(sgguf, i);
+                size_t       tensor_offset = gguf_get_tensor_offset(sgguf, i);
+
+                blurry_sharp_tensor_info info;
+                info.name        = name;
+                info.tensor_idx  = i;
+                info.split_idx   = si;
+                info.file_offset = data_offset + tensor_offset;
+                info.type        = type;
+
+                // Get shape from the tensor metadata context
+                ggml_tensor * meta = ggml_get_tensor(stctx, name);
+                if (meta) {
+                    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                        info.ne[d] = meta->ne[d];
+                    }
+                    info.nbytes = ggml_nbytes(meta);
+                } else {
+                    LLAMA_LOG_WARN("%s: tensor '%s' (split %d) found in GGUF index "
+                                  "but not in context, skipping\n",
+                                  __func__, name, si);
+                    continue;
+                }
+
+                info.layer_idx = llama_blurry_sharp_extract_layer_idx(info.name);
+
+                bsctx->sharp_index[info.name] = info;
+
+                if (info.layer_idx >= 0) {
+                    bsctx->layer_tensor_names[info.layer_idx].push_back(info.name);
+                }
+
+                if (params.verbose) {
+                    LLAMA_LOG_INFO("%s:   tensor %-50s  split=%d  type=%-8s  "
+                                  "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]  "
+                                  "bytes=%zu  layer=%d\n",
+                                  __func__, name, si, ggml_type_name(type),
+                                  info.ne[0], info.ne[1], info.ne[2], info.ne[3],
+                                  info.nbytes, info.layer_idx);
+                }
+
+                ++total_tensors;
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: sharp model contains %d tensors across %d split%s\n",
+                      __func__, total_tensors, bsctx->n_sharp_splits,
+                      bsctx->n_sharp_splits > 1 ? "s" : "");
+    }
+
+    // -----------------------------------------------------------------------
+    // 5) Collect sorted layer indices present in sharp model
+    // -----------------------------------------------------------------------
+    {
+        std::set<int> idx_set;
+        for (auto & kv : bsctx->layer_tensor_names) {
+            idx_set.insert(kv.first);
+        }
+        bsctx->sharp_layer_indices.assign(idx_set.begin(), idx_set.end());
+        LLAMA_LOG_INFO("%s: sharp model has %zu layer groups (layers %d..%d)\n",
+                      __func__,
+                      bsctx->sharp_layer_indices.size(),
+                      bsctx->sharp_layer_indices.empty() ? -1 : bsctx->sharp_layer_indices.front(),
+                      bsctx->sharp_layer_indices.empty() ? -1 : bsctx->sharp_layer_indices.back());
+    }
+
+    // -----------------------------------------------------------------------
+    // 6) Determine eligible layers
+    // -----------------------------------------------------------------------
+    {
+        // Start with all layers present in the sharp model
+        for (int idx : bsctx->sharp_layer_indices) {
+            bsctx->eligible_layers.insert(idx);
+        }
+
+        // Apply allowlist (if any)
+        if (params.n_layer_allowlist > 0 && params.layer_allowlist) {
+            std::unordered_set<int> allow;
+            for (int i = 0; i < params.n_layer_allowlist; ++i) {
+                allow.insert(params.layer_allowlist[i]);
+            }
+            for (auto it = bsctx->eligible_layers.begin(); it != bsctx->eligible_layers.end(); ) {
+                if (allow.find(*it) == allow.end()) {
+                    it = bsctx->eligible_layers.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        // Apply denylist
+        if (params.n_layer_denylist > 0 && params.layer_denylist) {
+            for (int i = 0; i < params.n_layer_denylist; ++i) {
+                bsctx->eligible_layers.erase(params.layer_denylist[i]);
+            }
+        }
+
+        // Also filter out layers that don't exist in the base model
+        int n_model_layers = (int)model->layers.size();
+        for (auto it = bsctx->eligible_layers.begin(); it != bsctx->eligible_layers.end(); ) {
+            if (*it < 0 || *it >= n_model_layers) {
+                LLAMA_LOG_WARN("%s: layer %d is in sharp model but not in base model (%d layers), skipping\n",
+                              __func__, *it, n_model_layers);
+                it = bsctx->eligible_layers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: %zu layers eligible for sharpening\n",
+                      __func__, bsctx->eligible_layers.size());
+    }
+
+    // -----------------------------------------------------------------------
+    // 7) Validate: for each eligible layer, check that we can find matching
+    //    tensors in the base model with compatible shapes.
+    // -----------------------------------------------------------------------
+    {
+        int n_matched = 0;
+        int n_skipped = 0;
+        int n_skip_no_base = 0;
+        int n_skip_shape   = 0;
+        std::vector<std::string> skipped_names;
+
+        for (int layer_idx : bsctx->sharp_layer_indices) {
+            if (bsctx->eligible_layers.find(layer_idx) == bsctx->eligible_layers.end()) {
+                continue;
+            }
+            auto & tensor_names = bsctx->layer_tensor_names[layer_idx];
+            for (auto it = tensor_names.begin(); it != tensor_names.end(); ) {
+                ggml_tensor * base_t = bs_find_model_tensor(model, it->c_str());
+                if (!base_t) {
+                    LLAMA_LOG_INFO("%s: skip (no base match): '%s'\n",
+                                  __func__, it->c_str());
+                    skipped_names.push_back(*it);
+                    bsctx->sharp_index.erase(*it);
+                    it = tensor_names.erase(it);
+                    ++n_skipped;
+                    ++n_skip_no_base;
+                    continue;
+                }
+
+                auto & info = bsctx->sharp_index[*it];
+
+                // Cache the base tensor pointer so apply/restore can skip O(n) lookup
+                info.base_tensor = base_t;
+
+                if (!llama_blurry_sharp_shapes_compatible(base_t, info)) {
+                    LLAMA_LOG_WARN("%s: skip (shape mismatch): '%s' "
+                                  "base=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "](%s) vs "
+                                  "sharp=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "](%s)\n",
+                                  __func__, it->c_str(),
+                                  base_t->ne[0], base_t->ne[1], base_t->ne[2], base_t->ne[3],
+                                  ggml_type_name(base_t->type),
+                                  info.ne[0], info.ne[1], info.ne[2], info.ne[3],
+                                  ggml_type_name(info.type));
+                    skipped_names.push_back(*it);
+                    bsctx->sharp_index.erase(*it);
+                    it = tensor_names.erase(it);
+                    ++n_skipped;
+                    ++n_skip_shape;
+                    continue;
+                }
+
+                ++n_matched;
+                ++it;
+            }
+
+            // If no tensors remain for this layer, remove eligibility
+            if (tensor_names.empty()) {
+                bsctx->eligible_layers.erase(layer_idx);
+            }
+        }
+
+        // Count sharp tensors that are NOT in any layer (layer_idx == -1)
+        // These are non-layer tensors (embeddings, output head, norms, etc.)
+        // that exist in the sharp GGUF but are never overlaid.
+        int n_non_layer_sharp = 0;
+        for (auto & kv : bsctx->sharp_index) {
+            if (kv.second.layer_idx < 0) {
+                ++n_non_layer_sharp;
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: %d tensors matched between blurry and sharp models, %d skipped\n",
+                      __func__, n_matched, n_skipped);
+        if (n_skipped > 0) {
+            LLAMA_LOG_INFO("%s:   skip breakdown: %d no base match, %d shape mismatch\n",
+                          __func__, n_skip_no_base, n_skip_shape);
+        }
+        if (n_non_layer_sharp > 0) {
+            LLAMA_LOG_INFO("%s: %d non-layer tensors in sharp model (not overlaid: embeddings, output head, etc.)\n",
+                          __func__, n_non_layer_sharp);
+        }
+
+        // Check for layers with partial tensor coverage (some tensors matched, some didn't)
+        for (int layer_idx : bsctx->sharp_layer_indices) {
+            if (bsctx->eligible_layers.find(layer_idx) == bsctx->eligible_layers.end()) {
+                continue;
+            }
+            auto lt_it = bsctx->layer_tensor_names.find(layer_idx);
+            if (lt_it == bsctx->layer_tensor_names.end()) continue;
+
+            int n_layer_tensors = (int)lt_it->second.size();
+            // Count how many skipped tensors belonged to this layer
+            int n_layer_skipped = 0;
+            for (const auto & sn : skipped_names) {
+                int skip_layer = llama_blurry_sharp_extract_layer_idx(sn);
+                if (skip_layer == layer_idx) ++n_layer_skipped;
+            }
+            if (n_layer_skipped > 0) {
+                LLAMA_LOG_WARN("%s: layer %d has partial coverage: %d tensors matched, "
+                              "%d skipped (may produce inconsistent results)\n",
+                              __func__, layer_idx, n_layer_tensors, n_layer_skipped);
+            }
+        }
+    }
+
+    if (bsctx->eligible_layers.empty()) {
+        LLAMA_LOG_WARN("%s: no eligible layers found for blurry-sharp overlay\n", __func__);
+        // Still return the context; it's valid but will be a no-op
+    }
+
+    // NOTE: No mmap safety check needed.  The pointer-swap overlay strategy
+    // never writes to the base model's tensor buffers — it swaps the data
+    // pointer to an owned sharp-data buffer instead.  So mmap'd (read-only)
+    // base models work fine.
+
+    // -----------------------------------------------------------------------
+    // Allocate pinned staging buffer for fast CPU→GPU copies
+    // -----------------------------------------------------------------------
+    // Find the largest sharp tensor to size the staging buffer appropriately.
+    // For MoE models, merged expert tensors (ffn_*_exps) can be several GiB.
+    // The staging buffer only needs to hold ONE tensor upload at a time, and
+    // for MoE combination mode we only upload individual expert slices.
+    // Cap the staging buffer at 256 MiB to avoid wasting non-swappable
+    // pinned (page-locked) memory on a buffer that's mostly unused.
+    {
+        size_t max_sharp_tensor = 0;
+        size_t max_expert_slice = 0;
+        for (auto & kv : bsctx->sharp_index) {
+            if (kv.second.nbytes > max_sharp_tensor) {
+                max_sharp_tensor = kv.second.nbytes;
+            }
+            // For expert tensors, compute per-expert slice size
+            if (bs_is_expert_tensor(kv.first) && kv.second.ne[2] > 1) {
+                size_t slice = kv.second.nbytes / (size_t)kv.second.ne[2];
+                if (slice > max_expert_slice) {
+                    max_expert_slice = slice;
+                }
+            }
+        }
+
+        // In MoE combination mode, we typically upload individual expert
+        // slices, not entire merged tensors.  Size the staging buffer to
+        // the largest non-expert tensor OR the largest expert slice,
+        // whichever is bigger — but cap at 256 MiB to avoid pinning
+        // excessive RAM.  For non-MoE or permanent mode, use the full
+        // largest tensor (still capped).
+        size_t staging_size = max_sharp_tensor;
+
+        // Find the largest non-expert tensor
+        size_t max_non_expert = 0;
+        for (auto & kv : bsctx->sharp_index) {
+            if (!bs_is_expert_tensor(kv.first) && kv.second.nbytes > max_non_expert) {
+                max_non_expert = kv.second.nbytes;
+            }
+        }
+        // For MoE models, staging only needs to hold a non-expert tensor
+        // or one expert slice (whichever is larger)
+        if (max_expert_slice > 0) {
+            staging_size = std::max(max_non_expert, max_expert_slice);
+        }
+
+        // Hard cap at 256 MiB — pinned memory is page-locked (non-swappable)
+        static const size_t STAGING_CAP = 256ULL * 1024 * 1024;
+        if (staging_size > STAGING_CAP) {
+            LLAMA_LOG_INFO("%s: capping pinned staging buffer from %.2f MiB to %.2f MiB "
+                          "(largest tensor = %.2f MiB, largest expert slice = %.2f MiB)\n",
+                          __func__,
+                          staging_size / (1024.0 * 1024.0),
+                          STAGING_CAP / (1024.0 * 1024.0),
+                          max_sharp_tensor / (1024.0 * 1024.0),
+                          max_expert_slice / (1024.0 * 1024.0));
+            staging_size = STAGING_CAP;
+        }
+
+        if (staging_size > 0) {
+            ggml_backend_buffer_type_t pinned_buft = llama_default_buffer_type_cpu(true);
+            if (pinned_buft && pinned_buft != ggml_backend_cpu_buffer_type()) {
+                // We have a pinned buffer type (CUDA/Vulkan/SYCL host memory)
+                ggml_backend_buffer_t pbuf = ggml_backend_buft_alloc_buffer(pinned_buft, staging_size);
+                if (pbuf) {
+                    bsctx->pinned_staging_buf  = pbuf;
+                    bsctx->pinned_staging_ptr  = ggml_backend_buffer_get_base(pbuf);
+                    bsctx->pinned_staging_size = staging_size;
+                    LLAMA_LOG_INFO("%s: allocated %.2f MiB pinned staging buffer for fast CPU->GPU copies\n",
+                                  __func__, staging_size / (1024.0 * 1024.0));
+                } else {
+                    LLAMA_LOG_WARN("%s: failed to allocate pinned staging buffer, falling back to pageable memory\n",
+                                  __func__);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Reset mmap advice to NORMAL (kernel default).
+    //
+    // The primary use case is SELECTIVE sharpening — only a handful of
+    // layers are sharpened per token, not the entire model.  The access
+    // pattern is therefore random (jumping to whichever layers the router
+    // picks), not sequential.  MADV_SEQUENTIAL would enable aggressive
+    // readahead that pulls in unneeded data and evicts the blurry model.
+    //
+    // Instead we rely on:
+    //   - Per-layer targeted prefetch (bs_prefetch_layer_mmap) in apply_layer
+    //   - MADV_DONTNEED after each tensor read to release consumed pages
+    //   - MADV_SEQUENTIAL only in apply_all when we know we'll read everything
+    //
+    // This keeps RAM usage bounded to roughly one layer at a time.
+    // -----------------------------------------------------------------------
+#ifndef _WIN32
+    for (size_t si = 0; si < bsctx->sharp_mmaps.size(); ++si) {
+        if (bsctx->sharp_mmaps[si]) {
+            posix_madvise(bsctx->sharp_mmaps[si]->addr(),
+                          bsctx->sharp_mmaps[si]->size(),
+                          POSIX_MADV_NORMAL);
+        }
+    }
+#endif
+
+    bsctx->initialized = true;
+
+    LLAMA_LOG_INFO("%s: blurry-sharp overlay system initialized successfully\n", __func__);
+    llama_blurry_sharp_log_index_summary(bsctx);
+
+    // -----------------------------------------------------------------------
+    // Pre-flight GPU budget analysis
+    //
+    // For each eligible layer, estimate how much GPU memory the sharp tensors
+    // would need (i.e. device tensors that would require a NEW allocation).
+    // Warn if the configured budget can't fit even a single layer.
+    // -----------------------------------------------------------------------
+    if (bsctx->params.gpu_budget_bytes > 0) {
+        int64_t total_device_sharp_bytes = 0;
+        int     n_layers_fit  = 0;
+        int     n_layers_skip = 0;
+        int64_t running_bytes = 0;
+
+        for (int layer_idx : bsctx->sharp_layer_indices) {
+            if (bsctx->eligible_layers.find(layer_idx) == bsctx->eligible_layers.end()) {
+                continue;
+            }
+            auto lt_it = bsctx->layer_tensor_names.find(layer_idx);
+            if (lt_it == bsctx->layer_tensor_names.end()) continue;
+
+            int64_t layer_device_bytes = 0;
+            for (const auto & tname : lt_it->second) {
+                auto si_it = bsctx->sharp_index.find(tname);
+                if (si_it == bsctx->sharp_index.end()) continue;
+
+                ggml_tensor * bt = bs_find_model_tensor(bsctx->model, tname.c_str());
+                if (!bt || !bt->buffer) continue;
+
+                if (!ggml_backend_buffer_is_host(bt->buffer)) {
+                    // This tensor lives on a device — overlay needs a new allocation
+                    layer_device_bytes += (int64_t)si_it->second.nbytes;
+                }
+            }
+
+            total_device_sharp_bytes += layer_device_bytes;
+
+            if (layer_device_bytes == 0 || (running_bytes + layer_device_bytes) <= bsctx->params.gpu_budget_bytes) {
+                running_bytes += layer_device_bytes;
+                n_layers_fit++;
+            } else {
+                n_layers_skip++;
+            }
+        }
+
+        int n_eligible = n_layers_fit + n_layers_skip;
+        LLAMA_LOG_INFO("%s: GPU budget analysis: %.0f MiB budget, %.0f MiB needed for all %d eligible layers\n",
+                      __func__,
+                      bsctx->params.gpu_budget_bytes / (1024.0 * 1024.0),
+                      total_device_sharp_bytes / (1024.0 * 1024.0),
+                      n_eligible);
+
+        if (n_layers_skip > 0) {
+            LLAMA_LOG_INFO("%s: GPU budget can fully sharpen ~%d/%d layers (%.0f MiB used)\n",
+                          __func__, n_layers_fit, n_eligible,
+                          running_bytes / (1024.0 * 1024.0));
+            LLAMA_LOG_WARN("%s: %d layers will be rolled back if sharpened "
+                          "(GPU tensors exceed budget). Increase --bs-gpu-budget-mb "
+                          "or reduce -ngl to move more tensors to CPU.\n",
+                          __func__, n_layers_skip);
+        }
+
+        if (n_layers_fit == 0 && n_eligible > 0) {
+            LLAMA_LOG_WARN("%s: *** GPU budget (%.0f MiB) is too small to sharpen even ONE layer! ***\n",
+                          __func__, bsctx->params.gpu_budget_bytes / (1024.0 * 1024.0));
+            LLAMA_LOG_WARN("%s: All sharpen attempts will be rolled back. Either:\n"
+                          "%s:   1. Increase --bs-gpu-budget-mb to at least %.0f MiB\n"
+                          "%s:   2. Reduce -ngl to keep more weight tensors on CPU\n"
+                          "%s:   3. Use a smaller sharp model (fewer bits per weight)\n",
+                          __func__, __func__,
+                          (total_device_sharp_bytes / (double)n_eligible) / (1024.0 * 1024.0),
+                          __func__, __func__);
+        }
+    }
+
+    return bsctx;
+}
+
+// ---------------------------------------------------------------------------
+// Free
+// ---------------------------------------------------------------------------
+
+void llama_blurry_sharp_free(llama_blurry_sharp_context * bsctx) {
+    if (!bsctx) return;
+
+    LLAMA_LOG_INFO("%s: freeing blurry-sharp context\n", __func__);
+
+    // Restore all layers first (return model to blurry state)
+    llama_blurry_sharp_restore_all(bsctx);
+
+    // Free pinned staging buffer
+    if (bsctx->pinned_staging_buf) {
+        ggml_backend_buffer_free(bsctx->pinned_staging_buf);
+        bsctx->pinned_staging_buf  = nullptr;
+        bsctx->pinned_staging_ptr  = nullptr;
+        bsctx->pinned_staging_size = 0;
+    }
+
+    // Free RAM cache (anonymous heap buffers for swap-backed sharp data)
+    if (!bsctx->ram_cache.empty()) {
+        LLAMA_LOG_INFO("%s: freeing RAM cache: %d tensors, %.2f MiB\n",
+                      __func__, (int)bsctx->ram_cache.size(),
+                      bsctx->ram_cache_bytes / (1024.0 * 1024.0));
+        bsctx->ram_cache.clear();
+        bsctx->ram_cache_bytes = 0;
+        bsctx->ram_cache_populated = false;
+        bsctx->ram_cache_staged = false;
+    }
+
+    // Free any cached device buffers.
+    // Sync the GPU first to ensure no async kernels are still reading from
+    // these buffers (same race condition as LRU eviction in JIT mode).
+    if (!bsctx->device_cache.empty()) {
+        bs_sync_device_before_eviction(bsctx);
+    }
+    for (auto & kv : bsctx->device_cache) {
+        if (kv.second.buffer) {
+            ggml_backend_buffer_free(kv.second.buffer);
+        }
+    }
+    bsctx->device_cache.clear();
+    bsctx->device_cache_bytes = 0;
+
+    if (bsctx->params.verbose) {
+        LLAMA_LOG_INFO("%s: device cache stats: %" PRId64 " hits, %" PRId64 " allocs, %" PRId64 " recopies, %" PRId64 " evictions\n",
+                      __func__, bsctx->n_cache_hits, bsctx->n_cache_allocs, bsctx->n_cache_recopies, bsctx->n_cache_evictions);
+    }
+
+    // Free sharp GGUF resources (all splits)
+    for (auto & m : bsctx->sharp_mmaps)       { m.reset(); }
+    for (auto & f : bsctx->sharp_files)        { f.reset(); }
+    for (auto * ctx : bsctx->sharp_tensor_ctxs) { if (ctx) ggml_free(ctx); }
+    for (auto * g   : bsctx->sharp_ggufs)       { if (g)   gguf_free(g);   }
+    bsctx->sharp_mmaps.clear();
+    bsctx->sharp_files.clear();
+    bsctx->sharp_tensor_ctxs.clear();
+    bsctx->sharp_ggufs.clear();
+
+    delete bsctx;
+}
+
+// ---------------------------------------------------------------------------
+// Internal: apply a single tensor overlay
+// ---------------------------------------------------------------------------
+
+// Overlay a single tensor.  Three strategies depending on where the tensor
+// lives and whether the sharp file is mmap'd:
+//
+//   1. ZERO-COPY  (host tensor + mmap sharp file)
+//      Point tensor->data directly at the mmap'd sharp page.
+//      Cost: ~nanoseconds.  OS demand-pages data from disk.
+//
+//   2. BUFFERED   (host tensor + no mmap)
+//      Read sharp data into a heap buffer, point tensor at it.
+//      Cost: ~milliseconds (file I/O).
+//
+//   3. DEVICE     (non-host tensor, e.g. CUDA)
+//      Cannot pointer-swap — tensor->data is a device pointer.
+//      Instead: back up original device data, read sharp data on CPU,
+//      dequant → F32 → requant to base type, then ggml_backend_tensor_set
+//      into the existing device buffer.  Type/strides are unchanged.
+//      Cost: depends on tensor size and quant types.
+//
+// Returns bytes of sharp data referenced/written, or -1 on error.
+static int64_t bs_overlay_single_tensor(
+        llama_blurry_sharp_context      * bsctx,
+        const blurry_sharp_tensor_info  & sharp_info,
+        ggml_tensor                     * base_tensor,
+        blurry_sharp_tensor_backup      & backup_out) {
+
+    // 1) Save original tensor metadata
+    backup_out.tensor_name       = sharp_info.name;
+    backup_out.base_tensor       = base_tensor;
+    backup_out.original_data     = base_tensor->data;
+    backup_out.original_type     = base_tensor->type;
+    backup_out.original_view_src = base_tensor->view_src;
+    backup_out.original_extra    = base_tensor->extra;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        backup_out.original_nb[d] = base_tensor->nb[d];
+        backup_out.ne[d]          = base_tensor->ne[d];
+    }
+
+    // 2) Determine strategy: host (CPU) tensor vs device (GPU) tensor
+    bool tensor_is_host = true;
+    if (base_tensor->buffer) {
+        tensor_is_host = ggml_backend_buffer_is_host(base_tensor->buffer);
+    }
+
+    // JIT SAFETY CHECK: when overlays are applied mid-graph-execution (JIT
+    // mode), the backend scheduler has already allocated device copy tensors
+    // at the ORIGINAL (blurry) type/size.  Changing a host tensor's type
+    // would make copy_inputs try to write sharp-sized data into the
+    // blurry-sized device copy → assertion failure:
+    //   "ggml_backend_tensor_set_async: tensor write out of bounds"
+    //
+    // Same-type overlays are safe (only data pointer changes, sizes match).
+    // Device tensor overlays are safe (we swap the buffer directly, no
+    // scheduler copy involved).
+    if (tensor_is_host && bsctx->jit_active && base_tensor->type != sharp_info.type) {
+        bsctx->n_jit_host_crosstype_skipped++;
+        if (bsctx->params.verbose || bsctx->n_jit_host_crosstype_skipped <= 3) {
+            LLAMA_LOG_WARN("%s: JIT mode: skipping cross-type host tensor '%s' "
+                          "(%s -> %s, %zu -> %zu bytes). "
+                          "Increase -ngl to move this layer to GPU.\n",
+                          __func__, sharp_info.name.c_str(),
+                          ggml_type_name(base_tensor->type),
+                          ggml_type_name(sharp_info.type),
+                          ggml_nbytes(base_tensor), sharp_info.nbytes);
+        }
+        return -1;
+    }
+
+    if (tensor_is_host) {
+        // ================================================================
+        // HOST PATH — pointer-swap (zero-copy or buffered)
+        // ================================================================
+        backup_out.is_device = false;
+
+        int si = sharp_info.split_idx;
+        bool have_mmap = (si >= 0 && si < (int)bsctx->sharp_mmaps.size()
+                          && bsctx->sharp_mmaps[si]);
+
+        // Check RAM cache first — anonymous heap buffers that swap properly.
+        // Under memory pressure, these pages go to swap (fast SSD) instead
+        // of being dropped entirely like file-backed mmap pages.
+        bool used_ram_cache = false;
+        if (bsctx->ram_cache_populated || bsctx->lazy_swap_enabled) {
+            auto cache_it = bsctx->ram_cache.find(sharp_info.name);
+
+            // Lazy swap: if the tensor is NOT yet in the cache, populate it
+            // on demand by reading from mmap or file into an anonymous heap
+            // buffer.  This spreads the disk I/O across the first inference
+            // pass instead of a 30-minute upfront precache.
+            if (cache_it == bsctx->ram_cache.end() && bsctx->lazy_swap_enabled) {
+                std::vector<uint8_t> buf(sharp_info.nbytes);
+                bool ok = false;
+
+                // Read from mmap if available
+                if (have_mmap) {
+                    const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+                    if (sharp_info.file_offset + sharp_info.nbytes <= bsctx->sharp_mmaps[si]->size()) {
+                        std::memcpy(buf.data(), mmap_base + sharp_info.file_offset, sharp_info.nbytes);
+                        // Release the mmap pages — data is now in anonymous heap memory.
+                        bs_release_mmap_pages(mmap_base + sharp_info.file_offset, sharp_info.nbytes);
+                        ok = true;
+                    }
+                }
+
+                // Fallback: file read
+                if (!ok && si >= 0 && si < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si]) {
+                    bsctx->sharp_files[si]->seek(sharp_info.file_offset, SEEK_SET);
+                    bsctx->sharp_files[si]->read_raw(buf.data(), sharp_info.nbytes);
+                    ok = true;
+                }
+
+                if (ok) {
+                    bsctx->ram_cache[sharp_info.name] = std::move(buf);
+                    bsctx->ram_cache_bytes += (int64_t)sharp_info.nbytes;
+                    cache_it = bsctx->ram_cache.find(sharp_info.name);
+
+                    if (bsctx->params.verbose) {
+                        LLAMA_LOG_INFO("%s: lazy-swap: cached tensor '%s' (%zu bytes, "
+                                      "total cache %.2f MiB)\n",
+                                      __func__, sharp_info.name.c_str(), sharp_info.nbytes,
+                                      bsctx->ram_cache_bytes / (1024.0 * 1024.0));
+                    }
+                }
+            }
+
+            if (cache_it != bsctx->ram_cache.end() && cache_it->second.size() >= sharp_info.nbytes) {
+                // Point tensor directly at the RAM cache buffer.
+                // This is "zero-copy" from the cache's perspective — no
+                // new allocation — but the data lives in anonymous (swappable)
+                // memory, not file-backed mmap.
+                base_tensor->data = cache_it->second.data();
+                backup_out.zero_copy = true;  // no owned sharp_data buffer
+                used_ram_cache = true;
+
+                // Release old BLURRY mmap pages — the tensor now points at
+                // the RAM cache, so the blurry file-backed pages can be
+                // dropped from the page cache.
+                if (backup_out.original_data) {
+                    size_t old_nbytes = bs_tensor_nbytes(backup_out.original_type, backup_out.ne);
+                    bs_release_mmap_pages(backup_out.original_data, old_nbytes);
+                }
+            }
+        }
+
+        if (!used_ram_cache && have_mmap) {
+            // ---- ZERO-COPY: point directly at the mmap'd sharp page ----
+            const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+            if (sharp_info.file_offset + sharp_info.nbytes > bsctx->sharp_mmaps[si]->size()) {
+                LLAMA_LOG_ERROR("%s: mmap read out of bounds for tensor '%s' (split %d)\n",
+                               __func__, sharp_info.name.c_str(), si);
+                return -1;
+            }
+            // Read-only mmap data — we never modify it.  The OS pages it in
+            // from disk on first access and evicts under memory pressure.
+            base_tensor->data = const_cast<uint8_t *>(mmap_base + sharp_info.file_offset);
+            backup_out.zero_copy = true;
+
+            // Release old BLURRY mmap pages — the tensor now points at the
+            // sharp mmap, so the blurry file-backed pages can be dropped
+            // from the page cache.  They'll be re-faulted from the blurry
+            // model file on restore.  This prevents the blurry + sharp
+            // models from both being resident in RAM simultaneously.
+            if (backup_out.original_data) {
+                size_t old_nbytes = bs_tensor_nbytes(backup_out.original_type, backup_out.ne);
+                bs_release_mmap_pages(backup_out.original_data, old_nbytes);
+            }
+        } else if (!used_ram_cache) {
+            // ---- BUFFERED: read into an owned heap buffer ----
+            if (si < 0 || si >= (int)bsctx->sharp_files.size() || !bsctx->sharp_files[si]) {
+                LLAMA_LOG_ERROR("%s: no file handle for split %d (tensor '%s')\n",
+                               __func__, si, sharp_info.name.c_str());
+                return -1;
+            }
+            backup_out.sharp_data.resize(sharp_info.nbytes);
+            bsctx->sharp_files[si]->seek(sharp_info.file_offset, SEEK_SET);
+            bsctx->sharp_files[si]->read_raw(backup_out.sharp_data.data(), sharp_info.nbytes);
+            base_tensor->data = backup_out.sharp_data.data();
+            backup_out.zero_copy = false;
+        }
+
+        // Update tensor type and recompute strides for the sharp quant format
+        base_tensor->type = sharp_info.type;
+        base_tensor->nb[0] = ggml_type_size(sharp_info.type);
+        base_tensor->nb[1] = ggml_row_size(sharp_info.type, base_tensor->ne[0]);
+        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+            base_tensor->nb[d] = base_tensor->nb[d - 1] * base_tensor->ne[d - 1];
+        }
+
+        // Clear view_src so that ggml_backend_tensor_set/get dispatch through
+        // tensor->buffer (which may differ from view_src->buffer after swap).
+        // The original value is saved in backup_out.original_view_src for restore.
+        base_tensor->view_src = nullptr;
+
+        bsctx->metrics.n_direct_copies++;
+
+    } else {
+        // ================================================================
+        // DEVICE PATH — pointer-swap with a new device buffer
+        //
+        // The tensor lives on a device (GPU).  We cannot point it at CPU
+        // mmap memory.  Instead we:
+        //   a) Allocate a NEW device buffer sized for the sharp tensor
+        //   b) Read sharp data from file/mmap into a CPU staging buffer
+        //   c) Temporarily wire the tensor to the new buffer, then use
+        //      ggml_backend_tensor_set to copy CPU → device
+        //   d) The original device buffer is NOT modified — it stays
+        //      intact in the model's shared allocation.  No backup needed.
+        //   e) On restore: swap {data, type, nb[], buffer} back, free
+        //      the new device buffer.
+        //
+        // Cost: one CPU→GPU memcpy per tensor (PCIe bandwidth bound).
+        // No dequant, no requant, no backup copy.
+        // ================================================================
+        backup_out.is_device  = true;
+        backup_out.zero_copy  = false;
+
+        // Obtain a usable (non-split) buffer type for device allocation.
+        // Must be computed BEFORE we modify base_tensor->buffer.
+        ggml_backend_buffer_type_t device_buft = bs_get_device_buft(bsctx, base_tensor->buffer);
+
+        // ---- Check device buffer cache first (retain_device_buffers mode) ----
+        // If we previously sharpened this tensor and retained the GPU buffer,
+        // we can skip cudaMalloc AND the PCIe copy entirely — just pointer-swap.
+        if (bsctx->retain_device_buffers) {
+            auto cache_it = bsctx->device_cache.find(sharp_info.name);
+            if (cache_it != bsctx->device_cache.end() &&
+                cache_it->second.buffer &&
+                cache_it->second.nbytes >= sharp_info.nbytes) {
+
+                // Cache hit!  Buffer is already on GPU with sharp data.
+                cache_it->second.use_sequence = bsctx->cache_use_counter++;
+
+                backup_out.original_buffer     = base_tensor->buffer;
+                backup_out.device_sharp_buffer = cache_it->second.buffer;
+                backup_out.device_buf_cached   = true;  // do NOT free on restore
+
+                void * cached_base = ggml_backend_buffer_get_base(cache_it->second.buffer);
+                base_tensor->data   = cached_base;
+                base_tensor->buffer = cache_it->second.buffer;
+                base_tensor->type   = sharp_info.type;
+                base_tensor->nb[0]  = ggml_type_size(sharp_info.type);
+                base_tensor->nb[1]  = ggml_row_size(sharp_info.type, base_tensor->ne[0]);
+                for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+                    base_tensor->nb[d] = base_tensor->nb[d - 1] * base_tensor->ne[d - 1];
+                }
+
+                // Clear view_src so dispatch goes through tensor->buffer
+                // (the cached sharp buffer), not the stale original.
+                base_tensor->view_src = nullptr;
+
+                // Clear extra so CUDA compute uses tensor->data (our new
+                // regular buffer) instead of the split tensor metadata.
+                base_tensor->extra = nullptr;
+
+                if (!cache_it->second.populated) {
+                    // Buffer exists but data hasn't been copied yet — re-copy.
+                    // Zero the buffer first to ensure padding is clean.
+                    ggml_backend_buffer_set_usage(cache_it->second.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    ggml_backend_buffer_clear(cache_it->second.buffer, 0);
+
+                    // Use optimized staging path (direct mmap→pinned when possible)
+                    const void * staging_src = bs_read_to_staging(bsctx, sharp_info);
+                    if (staging_src) {
+                        ggml_backend_tensor_set(base_tensor, staging_src, 0, sharp_info.nbytes);
+                        cache_it->second.populated = true;
+                        bsctx->n_cache_recopies++;
+                    }
+                } else {
+                    bsctx->n_cache_hits++;
+                }
+
+                bsctx->metrics.n_direct_copies++;
+                return (int64_t)sharp_info.nbytes;
+            }
+        }
+
+        // ---- No cache hit — check GPU budget and evict if needed ----
+        int64_t effective_device_bytes = bsctx->retain_device_buffers
+            ? bsctx->device_cache_bytes
+            : bsctx->current_device_sharp_bytes;
+
+        if (bsctx->params.gpu_budget_bytes > 0 &&
+            (effective_device_bytes + (int64_t)sharp_info.nbytes) > bsctx->params.gpu_budget_bytes) {
+
+            if (bsctx->retain_device_buffers && !bsctx->device_cache.empty()) {
+                // ---- LRU eviction: free the least-recently-used cached buffers
+                //      until we have room for this new tensor ----
+                //
+                // IMPORTANT: In JIT mode, CUDA kernels from a restored layer
+                // may still be executing asynchronously.  We MUST synchronize
+                // the device before freeing any buffers to prevent
+                // "CUDA error: illegal memory access" from kernels reading
+                // freed memory.
+                int64_t needed = (effective_device_bytes + (int64_t)sharp_info.nbytes)
+                               - bsctx->params.gpu_budget_bytes;
+                int64_t freed = 0;
+                bool synced = false;  // only sync once per eviction batch
+
+                while (freed < needed && !bsctx->device_cache.empty()) {
+                    // Find the LRU entry (lowest use_sequence)
+                    auto lru_it = bsctx->device_cache.end();
+                    uint64_t min_seq = UINT64_MAX;
+                    for (auto it = bsctx->device_cache.begin(); it != bsctx->device_cache.end(); ++it) {
+                        if (it->second.buffer && it->second.use_sequence < min_seq) {
+                            // Don't evict buffers that are currently wired to a live tensor.
+                            // Two cases:
+                            //   1. The layer is fully sharpened (is_sharpened == true) — its
+                            //      tensors' data pointers reference cached buffers.
+                            //   2. The layer is currently BEING BUILT (building_layer_idx) —
+                            //      earlier tensors in this layer already had their data
+                            //      pointers swapped to cached buffers, but is_sharpened
+                            //      hasn't been set yet.  Evicting these would leave
+                            //      base_tensor->data pointing at freed GPU memory.
+                            bool in_use = false;
+                            if (it->second.layer_idx >= 0) {
+                                // Guard against self-eviction during layer construction
+                                if (it->second.layer_idx == bsctx->building_layer_idx) {
+                                    in_use = true;
+                                }
+                                auto lb_it = bsctx->layer_backups.find(it->second.layer_idx);
+                                if (lb_it != bsctx->layer_backups.end() && lb_it->second.is_sharpened) {
+                                    in_use = true;
+                                }
+                            }
+                            if (!in_use) {
+                                min_seq = it->second.use_sequence;
+                                lru_it = it;
+                            }
+                        }
+                    }
+
+                    if (lru_it == bsctx->device_cache.end()) {
+                        break;  // all remaining cached buffers are in use
+                    }
+
+                    // Sync device ONCE before the first free to ensure all
+                    // async CUDA kernels (from a previous JIT layer) have
+                    // completed and are no longer reading from these buffers.
+                    if (!synced) {
+                        bs_sync_device_before_eviction(bsctx);
+                        synced = true;
+                    }
+
+                    if (bsctx->params.verbose) {
+                        LLAMA_LOG_INFO("%s: cache evict '%s' (%.2f MiB, seq=%" PRIu64 ")\n",
+                                      __func__, lru_it->first.c_str(),
+                                      lru_it->second.nbytes / (1024.0 * 1024.0),
+                                      lru_it->second.use_sequence);
+                    }
+
+                    freed += (int64_t)lru_it->second.nbytes;
+                    bsctx->device_cache_bytes -= (int64_t)lru_it->second.nbytes;
+                    ggml_backend_buffer_free(lru_it->second.buffer);
+                    bsctx->device_cache.erase(lru_it);
+                    bsctx->n_cache_evictions++;
+                }
+
+                // Recompute effective bytes after eviction
+                effective_device_bytes = bsctx->device_cache_bytes;
+            }
+
+            // After eviction attempt, re-check budget
+            if (bsctx->params.gpu_budget_bytes > 0 &&
+                (effective_device_bytes + (int64_t)sharp_info.nbytes) > bsctx->params.gpu_budget_bytes) {
+                if (bsctx->params.verbose) {
+                    LLAMA_LOG_WARN("%s: GPU budget exceeded (used %" PRId64 " + %zu > budget %" PRId64 "), "
+                                  "cannot overlay device tensor '%s'\n",
+                                  __func__,
+                                  effective_device_bytes,
+                                  sharp_info.nbytes,
+                                  bsctx->params.gpu_budget_bytes,
+                                  sharp_info.name.c_str());
+                }
+                bsctx->n_device_tensors_skipped++;
+                return -1;
+            }
+        }
+
+        // a) Allocate a device buffer on the same backend as the tensor.
+        //
+        //    IMPORTANT: CUDA quantized matmul kernels read up to
+        //    MATRIX_ROW_PADDING (512) elements past the logical end of each
+        //    row.  The normal model-loading path sizes every tensor's
+        //    allocation via ggml_backend_buft_get_alloc_size() which adds
+        //    that padding, and then ggml_backend_buffer_init_tensor() zeros
+        //    it.  We must do the same here, otherwise the kernel reads
+        //    uninitialized GPU memory — which may contain NaN bit patterns
+        //    — and the NaN cascades through every subsequent layer, making
+        //    all logits NaN.
+        //
+        ggml_backend_buffer_type_t buft = device_buft;
+
+        // Temporarily set the tensor type AND nb[] to the sharp type so
+        // that ggml_backend_buft_get_alloc_size computes the correct
+        // padded size.  ggml_nbytes() for quantized types uses
+        // ne[1]*nb[1], so nb[] MUST match the type — otherwise we get
+        // a size based on the blurry row stride, which is wrong.
+        ggml_type saved_type = base_tensor->type;
+        size_t saved_nb[GGML_MAX_DIMS];
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            saved_nb[d] = base_tensor->nb[d];
+        }
+
+        base_tensor->type  = sharp_info.type;
+        base_tensor->nb[0] = ggml_type_size(sharp_info.type);
+        base_tensor->nb[1] = ggml_row_size(sharp_info.type, base_tensor->ne[0]);
+        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+            base_tensor->nb[d] = base_tensor->nb[d - 1] * base_tensor->ne[d - 1];
+        }
+        size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, base_tensor);
+
+        // Restore original type and nb[] until we're ready to commit
+        base_tensor->type = saved_type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            base_tensor->nb[d] = saved_nb[d];
+        }
+
+        // Ensure alloc_size is at least as large as the raw tensor data
+        if (alloc_size < sharp_info.nbytes) {
+            alloc_size = sharp_info.nbytes;
+        }
+
+        ggml_backend_buffer_t sharp_buf = ggml_backend_buft_alloc_buffer(buft, alloc_size);
+        if (!sharp_buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate device buffer (%zu bytes, padded from %zu) for tensor '%s'\n",
+                           __func__, alloc_size, sharp_info.nbytes, sharp_info.name.c_str());
+            bsctx->n_device_tensors_skipped++;
+            return -1;
+        }
+
+        // Mark the buffer as holding weight data so the backend scheduler
+        // treats it the same as the original model weight buffers.  Without
+        // this flag the scheduler's "operations with weights" heuristic is
+        // skipped and backend assignment falls through to weaker heuristics,
+        // which can mis-assign operations or fail to create graph splits.
+        ggml_backend_buffer_set_usage(sharp_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        // Zero the entire device buffer so that padding bytes beyond the
+        // tensor data are 0, not uninitialised garbage / NaN.
+        ggml_backend_buffer_clear(sharp_buf, 0);
+
+        // b) Read sharp data into staging buffer for GPU upload.
+        //    Uses optimized path: mmap → pinned directly when possible,
+        //    skipping the intermediate heap buffer copy.
+        const void * staging_src = bs_read_to_staging(bsctx, sharp_info);
+        if (!staging_src) {
+            ggml_backend_buffer_free(sharp_buf);
+            return -1;
+        }
+
+        // --- Source data integrity check (verbose mode only) ---
+        if (bsctx->params.verbose && sharp_info.nbytes >= 16) {
+            const uint8_t * raw = (const uint8_t *)staging_src;
+            bool all_zero = true;
+            bool all_ff   = true;
+            for (size_t b = 0; b < 16; ++b) {
+                if (raw[b] != 0x00) all_zero = false;
+                if (raw[b] != 0xFF) all_ff   = false;
+            }
+            for (size_t b = sharp_info.nbytes - 16; b < sharp_info.nbytes; ++b) {
+                if (raw[b] != 0x00) all_zero = false;
+                if (raw[b] != 0xFF) all_ff   = false;
+            }
+            if (all_zero) {
+                LLAMA_LOG_WARN("%s: *** tensor '%s' sharp data is ALL ZEROS — "
+                              "possible file read failure (offset=%zu, nbytes=%zu) ***\n",
+                              __func__, sharp_info.name.c_str(),
+                              sharp_info.file_offset, sharp_info.nbytes);
+            }
+            if (all_ff) {
+                LLAMA_LOG_WARN("%s: *** tensor '%s' sharp data is ALL 0xFF — "
+                              "possible corrupt/unmapped region (offset=%zu, nbytes=%zu) ***\n",
+                              __func__, sharp_info.name.c_str(),
+                              sharp_info.file_offset, sharp_info.nbytes);
+            }
+        }
+
+        // c) Save original tensor state, then wire tensor to the new buffer
+        //    so that ggml_backend_tensor_set dispatches to the right device.
+        backup_out.original_buffer      = base_tensor->buffer;
+        backup_out.device_sharp_buffer  = sharp_buf;
+
+        void * sharp_base = ggml_backend_buffer_get_base(sharp_buf);
+        base_tensor->data   = sharp_base;
+        base_tensor->buffer = sharp_buf;
+        base_tensor->type   = sharp_info.type;
+        base_tensor->nb[0]  = ggml_type_size(sharp_info.type);
+        base_tensor->nb[1]  = ggml_row_size(sharp_info.type, base_tensor->ne[0]);
+        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+            base_tensor->nb[d] = base_tensor->nb[d - 1] * base_tensor->ne[d - 1];
+        }
+
+        // Clear view_src BEFORE tensor_set so dispatch goes through the
+        // correct (new) buffer, not the stale original via view_src.
+        base_tensor->view_src = nullptr;
+
+        // Clear extra so CUDA compute uses tensor->data (our new regular
+        // buffer) instead of following split-tensor metadata that still
+        // points at the original device allocation.
+        base_tensor->extra = nullptr;
+
+        // Copy CPU staging data → device via the backend's set_tensor
+        ggml_backend_tensor_set(base_tensor, staging_src, 0, sharp_info.nbytes);
+
+        // --- Post-copy device readback verification (verbose only) ---
+        // Read back a small chunk from the device and compare against the
+        // source staging buffer to confirm the H2D copy was correct.
+        // This catches silent DMA failures, wrong-pointer copies, and
+        // pinned-staging corruption issues.
+        if (bsctx->params.verbose) {
+            const size_t verify_bytes = std::min<size_t>(64, sharp_info.nbytes);
+            std::vector<uint8_t> readback(verify_bytes, 0xAA);  // sentinel fill
+            ggml_backend_tensor_get(base_tensor, readback.data(), 0, verify_bytes);
+
+            bool mismatch = false;
+            const uint8_t * src_bytes = (const uint8_t *)staging_src;
+            for (size_t b = 0; b < verify_bytes; ++b) {
+                if (readback[b] != src_bytes[b]) {
+                    mismatch = true;
+                    break;
+                }
+            }
+
+            if (mismatch) {
+                LLAMA_LOG_ERROR("%s: *** READBACK MISMATCH for tensor '%s' — "
+                               "device data does not match staging buffer! ***\n",
+                               __func__, sharp_info.name.c_str());
+                LLAMA_LOG_ERROR("%s:   first bytes staging: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                               __func__,
+                               src_bytes[0], src_bytes[1], src_bytes[2], src_bytes[3],
+                               src_bytes[4], src_bytes[5], src_bytes[6], src_bytes[7]);
+                LLAMA_LOG_ERROR("%s:   first bytes device:  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                               __func__,
+                               readback[0], readback[1], readback[2], readback[3],
+                               readback[4], readback[5], readback[6], readback[7]);
+            }
+
+            LLAMA_LOG_INFO("%s: device tensor '%s': alloc=%zu data=%zu type=%s ne=[%" PRId64 ",%" PRId64 "] "
+                          "buf=%p data=%p verify=%s\n",
+                          __func__, sharp_info.name.c_str(),
+                          alloc_size, sharp_info.nbytes,
+                          ggml_type_name(sharp_info.type),
+                          base_tensor->ne[0], base_tensor->ne[1],
+                          (void *)sharp_buf, base_tensor->data,
+                          mismatch ? "FAIL" : "ok");
+        }
+
+        // Track GPU memory usage (track the actual allocation, not just data)
+        bsctx->current_device_sharp_bytes += (int64_t)alloc_size;
+
+        // If retaining, store this buffer in the cache for future reuse
+        if (bsctx->retain_device_buffers) {
+            blurry_sharp_device_cache_entry entry;
+            entry.buffer       = sharp_buf;
+            entry.nbytes       = alloc_size;
+            entry.populated    = true;
+            entry.use_sequence = bsctx->cache_use_counter++;
+            entry.layer_idx    = sharp_info.layer_idx;
+            bsctx->device_cache[sharp_info.name] = entry;
+            bsctx->device_cache_bytes += (int64_t)alloc_size;
+            bsctx->n_cache_allocs++;
+            backup_out.device_buf_cached = true;  // do NOT free on restore
+        }
+
+        bsctx->metrics.n_direct_copies++;
+    }
+
+    return (int64_t)sharp_info.nbytes;
+}
+
+// ---------------------------------------------------------------------------
+// Internal: permanent (one-way) overlay of a single tensor
+//
+// Unlike bs_overlay_single_tensor, this does NOT create a backup.
+// The blurry data is overwritten / abandoned and cannot be restored.
+//
+// Memory strategy:
+//   - GPU tensor, SAME type+size: upload sharp data directly into the
+//     existing device buffer via ggml_backend_tensor_set.  Zero extra VRAM.
+//   - GPU tensor, DIFFERENT type: allocate a new device buffer, upload
+//     sharp data, pointer-swap.  The old data stays in the model's shared
+//     allocation (can't free it piecewise) but we don't allocate a backup.
+//   - CPU tensor, mmap: pointer-swap to sharp mmap page.  Release blurry
+//     mmap pages via MADV_DONTNEED.
+//   - CPU tensor, no mmap: read sharp data into a heap buffer, swap pointer.
+//
+// Returns bytes of sharp data written, or -1 on error.
+// ---------------------------------------------------------------------------
+
+static int64_t bs_overlay_single_tensor_permanent(
+        llama_blurry_sharp_context      * bsctx,
+        const blurry_sharp_tensor_info  & sharp_info,
+        ggml_tensor                     * base_tensor) {
+
+    bool tensor_is_host = true;
+    if (base_tensor->buffer) {
+        tensor_is_host = ggml_backend_buffer_is_host(base_tensor->buffer);
+    }
+
+    if (tensor_is_host) {
+        // ================================================================
+        // HOST PATH — pointer-swap (permanent, no backup)
+        // ================================================================
+        int si = sharp_info.split_idx;
+        bool have_mmap = (si >= 0 && si < (int)bsctx->sharp_mmaps.size()
+                          && bsctx->sharp_mmaps[si]);
+
+        if (have_mmap) {
+            // ZERO-COPY: point directly at the mmap'd sharp page.
+            const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+            if (sharp_info.file_offset + sharp_info.nbytes > bsctx->sharp_mmaps[si]->size()) {
+                LLAMA_LOG_ERROR("%s: mmap read out of bounds for tensor '%s' (split %d)\n",
+                               __func__, sharp_info.name.c_str(), si);
+                return -1;
+            }
+
+            // Release old blurry mmap pages — we're done with them permanently
+            if (base_tensor->data) {
+                int64_t ne_arr[GGML_MAX_DIMS];
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) ne_arr[d] = base_tensor->ne[d];
+                size_t old_nbytes = bs_tensor_nbytes(base_tensor->type, ne_arr);
+                bs_release_mmap_pages(base_tensor->data, old_nbytes);
+            }
+
+            base_tensor->data = const_cast<uint8_t *>(mmap_base + sharp_info.file_offset);
+        } else {
+            // BUFFERED: read into heap memory.  In permanent mode we leak the
+            // old data pointer (it's part of the model's mmap or allocation,
+            // can't free it piecewise).  The new buffer is allocated and never
+            // freed until the model itself is freed.
+            if (si < 0 || si >= (int)bsctx->sharp_files.size() || !bsctx->sharp_files[si]) {
+                LLAMA_LOG_ERROR("%s: no file handle for split %d (tensor '%s')\n",
+                               __func__, si, sharp_info.name.c_str());
+                return -1;
+            }
+            // Allocate persistent buffer (intentionally leaked — lives as long as model)
+            uint8_t * buf = new uint8_t[sharp_info.nbytes];
+            bsctx->sharp_files[si]->seek(sharp_info.file_offset, SEEK_SET);
+            bsctx->sharp_files[si]->read_raw(buf, sharp_info.nbytes);
+            base_tensor->data = buf;
+        }
+
+        // Update tensor type and recompute strides for the sharp quant format
+        base_tensor->type = sharp_info.type;
+        base_tensor->nb[0] = ggml_type_size(sharp_info.type);
+        base_tensor->nb[1] = ggml_row_size(sharp_info.type, base_tensor->ne[0]);
+        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+            base_tensor->nb[d] = base_tensor->nb[d - 1] * base_tensor->ne[d - 1];
+        }
+
+        // Clear view_src so dispatch goes through tensor->buffer
+        base_tensor->view_src = nullptr;
+
+        bsctx->metrics.n_direct_copies++;
+
+    } else {
+        // ================================================================
+        // DEVICE PATH — permanent overwrite
+        //
+        // Two sub-strategies:
+        //   A) SAME TYPE + SAME SIZE: upload sharp data directly into the
+        //      existing device buffer.  No new allocation.  Zero extra VRAM.
+        //   B) DIFFERENT TYPE/SIZE: allocate a new device buffer, upload
+        //      sharp data, pointer-swap.  Old data stays in the model's
+        //      shared allocation (unavoidable) but no backup is created.
+        // ================================================================
+
+        bool same_type = (base_tensor->type == sharp_info.type);
+        size_t base_nbytes = ggml_nbytes(base_tensor);
+        bool same_size = (base_nbytes == sharp_info.nbytes);
+
+        if (same_type && same_size) {
+            // ---- Strategy A: IN-PLACE OVERWRITE (zero extra VRAM) ----
+            // Read sharp data into staging, then ggml_backend_tensor_set
+            // directly into the existing device buffer.
+            const void * staging_src = bs_read_to_staging(bsctx, sharp_info);
+            if (!staging_src) {
+                LLAMA_LOG_ERROR("%s: failed to read sharp data for in-place overwrite of '%s'\n",
+                               __func__, sharp_info.name.c_str());
+                return -1;
+            }
+
+            // For split buffers, we need to handle the tensor_set differently.
+            // The standard ggml_backend_tensor_set dispatches through
+            // tensor->buffer which handles split buffers correctly via
+            // tensor->extra.  So this works for both regular and split buffers.
+            ggml_backend_tensor_set(base_tensor, staging_src, 0, sharp_info.nbytes);
+
+            if (bsctx->params.verbose) {
+                LLAMA_LOG_INFO("%s: permanent in-place overwrite '%s' (%s, %zu bytes, zero extra VRAM)\n",
+                              __func__, sharp_info.name.c_str(),
+                              ggml_type_name(sharp_info.type), sharp_info.nbytes);
+            }
+
+        } else {
+            // ---- Strategy B: NEW BUFFER (different type/size) ----
+            ggml_backend_buffer_type_t device_buft = bs_get_device_buft(bsctx, base_tensor->buffer);
+
+            // Temporarily set tensor type/strides for correct alloc_size computation
+            ggml_type saved_type = base_tensor->type;
+            size_t saved_nb[GGML_MAX_DIMS];
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) saved_nb[d] = base_tensor->nb[d];
+
+            base_tensor->type  = sharp_info.type;
+            base_tensor->nb[0] = ggml_type_size(sharp_info.type);
+            base_tensor->nb[1] = ggml_row_size(sharp_info.type, base_tensor->ne[0]);
+            for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+                base_tensor->nb[d] = base_tensor->nb[d - 1] * base_tensor->ne[d - 1];
+            }
+            size_t alloc_size = ggml_backend_buft_get_alloc_size(device_buft, base_tensor);
+
+            // Restore temporarily (we'll set them again after successful alloc)
+            base_tensor->type = saved_type;
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) base_tensor->nb[d] = saved_nb[d];
+
+            if (alloc_size < sharp_info.nbytes) alloc_size = sharp_info.nbytes;
+
+            ggml_backend_buffer_t sharp_buf = ggml_backend_buft_alloc_buffer(device_buft, alloc_size);
+            if (!sharp_buf) {
+                LLAMA_LOG_ERROR("%s: failed to allocate device buffer (%zu bytes) for permanent overlay of '%s'\n",
+                               __func__, alloc_size, sharp_info.name.c_str());
+                return -1;
+            }
+
+            ggml_backend_buffer_set_usage(sharp_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_backend_buffer_clear(sharp_buf, 0);
+
+            // Read sharp data into staging
+            const void * staging_src = bs_read_to_staging(bsctx, sharp_info);
+            if (!staging_src) {
+                ggml_backend_buffer_free(sharp_buf);
+                return -1;
+            }
+
+            // Wire tensor to new buffer
+            void * sharp_base = ggml_backend_buffer_get_base(sharp_buf);
+            base_tensor->data     = sharp_base;
+            base_tensor->buffer   = sharp_buf;
+            base_tensor->type     = sharp_info.type;
+            base_tensor->nb[0]    = ggml_type_size(sharp_info.type);
+            base_tensor->nb[1]    = ggml_row_size(sharp_info.type, base_tensor->ne[0]);
+            for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+                base_tensor->nb[d] = base_tensor->nb[d - 1] * base_tensor->ne[d - 1];
+            }
+            base_tensor->view_src = nullptr;
+            base_tensor->extra    = nullptr;
+
+            // Upload sharp data
+            ggml_backend_tensor_set(base_tensor, staging_src, 0, sharp_info.nbytes);
+
+            // Track the new buffer in device_cache so it gets freed on context destruction.
+            // We use the cache as an ownership list, not for restore (permanent mode).
+            blurry_sharp_device_cache_entry entry;
+            entry.buffer       = sharp_buf;
+            entry.nbytes       = alloc_size;
+            entry.populated    = true;
+            entry.use_sequence = bsctx->cache_use_counter++;
+            entry.layer_idx    = sharp_info.layer_idx;
+            bsctx->device_cache[sharp_info.name] = entry;
+            bsctx->device_cache_bytes += (int64_t)alloc_size;
+
+            if (bsctx->params.verbose) {
+                LLAMA_LOG_INFO("%s: permanent new-buffer overlay '%s' (%s → %s, %zu bytes)\n",
+                              __func__, sharp_info.name.c_str(),
+                              ggml_type_name(saved_type),
+                              ggml_type_name(sharp_info.type), alloc_size);
+            }
+        }
+
+        bsctx->metrics.n_direct_copies++;
+    }
+
+    return (int64_t)sharp_info.nbytes;
+}
+
+// ---------------------------------------------------------------------------
+// Internal: restore a single tensor from backup
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Lazy swap: push a layer's RAM-cached tensor pages to swap via MADV_PAGEOUT.
+//
+// Called after restore_layer / restore_all when lazy_swap_enabled is true.
+// The tensor data is now "cold" (tensor pointers have been restored to blurry),
+// so we can push the anonymous heap pages to swap, freeing RAM for the blurry
+// model / KV cache.  Next time apply_layer is called, the OS will swap-in
+// from SSD (fast) instead of re-reading from the GGUF file (slow).
+// ---------------------------------------------------------------------------
+static void bs_lazy_swap_pageout_layer(
+        llama_blurry_sharp_context * bsctx,
+        int                          layer_idx) {
+#ifdef __linux__
+    #ifndef MADV_PAGEOUT
+    #define MADV_PAGEOUT 21
+    #endif
+
+    auto layer_it = bsctx->layer_tensor_names.find(layer_idx);
+    if (layer_it == bsctx->layer_tensor_names.end()) return;
+
+    int32_t n_paged = 0;
+    int64_t paged_bytes = 0;
+
+    for (const auto & tensor_name : layer_it->second) {
+        auto cache_it = bsctx->ram_cache.find(tensor_name);
+        if (cache_it == bsctx->ram_cache.end() || cache_it->second.empty()) continue;
+
+        int ret = madvise(cache_it->second.data(), cache_it->second.size(), MADV_PAGEOUT);
+        if (ret == 0) {
+            ++n_paged;
+            paged_bytes += (int64_t)cache_it->second.size();
+        }
+    }
+
+    if (bsctx->params.verbose && n_paged > 0) {
+        LLAMA_LOG_INFO("%s: lazy-swap: paged out %d tensors (%.2f MiB) for layer %d\n",
+                      __func__, n_paged, paged_bytes / (1024.0 * 1024.0), layer_idx);
+    }
+#else
+    (void)bsctx;
+    (void)layer_idx;
+#endif
+}
+
+static bool bs_restore_single_tensor(
+        llama_blurry_sharp_context     * bsctx,
+        blurry_sharp_tensor_backup     & backup) {
+    // Use cached pointer (O(1)) instead of linear search (O(n))
+    ggml_tensor * base_tensor = backup.base_tensor;
+    if (!base_tensor) {
+        // Fallback to linear search if cache wasn't populated
+        base_tensor = bs_find_model_tensor(bsctx->model, backup.tensor_name.c_str());
+    }
+    if (!base_tensor) {
+        LLAMA_LOG_ERROR("%s: cannot find tensor '%s' for restoration\n",
+                       __func__, backup.tensor_name.c_str());
+        return false;
+    }
+
+    // ---- In-place expert slice restore (host or device) ----
+    // If expert_backup_ids is non-empty, this tensor was sharpened via the
+    // in-place expert slice strategy (Strategy A/B in overlay_expert_tensor).
+    // Restore by writing back the saved blurry expert slices.
+    if (!backup.expert_backup_ids.empty()) {
+        size_t n_backed = backup.expert_backup_ids.size();
+        // Compute per-expert slice size from the backup dimensions
+        size_t total_bytes = bs_tensor_nbytes(backup.original_type, backup.ne);
+        int32_t n_expert_total = (int32_t)backup.ne[2];
+        size_t expert_slice = (n_expert_total > 0) ? total_bytes / (size_t)n_expert_total : total_bytes;
+        size_t data_offset = 0;
+
+        if (backup.is_device) {
+            // Write back blurry slices to device
+            for (size_t i = 0; i < n_backed; ++i) {
+                size_t slice_off = (size_t)backup.expert_backup_ids[i] * expert_slice;
+                ggml_backend_tensor_set(base_tensor,
+                    backup.expert_backup_data.data() + data_offset,
+                    slice_off, expert_slice);
+                data_offset += expert_slice;
+            }
+        } else {
+            // Write back blurry slices to host memory
+            uint8_t * base_data = (uint8_t *)base_tensor->data;
+            for (size_t i = 0; i < n_backed; ++i) {
+                size_t slice_off = (size_t)backup.expert_backup_ids[i] * expert_slice;
+                std::memcpy(base_data + slice_off,
+                            backup.expert_backup_data.data() + data_offset,
+                            expert_slice);
+                data_offset += expert_slice;
+            }
+        }
+
+        backup.expert_backup_ids.clear();
+        backup.expert_backup_data.clear();
+        backup.expert_backup_data.shrink_to_fit();
+        return true;
+    }
+
+    if (backup.is_device) {
+        // DEVICE PATH: pointer-swap restore — put back original {data, type, nb[], buffer, view_src, extra}
+        //
+        // Release sharp GPU tensor's backing mmap pages (if the data was also
+        // left resident in the page cache by a cached-but-repopulated path).
+        // This is a no-op if the pages were already released during staging.
+
+        base_tensor->data     = backup.original_data;
+        base_tensor->type     = backup.original_type;
+        base_tensor->buffer   = backup.original_buffer;
+        base_tensor->view_src = backup.original_view_src;
+        base_tensor->extra    = backup.original_extra;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            base_tensor->nb[d] = backup.original_nb[d];
+        }
+        if (backup.device_sharp_buffer) {
+            if (backup.device_buf_cached) {
+                // Buffer is in the cache — do NOT free it.  It will be reused
+                // next time this tensor is sharpened (zero-cost re-sharpen).
+                // Just detach it from the backup so it isn't double-freed.
+                backup.device_sharp_buffer = nullptr;
+            } else {
+                // Not cached — free the device buffer and track GPU memory freed
+                bsctx->current_device_sharp_bytes -= (int64_t)ggml_backend_buffer_get_size(backup.device_sharp_buffer);
+                ggml_backend_buffer_free(backup.device_sharp_buffer);
+                backup.device_sharp_buffer = nullptr;
+            }
+        }
+    } else {
+        // HOST PATH: pointer-swap restore — put back the saved metadata including view_src and extra.
+        //
+        // For zero-copy tensors pointing at mmap pages, release them so the
+        // sharp model doesn't linger in the page cache.
+        //
+        // IMPORTANT: Do NOT call bs_release_mmap_pages on RAM cache buffers!
+        // On Linux, MADV_DONTNEED on anonymous (heap) pages ZEROS them out,
+        // destroying the cached data.  Only release file-backed mmap pages.
+        if (backup.zero_copy && base_tensor->data) {
+            bool is_ram_cache_ptr = false;
+            if (bsctx->ram_cache_populated || bsctx->lazy_swap_enabled) {
+                // Check if data points into any RAM cache buffer
+                for (auto & kv : bsctx->ram_cache) {
+                    const uint8_t * buf_start = kv.second.data();
+                    const uint8_t * buf_end   = buf_start + kv.second.size();
+                    const uint8_t * data_ptr  = (const uint8_t *)base_tensor->data;
+                    if (data_ptr >= buf_start && data_ptr < buf_end) {
+                        is_ram_cache_ptr = true;
+                        break;
+                    }
+                }
+            }
+            if (!is_ram_cache_ptr) {
+                size_t sharp_nbytes = bs_tensor_nbytes(base_tensor->type, backup.ne);
+                bs_release_mmap_pages(base_tensor->data, sharp_nbytes);
+            }
+        }
+
+        base_tensor->data     = backup.original_data;
+        base_tensor->type     = backup.original_type;
+        base_tensor->view_src = backup.original_view_src;
+        base_tensor->extra    = backup.original_extra;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            base_tensor->nb[d] = backup.original_nb[d];
+        }
+
+        // Release the sharp data buffer (only if we allocated one)
+        if (!backup.zero_copy) {
+            backup.sharp_data.clear();
+            backup.sharp_data.shrink_to_fit();
+        }
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Eviction
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_evict_to_budget(
+        llama_blurry_sharp_context * bsctx,
+        int64_t                      target_bytes) {
+    if (!bsctx) return 0;
+    std::lock_guard<std::mutex> lock(bsctx->mtx);
+
+    int32_t n_evicted = 0;
+
+    while (bsctx->current_backup_bytes > target_bytes && !bsctx->layer_backups.empty()) {
+        // Find the layer to evict based on policy
+        int evict_layer = -1;
+
+        switch (bsctx->params.eviction_policy) {
+            case LLAMA_BS_EVICT_LRU: {
+                // Evict the layer with the smallest apply_sequence (oldest use)
+                uint64_t min_seq = UINT64_MAX;
+                for (auto & kv : bsctx->layer_backups) {
+                    if (kv.second.is_sharpened && kv.second.apply_sequence < min_seq) {
+                        min_seq = kv.second.apply_sequence;
+                        evict_layer = kv.first;
+                    }
+                }
+                break;
+            }
+            case LLAMA_BS_EVICT_FIFO: {
+                // Same as LRU for this implementation (oldest first)
+                uint64_t min_seq = UINT64_MAX;
+                for (auto & kv : bsctx->layer_backups) {
+                    if (kv.second.is_sharpened && kv.second.apply_sequence < min_seq) {
+                        min_seq = kv.second.apply_sequence;
+                        evict_layer = kv.first;
+                    }
+                }
+                break;
+            }
+            case LLAMA_BS_EVICT_PRIORITY: {
+                // Evict the layer with the most backup bytes (biggest recovery)
+                int64_t max_bytes = -1;
+                for (auto & kv : bsctx->layer_backups) {
+                    if (kv.second.is_sharpened && kv.second.backup_bytes > max_bytes) {
+                        max_bytes = kv.second.backup_bytes;
+                        evict_layer = kv.first;
+                    }
+                }
+                break;
+            }
+        }
+
+        if (evict_layer < 0) break;
+
+        // Restore this layer (unlock not needed, we hold the lock already)
+        auto it = bsctx->layer_backups.find(evict_layer);
+        if (it == bsctx->layer_backups.end()) break;
+
+        int64_t t_start = bs_time_us();
+
+        for (auto & tb : it->second.tensor_backups) {
+            bs_restore_single_tensor(bsctx, tb);
+        }
+
+        bsctx->current_backup_bytes -= it->second.backup_bytes;
+        bsctx->layer_backups.erase(it);
+
+        int64_t t_end = bs_time_us();
+        bsctx->metrics.total_time_restore_us += (t_end - t_start);
+        bsctx->metrics.n_evictions++;
+        bsctx->metrics.n_restore_calls++;
+
+        ++n_evicted;
+
+        if (bsctx->params.verbose) {
+            LLAMA_LOG_INFO("%s: evicted layer %d (backup_bytes now = %" PRId64 ")\n",
+                          __func__, evict_layer, bsctx->current_backup_bytes);
+        }
+    }
+
+    return n_evicted;
+}
+
+// ---------------------------------------------------------------------------
+// Apply layer
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_apply_layer(
+        llama_blurry_sharp_context * bsctx,
+        int                          layer_idx) {
+    if (!bsctx || !bsctx->initialized) return -1;
+    std::lock_guard<std::mutex> lock(bsctx->mtx);
+
+    // Check eligibility
+    if (bsctx->eligible_layers.find(layer_idx) == bsctx->eligible_layers.end()) {
+        if (bsctx->params.verbose) {
+            LLAMA_LOG_INFO("%s: layer %d is not eligible for sharpening\n",
+                          __func__, layer_idx);
+        }
+        return -1;
+    }
+
+    // Check if already sharpened
+    {
+        auto it = bsctx->layer_backups.find(layer_idx);
+        if (it != bsctx->layer_backups.end() && it->second.is_sharpened) {
+            // Already sharpened – just touch the sequence counter for LRU
+            it->second.apply_sequence = bsctx->apply_sequence_counter++;
+            it->second.apply_timestamp_us = bs_time_us();
+            return 0;
+        }
+    }
+
+    // Check max_sharp_layers limit
+    if (bsctx->params.max_sharp_layers > 0) {
+        int32_t n_currently_sharp = 0;
+        for (auto & kv : bsctx->layer_backups) {
+            if (kv.second.is_sharpened) n_currently_sharp++;
+        }
+        if (n_currently_sharp >= bsctx->params.max_sharp_layers) {
+            // Need to evict at least one layer
+            int64_t budget = bsctx->current_backup_bytes; // keep same byte budget
+            int32_t evicted = llama_blurry_sharp_evict_to_budget(bsctx,
+                budget > 0 ? budget - 1 : 0);
+            // Recount
+            n_currently_sharp = 0;
+            for (auto & kv : bsctx->layer_backups) {
+                if (kv.second.is_sharpened) n_currently_sharp++;
+            }
+            if (n_currently_sharp >= bsctx->params.max_sharp_layers) {
+                LLAMA_LOG_WARN("%s: max_sharp_layers=%d reached, cannot sharpen layer %d\n",
+                              __func__, bsctx->params.max_sharp_layers, layer_idx);
+                return -3;
+            }
+            (void)evicted;
+        }
+    }
+
+    // Get tensor names for this layer
+    auto layer_it = bsctx->layer_tensor_names.find(layer_idx);
+    if (layer_it == bsctx->layer_tensor_names.end() || layer_it->second.empty()) {
+        LLAMA_LOG_WARN("%s: no sharp tensors found for layer %d\n", __func__, layer_idx);
+        return -2;
+    }
+
+    int64_t t_start = bs_time_us();
+
+    // -----------------------------------------------------------------------
+    // PERMANENT MODE: one-way overwrite, no backup, no restore capability.
+    // Dramatically reduces memory usage for static overlay (apply once).
+    // -----------------------------------------------------------------------
+    if (bsctx->params.permanent) {
+        int n_success = 0;
+        int n_fail    = 0;
+
+        bs_prefetch_layer_mmap(bsctx, layer_idx);
+
+        for (const auto & tensor_name : layer_it->second) {
+            auto info_it = bsctx->sharp_index.find(tensor_name);
+            if (info_it == bsctx->sharp_index.end()) continue;
+
+            const auto & sharp_info = info_it->second;
+
+            ggml_tensor * base_tensor = sharp_info.base_tensor;
+            if (!base_tensor) {
+                base_tensor = bs_find_model_tensor(bsctx->model, tensor_name.c_str());
+            }
+            if (!base_tensor) {
+                LLAMA_LOG_WARN("%s: base tensor '%s' not found, skipping\n",
+                              __func__, tensor_name.c_str());
+                ++n_fail;
+                continue;
+            }
+
+            ggml_type old_type = base_tensor->type;
+            int64_t sharp_bytes = bs_overlay_single_tensor_permanent(bsctx, sharp_info, base_tensor);
+            if (sharp_bytes < 0) {
+                LLAMA_LOG_ERROR("%s: permanent overlay failed for tensor '%s'\n",
+                               __func__, tensor_name.c_str());
+                ++n_fail;
+                continue;
+            }
+
+            bsctx->metrics.total_sharp_bytes_read += sharp_bytes;
+            ++n_success;
+
+            if (bsctx->params.verbose) {
+                LLAMA_LOG_INFO("%s: permanent overlay '%s' (%s → %s, %zu bytes)\n",
+                              __func__, tensor_name.c_str(),
+                              ggml_type_name(old_type),
+                              ggml_type_name(sharp_info.type),
+                              sharp_info.nbytes);
+            }
+        }
+
+        int64_t t_end = bs_time_us();
+        bsctx->metrics.n_apply_calls++;
+        bsctx->metrics.total_time_apply_us += (t_end - t_start);
+
+        // Mark as sharpened (but with no backups — permanent)
+        blurry_sharp_layer_backup marker;
+        marker.layer_idx          = layer_idx;
+        marker.is_sharpened       = (n_success > 0);
+        marker.backup_bytes       = 0;  // no backup in permanent mode
+        marker.sharp_bytes_read   = 0;
+        marker.apply_timestamp_us = t_start;
+        marker.apply_sequence     = bsctx->apply_sequence_counter++;
+        // tensor_backups is intentionally empty — no restore possible
+        bsctx->layer_backups[layer_idx] = std::move(marker);
+
+        if (bsctx->params.verbose) {
+            LLAMA_LOG_INFO("%s: layer %d permanently sharpened (%d/%d tensors, %" PRId64 " us)\n",
+                          __func__, layer_idx, n_success, n_success + n_fail,
+                          t_end - t_start);
+        }
+
+        return (n_success > 0) ? 0 : -4;
+    }
+
+    // -----------------------------------------------------------------------
+    // NORMAL MODE: overlay with backup for later restore
+    // -----------------------------------------------------------------------
+
+    blurry_sharp_layer_backup layer_backup;
+    layer_backup.layer_idx       = layer_idx;
+    layer_backup.is_sharpened    = false; // set to true only on success
+    layer_backup.backup_bytes    = 0;
+    layer_backup.sharp_bytes_read = 0;
+    layer_backup.apply_timestamp_us = t_start;
+    layer_backup.apply_sequence  = bsctx->apply_sequence_counter++;
+
+    bool any_failed = false;
+
+    // Mark this layer as "being built" so the LRU eviction code inside
+    // bs_overlay_single_tensor does NOT evict cache entries that were
+    // just allocated for earlier tensors of THIS layer.  Without this
+    // guard, tensor B's overlay could evict tensor A's freshly-cached
+    // buffer, leaving tensor A's base_tensor->data pointing at freed
+    // GPU memory → illegal memory access when the compute kernel runs.
+    bsctx->building_layer_idx = layer_idx;
+
+    // Prefetch this layer's sharp data from disk into the page cache.
+    // The madvise(WILLNEED) calls are non-blocking — the kernel starts
+    // async I/O immediately.  By the time we iterate through the tensors
+    // below, many pages will already be resident, avoiding synchronous
+    // page-fault stalls.  Each tensor's pages are then released via
+    // MADV_DONTNEED after consumption, so RAM never accumulates more
+    // than ~one layer's worth of sharp data.
+    bs_prefetch_layer_mmap(bsctx, layer_idx);
+
+    for (const auto & tensor_name : layer_it->second) {
+        auto info_it = bsctx->sharp_index.find(tensor_name);
+        if (info_it == bsctx->sharp_index.end()) continue;
+
+        const auto & sharp_info = info_it->second;
+
+        // Find matching tensor in base model (use cached pointer for O(1) lookup)
+        ggml_tensor * base_tensor = sharp_info.base_tensor;
+        if (!base_tensor) {
+            base_tensor = bs_find_model_tensor(bsctx->model, tensor_name.c_str());
+        }
+        if (!base_tensor) {
+            LLAMA_LOG_WARN("%s: base tensor '%s' not found, skipping\n",
+                          __func__, tensor_name.c_str());
+            continue;
+        }
+
+        // Check memory budget before proceeding.
+        // With pointer-swap, the cost is the sharp data buffer we allocate
+        // (not the blurry tensor size, which stays in place untouched).
+        int64_t sharp_cost = (int64_t)sharp_info.nbytes;
+        if (bsctx->params.memory_budget_bytes > 0 &&
+            (bsctx->current_backup_bytes + sharp_cost) > bsctx->params.memory_budget_bytes) {
+            // Try eviction
+            int64_t needed = bsctx->current_backup_bytes + sharp_cost
+                           - bsctx->params.memory_budget_bytes;
+            int64_t target = bsctx->current_backup_bytes - needed;
+            if (target < 0) target = 0;
+            llama_blurry_sharp_evict_to_budget(bsctx, target);
+
+            // Re-check
+            if ((bsctx->current_backup_bytes + sharp_cost) > bsctx->params.memory_budget_bytes) {
+                LLAMA_LOG_WARN("%s: memory budget exceeded, cannot overlay tensor '%s'\n",
+                              __func__, tensor_name.c_str());
+                any_failed = true;
+                continue;
+            }
+        }
+
+        blurry_sharp_tensor_backup tb;
+        ggml_type backup_out_type = base_tensor->type;  // save before swap
+        int64_t sharp_bytes = bs_overlay_single_tensor(bsctx, sharp_info, base_tensor, tb);
+        if (sharp_bytes < 0) {
+            LLAMA_LOG_ERROR("%s: failed to overlay tensor '%s'\n",
+                           __func__, tensor_name.c_str());
+            any_failed = true;
+            continue;
+        }
+
+        layer_backup.backup_bytes     += sharp_bytes;
+        layer_backup.sharp_bytes_read += sharp_bytes;
+        layer_backup.tensor_backups.push_back(std::move(tb));
+
+        bsctx->current_backup_bytes += sharp_bytes;
+        bsctx->metrics.total_sharp_bytes_read += sharp_bytes;
+        bsctx->metrics.total_backup_bytes_written += sharp_bytes;
+
+        // Capture strategy info AFTER the overlay
+        const blurry_sharp_tensor_backup & last_tb = layer_backup.tensor_backups.back();
+        const char * strategy_str =
+            last_tb.is_device  ? "device-swap" :
+            last_tb.zero_copy  ? "zero-copy"   : "buffered";
+
+        if (bsctx->params.verbose) {
+            LLAMA_LOG_INFO("%s: overlaid tensor '%s' (%s, %s → %s, %zu sharp bytes)\n",
+                          __func__, tensor_name.c_str(),
+                          strategy_str,
+                          ggml_type_name(backup_out_type),
+                          ggml_type_name(sharp_info.type),
+                          sharp_info.nbytes);
+        }
+    }
+
+    if (layer_backup.tensor_backups.empty()) {
+        bsctx->building_layer_idx = -1;
+        return any_failed ? -4 : -2;
+    }
+
+    // Safety: if any tensor failed to overlay, roll back the entire layer.
+    // A partially-sharpened layer (some tensors IQ1_S, others Q4_K_S) will
+    // produce garbage output because the quant types are incompatible within
+    // a single layer's computation.  It's better to leave the layer fully
+    // blurry than to have it in a mixed/corrupt state.
+    if (any_failed) {
+        LLAMA_LOG_WARN("%s: layer %d had %d tensor failures — rolling back %d "
+                      "successful overlays to prevent mixed-quant corruption\n",
+                      __func__, layer_idx,
+                      (int)(layer_it->second.size() - layer_backup.tensor_backups.size()),
+                      (int)layer_backup.tensor_backups.size());
+
+        for (auto & tb : layer_backup.tensor_backups) {
+            // If this tensor's device buffer was added to the cache during
+            // overlay, evict it NOW so the GPU memory is actually freed.
+            // Otherwise the cache holds onto buffers from a rolled-back
+            // layer, leaking GPU memory and causing OOM cascades for
+            // subsequent layers.
+            if (tb.is_device && tb.device_buf_cached) {
+                auto cache_it = bsctx->device_cache.find(tb.tensor_name);
+                if (cache_it != bsctx->device_cache.end()) {
+                    if (cache_it->second.buffer) {
+                        bsctx->device_cache_bytes -= (int64_t)cache_it->second.nbytes;
+                        ggml_backend_buffer_free(cache_it->second.buffer);
+                    }
+                    bsctx->device_cache.erase(cache_it);
+                }
+                // Null out the pointer so bs_restore_single_tensor does NOT
+                // double-free the same buffer we just freed via the cache.
+                tb.device_sharp_buffer = nullptr;
+                tb.device_buf_cached = false;
+            }
+            bs_restore_single_tensor(bsctx, tb);
+        }
+        bsctx->current_backup_bytes -= layer_backup.backup_bytes;
+        bsctx->building_layer_idx = -1;
+        return -4;
+    }
+
+    layer_backup.is_sharpened = true;
+    bsctx->layer_backups[layer_idx] = std::move(layer_backup);
+    bsctx->building_layer_idx = -1;
+
+    int64_t t_end = bs_time_us();
+    bsctx->metrics.n_apply_calls++;
+    bsctx->metrics.total_time_apply_us += (t_end - t_start);
+
+    if (bsctx->params.verbose) {
+        LLAMA_LOG_INFO("%s: layer %d sharpened (%d tensors, %" PRId64 " backup bytes, %" PRId64 " us)\n",
+                      __func__, layer_idx,
+                      (int)bsctx->layer_backups[layer_idx].tensor_backups.size(),
+                      bsctx->layer_backups[layer_idx].backup_bytes,
+                      t_end - t_start);
+    }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Restore layer
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_restore_layer(
+        llama_blurry_sharp_context * bsctx,
+        int                          layer_idx) {
+    if (!bsctx) return -1;
+    std::lock_guard<std::mutex> lock(bsctx->mtx);
+
+    // In permanent mode, restore is impossible — blurry data was discarded.
+    if (bsctx->params.permanent) {
+        auto it = bsctx->layer_backups.find(layer_idx);
+        if (it != bsctx->layer_backups.end() && it->second.is_sharpened) {
+            LLAMA_LOG_WARN("%s: permanent mode — cannot restore layer %d, blurry data was discarded\n",
+                          __func__, layer_idx);
+        }
+        return -1;
+    }
+
+    auto it = bsctx->layer_backups.find(layer_idx);
+    if (it == bsctx->layer_backups.end() || !it->second.is_sharpened) {
+        return -1;
+    }
+
+    int64_t t_start = bs_time_us();
+
+    for (auto & tb : it->second.tensor_backups) {
+        if (!bs_restore_single_tensor(bsctx, tb)) {
+            LLAMA_LOG_ERROR("%s: failed to restore tensor '%s' for layer %d\n",
+                           __func__, tb.tensor_name.c_str(), layer_idx);
+        }
+    }
+
+    bsctx->current_backup_bytes -= it->second.backup_bytes;
+    bsctx->layer_backups.erase(it);
+
+    // Lazy swap: push this layer's RAM-cached pages to swap now that the
+    // tensor pointers have been restored to blurry.  The data is "cold" —
+    // freeing RAM for the blurry model / KV cache while keeping the sharp
+    // data quickly accessible via swap-in on the next apply_layer call.
+    if (bsctx->lazy_swap_enabled) {
+        bs_lazy_swap_pageout_layer(bsctx, layer_idx);
+    }
+
+    int64_t t_end = bs_time_us();
+    bsctx->metrics.n_restore_calls++;
+    bsctx->metrics.total_time_restore_us += (t_end - t_start);
+
+    if (bsctx->params.verbose) {
+        LLAMA_LOG_INFO("%s: layer %d restored to blurry (%" PRId64 " us)\n",
+                      __func__, layer_idx, t_end - t_start);
+    }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Restore all
+// ---------------------------------------------------------------------------
+
+void llama_blurry_sharp_restore_all(llama_blurry_sharp_context * bsctx) {
+    if (!bsctx) return;
+    std::lock_guard<std::mutex> lock(bsctx->mtx);
+
+    // In permanent mode, restore is a no-op — data is gone, warn the caller.
+    if (bsctx->params.permanent) {
+        bool any_sharp = false;
+        for (auto & kv : bsctx->layer_backups) {
+            if (kv.second.is_sharpened) { any_sharp = true; break; }
+        }
+        if (any_sharp) {
+            LLAMA_LOG_WARN("%s: permanent mode — restore_all is a no-op, blurry data was discarded\n",
+                          __func__);
+        }
+        return;
+    }
+
+    int64_t t_start = bs_time_us();
+
+    // Collect layer indices first (we modify the map during iteration)
+    std::vector<int> layers_to_restore;
+    for (auto & kv : bsctx->layer_backups) {
+        if (kv.second.is_sharpened) {
+            layers_to_restore.push_back(kv.first);
+        }
+    }
+
+    for (int layer_idx : layers_to_restore) {
+        auto it = bsctx->layer_backups.find(layer_idx);
+        if (it == bsctx->layer_backups.end()) continue;
+
+        for (auto & tb : it->second.tensor_backups) {
+            bs_restore_single_tensor(bsctx, tb);
+        }
+        bsctx->current_backup_bytes -= it->second.backup_bytes;
+        bsctx->layer_backups.erase(it);
+        bsctx->metrics.n_restore_calls++;
+
+        // Lazy swap: push this layer's RAM-cached pages to swap now that
+        // tensor pointers have been restored to blurry.  Frees RAM for
+        // the blurry model / KV cache; next apply_layer will swap-in
+        // from SSD instead of re-reading from the GGUF file.
+        if (bsctx->lazy_swap_enabled) {
+            bs_lazy_swap_pageout_layer(bsctx, layer_idx);
+        }
+    }
+
+    int64_t t_end = bs_time_us();
+    bsctx->metrics.total_time_restore_us += (t_end - t_start);
+
+    if (bsctx->params.verbose) {
+        LLAMA_LOG_INFO("%s: restored %zu layers to blurry (%" PRId64 " us)\n",
+                      __func__, layers_to_restore.size(), t_end - t_start);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+std::vector<blurry_sharp_routing_decision> llama_blurry_sharp_route(
+        llama_blurry_sharp_context * bsctx,
+        const float                * activations,
+        int32_t                      n_tokens,
+        int32_t                      n_embd) {
+    std::vector<blurry_sharp_routing_decision> decisions;
+    if (!bsctx || !bsctx->initialized) return decisions;
+
+    for (int layer_idx : bsctx->sharp_layer_indices) {
+        if (bsctx->eligible_layers.find(layer_idx) == bsctx->eligible_layers.end()) {
+            continue;
+        }
+
+        blurry_sharp_routing_decision dec;
+        dec.layer_idx = layer_idx;
+        dec.confidence = 1.0f;
+        dec.should_sharpen = false;
+
+        switch (bsctx->params.router_strategy) {
+            case LLAMA_BS_ROUTER_ALWAYS:
+                dec.should_sharpen = true;
+                dec.confidence = 0.0f;
+                break;
+
+            case LLAMA_BS_ROUTER_NEVER:
+                dec.should_sharpen = false;
+                dec.confidence = 1.0f;
+                break;
+
+            case LLAMA_BS_ROUTER_NORM: {
+                // Compute per-token L2 norms and derive confidence.
+                // Higher norm → lower confidence → more likely to sharpen.
+                if (!activations || n_tokens <= 0 || n_embd <= 0) {
+                    dec.should_sharpen = false;
+                    dec.confidence = 1.0f;
+                    break;
+                }
+
+                dec.per_token_confidences.resize((size_t)n_tokens);
+                float max_norm = 0.0f;
+
+                // First pass: compute norms
+                std::vector<float> norms((size_t)n_tokens);
+                for (int t = 0; t < n_tokens; ++t) {
+                    const float * row = activations + (size_t)t * (size_t)n_embd;
+                    float sum_sq = 0.0f;
+                    for (int e = 0; e < n_embd; ++e) {
+                        sum_sq += row[e] * row[e];
+                    }
+                    norms[t] = std::sqrt(sum_sq);
+                    if (norms[t] > max_norm) max_norm = norms[t];
+                }
+
+                // Second pass: map to confidences
+                float inv_max = (max_norm > 1e-12f) ? (1.0f / max_norm) : 1.0f;
+                float avg_confidence = 0.0f;
+                int n_low_confidence = 0;
+
+                for (int t = 0; t < n_tokens; ++t) {
+                    float score = norms[t] * inv_max;
+                    float conf = std::max(0.0f, 1.0f - score);
+                    dec.per_token_confidences[t] = conf;
+                    avg_confidence += conf;
+                    if (conf < bsctx->params.router_min_confidence) {
+                        ++n_low_confidence;
+                    }
+                }
+                avg_confidence /= (float)n_tokens;
+
+                dec.confidence = avg_confidence;
+                dec.should_sharpen = (n_low_confidence > 0) ||
+                                    (avg_confidence < bsctx->params.router_min_confidence);
+                break;
+            }
+        }
+
+        decisions.push_back(std::move(dec));
+    }
+
+    return decisions;
+}
+
+// ---------------------------------------------------------------------------
+// Auto-sharpen
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_auto_sharpen(
+        llama_blurry_sharp_context * bsctx,
+        const float                * activations,
+        int32_t                      n_tokens,
+        int32_t                      n_embd) {
+    if (!bsctx || !bsctx->initialized) return 0;
+
+    auto decisions = llama_blurry_sharp_route(bsctx, activations, n_tokens, n_embd);
+
+    int32_t n_sharpened = 0;
+    for (auto & dec : decisions) {
+        if (dec.should_sharpen) {
+            int32_t ret = llama_blurry_sharp_apply_layer(bsctx, dec.layer_idx);
+            if (ret == 0) {
+                ++n_sharpened;
+            }
+        }
+    }
+
+    return n_sharpened;
+}
+
+// ---------------------------------------------------------------------------
+// Queries
+// ---------------------------------------------------------------------------
+
+bool llama_blurry_sharp_is_layer_sharp(
+        const llama_blurry_sharp_context * bsctx,
+        int                                layer_idx) {
+    if (!bsctx) return false;
+    auto it = bsctx->layer_backups.find(layer_idx);
+    if (it == bsctx->layer_backups.end()) return false;
+    return it->second.is_sharpened;
+}
+
+bool llama_blurry_sharp_get_layer_state(
+        const llama_blurry_sharp_context * bsctx,
+        int                                layer_idx,
+        llama_blurry_sharp_layer_state   * out) {
+    if (!bsctx || !out) return false;
+    if (layer_idx < 0 || layer_idx >= (int)bsctx->model->layers.size()) return false;
+
+    out->layer_idx          = layer_idx;
+    out->is_sharpened       = false;
+    out->n_tensors_overlaid = 0;
+    out->backup_bytes       = 0;
+    out->sharp_bytes_read   = 0;
+    out->timestamp_us       = 0;
+
+    auto it = bsctx->layer_backups.find(layer_idx);
+    if (it != bsctx->layer_backups.end() && it->second.is_sharpened) {
+        out->is_sharpened       = true;
+        out->n_tensors_overlaid = (int32_t)it->second.tensor_backups.size();
+        out->backup_bytes       = it->second.backup_bytes;
+        out->sharp_bytes_read   = it->second.sharp_bytes_read;
+        out->timestamp_us       = it->second.apply_timestamp_us;
+    }
+
+    return true;
+}
+
+llama_blurry_sharp_state llama_blurry_sharp_get_state(
+        const llama_blurry_sharp_context * bsctx) {
+    llama_blurry_sharp_state state = {};
+    if (!bsctx) return state;
+
+    state.n_layers_total = (int32_t)bsctx->model->layers.size();
+    state.n_layers_sharpened = 0;
+    state.total_backup_bytes = bsctx->current_backup_bytes;
+    state.total_sharp_bytes_read = bsctx->metrics.total_sharp_bytes_read;
+    state.memory_budget_bytes = bsctx->params.memory_budget_bytes;
+    state.gpu_budget_bytes = bsctx->params.gpu_budget_bytes;
+    state.gpu_device_bytes_used = bsctx->current_device_sharp_bytes;
+    state.max_sharp_layers = bsctx->params.max_sharp_layers;
+    state.n_device_tensors_skipped = bsctx->n_device_tensors_skipped;
+
+    for (auto & kv : bsctx->layer_backups) {
+        if (kv.second.is_sharpened) {
+            state.n_layers_sharpened++;
+        }
+    }
+
+    return state;
+}
+
+blurry_sharp_metrics llama_blurry_sharp_get_metrics(
+        const llama_blurry_sharp_context * bsctx) {
+    if (!bsctx) {
+        blurry_sharp_metrics m = {};
+        return m;
+    }
+    return bsctx->metrics;
+}
+
+void llama_blurry_sharp_reset_metrics(llama_blurry_sharp_context * bsctx) {
+    if (!bsctx) return;
+    std::lock_guard<std::mutex> lock(bsctx->mtx);
+    bsctx->metrics = {};
+}
+
+// ---------------------------------------------------------------------------
+// Batch apply all eligible layers
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_apply_all(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->initialized) return 0;
+
+    int64_t t_start = bs_time_us();
+
+    if (bsctx->params.permanent) {
+        LLAMA_LOG_INFO("%s: applying all layers in PERMANENT mode (no backup, reduced memory)\n",
+                      __func__);
+    }
+
+    // When applying ALL layers we know the access pattern is sequential
+    // through the file.  Set MADV_SEQUENTIAL so the kernel does aggressive
+    // readahead and reclaims pages behind the cursor.  Each tensor's pages
+    // are still explicitly released via MADV_DONTNEED after consumption.
+    // After the loop we reset to MADV_NORMAL for subsequent selective use.
+#ifndef _WIN32
+    for (size_t si = 0; si < bsctx->sharp_mmaps.size(); ++si) {
+        if (bsctx->sharp_mmaps[si]) {
+            posix_madvise(bsctx->sharp_mmaps[si]->addr(),
+                          bsctx->sharp_mmaps[si]->size(),
+                          POSIX_MADV_SEQUENTIAL);
+        }
+    }
+#endif
+
+    int32_t n_sharpened = 0;
+    int32_t n_eligible  = 0;
+
+    for (int layer_idx : bsctx->sharp_layer_indices) {
+        if (bsctx->eligible_layers.find(layer_idx) == bsctx->eligible_layers.end()) {
+            continue;
+        }
+        ++n_eligible;
+        int32_t ret = llama_blurry_sharp_apply_layer(bsctx, layer_idx);
+        if (ret == 0) {
+            ++n_sharpened;
+        }
+    }
+
+    int64_t t_end = bs_time_us();
+    double elapsed_ms = (t_end - t_start) / 1000.0;
+
+    // Reset to NORMAL for subsequent selective (random) access patterns.
+#ifndef _WIN32
+    for (size_t si = 0; si < bsctx->sharp_mmaps.size(); ++si) {
+        if (bsctx->sharp_mmaps[si]) {
+            posix_madvise(bsctx->sharp_mmaps[si]->addr(),
+                          bsctx->sharp_mmaps[si]->size(),
+                          POSIX_MADV_NORMAL);
+        }
+    }
+#endif
+
+    LLAMA_LOG_INFO("%s: sharpened %d/%d eligible layers in %.2f ms\n",
+                  __func__, n_sharpened, n_eligible, elapsed_ms);
+
+    return n_sharpened;
+}
+
+// ---------------------------------------------------------------------------
+// Warm live pages into RAM
+// ---------------------------------------------------------------------------
+
+void llama_blurry_sharp_warm_live_pages(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->initialized) return;
+
+#ifndef _WIN32
+    int64_t t_start = bs_time_us();
+    int     n_warmed = 0;
+    int64_t warmed_bytes = 0;
+
+    for (auto & kv : bsctx->layer_backups) {
+        if (!kv.second.is_sharpened) continue;
+
+        for (auto & tb : kv.second.tensor_backups) {
+            // Only warm CPU zero-copy tensors — their data is either an mmap
+            // page (file-backed) or a RAM cache buffer (anonymous/swap-backed).
+            // GPU tensors already live in VRAM (no warming needed).
+            // Buffered CPU tensors live in heap memory (already in RAM).
+            if (tb.is_device || !tb.zero_copy) continue;
+
+            ggml_tensor * t = tb.base_tensor;
+            if (!t || !t->data) continue;
+
+            size_t nbytes = ggml_nbytes(t);
+            if (nbytes == 0) continue;
+
+            // Tell the kernel: "I need these pages, please pull them into
+            // RAM."  For mmap pages this reads from the GGUF file; for
+            // RAM-cache pages this swaps them in from the swap partition.
+            // Both paths are non-blocking — the kernel starts async I/O
+            // and returns immediately.
+            posix_madvise(t->data, nbytes, POSIX_MADV_WILLNEED);
+
+            ++n_warmed;
+            warmed_bytes += (int64_t)nbytes;
+        }
+    }
+
+    int64_t t_end = bs_time_us();
+
+    if (n_warmed > 0) {
+        LLAMA_LOG_INFO("%s: requested prefetch of %d zero-copy tensors "
+                      "(%.2f MiB) into page cache in %.2f ms\n",
+                      __func__, n_warmed,
+                      warmed_bytes / (1024.0 * 1024.0),
+                      (t_end - t_start) / 1000.0);
+    }
+#else
+    GGML_UNUSED(bsctx);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Prefetch a single layer's sharp mmap data into the page cache.
+// Thin public wrapper around bs_prefetch_layer_mmap().
+// ---------------------------------------------------------------------------
+
+void llama_blurry_sharp_prefetch_layer(
+        llama_blurry_sharp_context * bsctx,
+        int32_t                      layer_idx) {
+    if (!bsctx || !bsctx->initialized) return;
+    // bs_prefetch_layer_mmap only reads immutable init-time data
+    // (layer_tensor_names, sharp_index, sharp_mmaps) and issues
+    // non-blocking madvise(WILLNEED) syscalls, so no lock needed.
+    bs_prefetch_layer_mmap(bsctx, layer_idx);
+}
+
+// ---------------------------------------------------------------------------
+// RAM cache: pre-read sharp tensor data into anonymous heap buffers
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_precache_ram(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->initialized) return 0;
+    std::lock_guard<std::mutex> lock(bsctx->mtx);
+
+    if (bsctx->ram_cache_populated) {
+        LLAMA_LOG_INFO("%s: RAM cache already populated (%d tensors, %.2f MiB)\n",
+                      __func__, (int)bsctx->ram_cache.size(),
+                      bsctx->ram_cache_bytes / (1024.0 * 1024.0));
+        return (int32_t)bsctx->ram_cache.size();
+    }
+
+    int64_t t_start = bs_time_us();
+
+    int32_t n_cached = 0;
+    int64_t total_bytes = 0;
+    int32_t n_failed = 0;
+
+    LLAMA_LOG_INFO("%s: pre-reading all sharp tensor data into RAM cache "
+                  "(anonymous heap memory, swap-backed under pressure)...\n", __func__);
+
+    // Iterate all sharp tensors (not just eligible ones — cache everything
+    // so that any future apply_layer/apply_experts has data ready).
+    for (auto & kv : bsctx->sharp_index) {
+        const std::string & tensor_name = kv.first;
+        const blurry_sharp_tensor_info & info = kv.second;
+
+        // Skip if already cached
+        if (bsctx->ram_cache.find(tensor_name) != bsctx->ram_cache.end()) {
+            continue;
+        }
+
+        // Allocate anonymous heap buffer and read sharp data into it.
+        // This creates anonymous pages that go to swap under pressure
+        // (instead of being dropped like file-backed mmap pages).
+        std::vector<uint8_t> buf(info.nbytes);
+
+        int si = info.split_idx;
+        bool ok = false;
+
+        // Read from mmap if available
+        if (si >= 0 && si < (int)bsctx->sharp_mmaps.size() && bsctx->sharp_mmaps[si]) {
+            const uint8_t * base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+            if (info.file_offset + info.nbytes <= bsctx->sharp_mmaps[si]->size()) {
+                std::memcpy(buf.data(), base + info.file_offset, info.nbytes);
+                // Release the mmap pages — data is now in anonymous heap memory.
+                // The mmap pages are file-backed and would just waste page cache.
+                bs_release_mmap_pages(base + info.file_offset, info.nbytes);
+                ok = true;
+            }
+        }
+
+        // Fallback: file read
+        if (!ok && si >= 0 && si < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si]) {
+            bsctx->sharp_files[si]->seek(info.file_offset, SEEK_SET);
+            bsctx->sharp_files[si]->read_raw(buf.data(), info.nbytes);
+            ok = true;
+        }
+
+        if (!ok) {
+            ++n_failed;
+            if (bsctx->params.verbose) {
+                LLAMA_LOG_WARN("%s: failed to read tensor '%s' (split %d)\n",
+                              __func__, tensor_name.c_str(), si);
+            }
+            continue;
+        }
+
+        total_bytes += (int64_t)info.nbytes;
+        bsctx->ram_cache[tensor_name] = std::move(buf);
+        ++n_cached;
+
+        // Progress reporting for large models
+        if (n_cached % 50 == 0) {
+            LLAMA_LOG_INFO("%s: cached %d tensors (%.2f MiB)...\n",
+                          __func__, n_cached, total_bytes / (1024.0 * 1024.0));
+        }
+    }
+
+    bsctx->ram_cache_bytes = total_bytes;
+    bsctx->ram_cache_populated = true;
+
+    int64_t t_end = bs_time_us();
+
+    LLAMA_LOG_INFO("%s: RAM cache populated: %d tensors, %.2f MiB in %.2f s "
+                  "(%.2f MiB/s)\n",
+                  __func__, n_cached,
+                  total_bytes / (1024.0 * 1024.0),
+                  (t_end - t_start) / 1e6,
+                  (t_end > t_start) ? (total_bytes / (1024.0 * 1024.0)) / ((t_end - t_start) / 1e6) : 0.0);
+    if (n_failed > 0) {
+        LLAMA_LOG_WARN("%s: %d tensors failed to cache (will fall back to mmap/file)\n",
+                      __func__, n_failed);
+    }
+    LLAMA_LOG_INFO("%s: memory tier: VRAM > RAM cache (%.2f MiB anonymous/swappable) > Swap > Disk\n",
+                  __func__, total_bytes / (1024.0 * 1024.0));
+
+    return n_cached;
+}
+
+// ---------------------------------------------------------------------------
+// Swap staging: proactively move RAM-cached pages to swap
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_stage_to_swap(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->initialized) return 0;
+    if (!bsctx->ram_cache_populated) {
+        LLAMA_LOG_WARN("%s: RAM cache not populated — call precache_ram() first\n", __func__);
+        return 0;
+    }
+
+#ifdef __linux__
+    // MADV_PAGEOUT (value 21) was added in Linux 5.4.  It tells the kernel
+    // to move the specified anonymous pages to swap, freeing their physical
+    // frames for other use.  The pages remain valid — accessing them later
+    // triggers a swap-in (fast from SSD).
+    //
+    // This is exactly what we want: free RAM for the blurry model / KV cache
+    // while keeping sharp data quickly accessible via swap-in.
+    #ifndef MADV_PAGEOUT
+    #define MADV_PAGEOUT 21
+    #endif
+
+    int64_t t_start = bs_time_us();
+    int32_t n_staged = 0;
+    int64_t staged_bytes = 0;
+
+    LLAMA_LOG_INFO("%s: staging %.2f MiB of RAM-cached sharp data to swap "
+                  "(freeing RAM for active use)...\n",
+                  __func__, bsctx->ram_cache_bytes / (1024.0 * 1024.0));
+
+    for (auto & kv : bsctx->ram_cache) {
+        if (kv.second.empty()) continue;
+
+        int ret = madvise(kv.second.data(), kv.second.size(), MADV_PAGEOUT);
+        if (ret == 0) {
+            ++n_staged;
+            staged_bytes += (int64_t)kv.second.size();
+        }
+        // MADV_PAGEOUT can fail (e.g. kernel < 5.4, no swap configured) —
+        // silently ignore failures.  The data stays in RAM, which is still
+        // better than file-backed mmap (RAM > Disk).
+    }
+
+    bsctx->ram_cache_staged = true;
+
+    int64_t t_end = bs_time_us();
+
+    if (n_staged > 0) {
+        LLAMA_LOG_INFO("%s: staged %d tensors (%.2f MiB) to swap in %.2f ms\n",
+                      __func__, n_staged,
+                      staged_bytes / (1024.0 * 1024.0),
+                      (t_end - t_start) / 1000.0);
+        LLAMA_LOG_INFO("%s: RAM is now free for blurry model / KV cache; "
+                      "sharp data accessible via fast swap-in\n", __func__);
+    } else {
+        LLAMA_LOG_WARN("%s: MADV_PAGEOUT not available or no swap configured — "
+                      "sharp data stays in RAM (still better than file-backed mmap)\n",
+                      __func__);
+    }
+
+    return n_staged;
+#else
+    LLAMA_LOG_INFO("%s: MADV_PAGEOUT not available on this platform — "
+                  "sharp data stays in RAM (still better than file-backed mmap)\n",
+                  __func__);
+    bsctx->ram_cache_staged = true;
+    return 0;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Pre-allocate device buffers
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_preload_device_cache(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->initialized) return 0;
+    std::lock_guard<std::mutex> lock(bsctx->mtx);
+
+    int64_t t_start = bs_time_us();
+
+    // Implicitly enable retain_device_buffers — pre-allocation only makes
+    // sense if the buffers survive across restore cycles.
+    bsctx->retain_device_buffers = true;
+
+    int32_t n_preloaded = 0;
+    int64_t preloaded_bytes = 0;
+
+    for (int layer_idx : bsctx->sharp_layer_indices) {
+        if (bsctx->eligible_layers.find(layer_idx) == bsctx->eligible_layers.end()) {
+            continue;
+        }
+
+        auto lt_it = bsctx->layer_tensor_names.find(layer_idx);
+        if (lt_it == bsctx->layer_tensor_names.end()) continue;
+
+        for (const auto & tensor_name : lt_it->second) {
+            // Skip if already in the cache
+            if (bsctx->device_cache.find(tensor_name) != bsctx->device_cache.end()) {
+                continue;
+            }
+
+            auto info_it = bsctx->sharp_index.find(tensor_name);
+            if (info_it == bsctx->sharp_index.end()) continue;
+            const auto & sharp_info = info_it->second;
+
+            // Find the base tensor (use cached pointer)
+            ggml_tensor * base_t = sharp_info.base_tensor;
+            if (!base_t) {
+                base_t = bs_find_model_tensor(bsctx->model, tensor_name.c_str());
+            }
+            if (!base_t || !base_t->buffer) continue;
+
+            // Only pre-allocate for device (non-host) tensors
+            if (ggml_backend_buffer_is_host(base_t->buffer)) continue;
+
+            ggml_backend_buffer_type_t device_buft = bs_get_device_buft(bsctx, base_t->buffer);
+
+            // Temporarily set tensor type/strides to sharp type to compute
+            // the correct padded allocation size.
+            ggml_type saved_type = base_t->type;
+            size_t saved_nb[GGML_MAX_DIMS];
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) saved_nb[d] = base_t->nb[d];
+
+            base_t->type  = sharp_info.type;
+            base_t->nb[0] = ggml_type_size(sharp_info.type);
+            base_t->nb[1] = ggml_row_size(sharp_info.type, base_t->ne[0]);
+            for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+                base_t->nb[d] = base_t->nb[d - 1] * base_t->ne[d - 1];
+            }
+            size_t alloc_size = ggml_backend_buft_get_alloc_size(device_buft, base_t);
+
+            // Restore original type/strides
+            base_t->type = saved_type;
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) base_t->nb[d] = saved_nb[d];
+
+            if (alloc_size < sharp_info.nbytes) alloc_size = sharp_info.nbytes;
+
+            // Respect GPU budget
+            if (bsctx->params.gpu_budget_bytes > 0 &&
+                (bsctx->device_cache_bytes + (int64_t)alloc_size) > bsctx->params.gpu_budget_bytes) {
+                continue;
+            }
+
+            // Allocate the device buffer
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(device_buft, alloc_size);
+            if (!buf) continue;
+
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_backend_buffer_clear(buf, 0);
+
+            // Add to cache as unpopulated — apply_layer will fill with data
+            blurry_sharp_device_cache_entry entry;
+            entry.buffer       = buf;
+            entry.nbytes       = alloc_size;
+            entry.populated    = false;
+            entry.use_sequence = bsctx->cache_use_counter++;
+            entry.layer_idx    = sharp_info.layer_idx;
+            bsctx->device_cache[tensor_name] = entry;
+            bsctx->device_cache_bytes += (int64_t)alloc_size;
+            bsctx->n_cache_allocs++;
+
+            preloaded_bytes += (int64_t)alloc_size;
+            ++n_preloaded;
+        }
+    }
+
+    int64_t t_end = bs_time_us();
+
+    LLAMA_LOG_INFO("%s: pre-allocated %d device buffers (%.2f MiB) in %.2f ms\n",
+                  __func__, n_preloaded,
+                  preloaded_bytes / (1024.0 * 1024.0),
+                  (t_end - t_start) / 1000.0);
+
+    return n_preloaded;
+}
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+void llama_blurry_sharp_log_index_summary(const llama_blurry_sharp_context * bsctx) {
+    if (!bsctx) return;
+
+    LLAMA_LOG_INFO("\n");
+    LLAMA_LOG_INFO("=== Blurry→Sharp Overlay Index Summary ===\n");
+    LLAMA_LOG_INFO("  Sharp model splits:  %d\n",  bsctx->n_sharp_splits);
+    LLAMA_LOG_INFO("  Sharp model tensors: %zu\n", bsctx->sharp_index.size());
+    LLAMA_LOG_INFO("  Layer groups:        %zu\n", bsctx->layer_tensor_names.size());
+    LLAMA_LOG_INFO("  Eligible layers:     %zu\n", bsctx->eligible_layers.size());
+
+    // Compute total sharp model size
+    int64_t total_sharp_bytes = 0;
+    for (auto & kv : bsctx->sharp_index) {
+        total_sharp_bytes += (int64_t)kv.second.nbytes;
+    }
+    LLAMA_LOG_INFO("  Total sharp data:    %.2f MiB\n",
+                  (double)total_sharp_bytes / (1024.0 * 1024.0));
+
+    // Show per-layer tensor count
+    if (bsctx->params.verbose) {
+        for (int idx : bsctx->sharp_layer_indices) {
+            auto it = bsctx->layer_tensor_names.find(idx);
+            if (it == bsctx->layer_tensor_names.end()) continue;
+            bool eligible = bsctx->eligible_layers.find(idx) != bsctx->eligible_layers.end();
+            LLAMA_LOG_INFO("    layer %3d: %2zu tensors %s\n",
+                          idx, it->second.size(),
+                          eligible ? "(eligible)" : "(ineligible)");
+        }
+    }
+
+    LLAMA_LOG_INFO("==========================================\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// MoE Combination Expert API
+// ---------------------------------------------------------------------------
+
+bool llama_blurry_sharp_is_expert_tensor(const char * tensor_name) {
+    if (!tensor_name) return false;
+    return bs_is_expert_tensor(std::string(tensor_name));
+}
+
+int32_t llama_blurry_sharp_n_experts(
+        const llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->initialized) return 0;
+
+    // Find the first ffn_gate_exps tensor and inspect ne[2]
+    for (const auto & kv : bsctx->sharp_index) {
+        if (bs_is_expert_tensor(kv.first) &&
+            kv.first.find("ffn_gate_exps") != std::string::npos) {
+            return (int32_t)kv.second.ne[2];
+        }
+    }
+    // Fallback: try any expert tensor
+    for (const auto & kv : bsctx->sharp_index) {
+        if (bs_is_expert_tensor(kv.first) && kv.second.ne[2] > 1) {
+            return (int32_t)kv.second.ne[2];
+        }
+    }
+    return 0;
+}
+
+int32_t llama_blurry_sharp_n_experts_used(
+        const llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->model) return 0;
+    return (int32_t)bsctx->model->hparams.n_expert_used;
+}
+
+// ---------------------------------------------------------------------------
+// Expert-level overlay: create a "combination tensor" that is mostly blurry
+// but with selected expert slices replaced by sharp data.
+//
+// For each expert tensor (ffn_gate_exps, ffn_up_exps, ffn_down_exps):
+//   1. Allocate a buffer the size of the full tensor
+//   2. Copy all data from the blurry tensor into it
+//   3. Read only the requested expert slices from the sharp GGUF
+//   4. Overwrite those slices in the combination buffer
+//   5. Pointer-swap tensor->data to point at the combination buffer
+//
+// For non-expert tensors (attention, norms, gate_inp):
+//   Falls through to the standard bs_overlay_single_tensor path.
+//
+// This reduces I/O by n_expert/n_experts_requested for MoE models.
+// For example, in a 128-expert model with top-8 routing, this reads
+// ~16x less data from the sharp GGUF per layer.
+// ---------------------------------------------------------------------------
+
+// Helper: overlay a single expert tensor with selective expert slices.
+// Returns bytes read from sharp file, or negative on error.
+static int64_t bs_overlay_expert_tensor(
+        llama_blurry_sharp_context       * bsctx,
+        const blurry_sharp_tensor_info   & sharp_info,
+        ggml_tensor                      * base_tensor,
+        const int32_t                    * expert_ids,
+        int32_t                            n_experts_req,
+        blurry_sharp_tensor_backup       & backup_out) {
+
+    int32_t n_expert_total = (int32_t)sharp_info.ne[2];
+    if (n_expert_total <= 1) {
+        // Not actually a multi-expert tensor, fall back to full overlay
+        return bs_overlay_single_tensor(bsctx, sharp_info, base_tensor, backup_out);
+    }
+
+    // Validate expert indices
+    for (int32_t i = 0; i < n_experts_req; ++i) {
+        if (expert_ids[i] < 0 || expert_ids[i] >= n_expert_total) {
+            LLAMA_LOG_ERROR("%s: expert_id %d out of range [0, %d) for tensor '%s'\n",
+                           __func__, expert_ids[i], n_expert_total,
+                           sharp_info.name.c_str());
+            return -1;
+        }
+    }
+
+    // JIT SAFETY CHECK: when overlays are applied mid-graph-execution (JIT
+    // mode), the backend scheduler has already allocated device copy tensors
+    // at the ORIGINAL (blurry) type/size.  Cross-type overlays on host
+    // tensors would change nb[]/type, causing copy_inputs to write
+    // sharp-sized data into blurry-sized device copies → assertion failure:
+    //   "ggml_backend_tensor_set_async: tensor write out of bounds"
+    //
+    // Same-type expert overlays are safe (in-place slice overwrite, no type
+    // change).  Device tensor overlays are safe (we allocate a new device
+    // buffer directly, no scheduler copy involved).
+    {
+        bool tensor_is_host = true;
+        if (base_tensor->buffer) {
+            tensor_is_host = ggml_backend_buffer_is_host(base_tensor->buffer);
+        }
+        if (tensor_is_host && bsctx->jit_active && base_tensor->type != sharp_info.type) {
+            bsctx->n_jit_host_crosstype_skipped++;
+            if (bsctx->params.verbose || bsctx->n_jit_host_crosstype_skipped <= 3) {
+                LLAMA_LOG_WARN("%s: JIT mode: skipping cross-type host expert tensor '%s' "
+                              "(%s -> %s, %zu -> %zu bytes, %d experts requested). "
+                              "Increase -ngl to move this layer to GPU.\n",
+                              __func__, sharp_info.name.c_str(),
+                              ggml_type_name(base_tensor->type),
+                              ggml_type_name(sharp_info.type),
+                              ggml_nbytes(base_tensor), sharp_info.nbytes,
+                              n_experts_req);
+            }
+            return -1;
+        }
+    }
+
+    // 1) Save original tensor metadata
+    backup_out.tensor_name       = sharp_info.name;
+    backup_out.base_tensor       = base_tensor;
+    backup_out.original_data     = base_tensor->data;
+    backup_out.original_type     = base_tensor->type;
+    backup_out.original_view_src = base_tensor->view_src;
+    backup_out.original_extra    = base_tensor->extra;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        backup_out.original_nb[d] = base_tensor->nb[d];
+        backup_out.ne[d]          = base_tensor->ne[d];
+    }
+
+    // Compute per-expert slice sizes.
+    // Expert tensors are laid out with expert as the outermost (ne[2]) dimension.
+    // Each expert slice is contiguous: expert_slice_bytes = total_bytes / n_expert
+    size_t sharp_expert_slice = sharp_info.nbytes / (size_t)n_expert_total;
+
+    // For the base (blurry) tensor, compute the slice size from its type/shape
+    size_t base_total_bytes = ggml_nbytes(base_tensor);
+    size_t base_expert_slice = base_total_bytes / (size_t)n_expert_total;
+
+    // 2) Determine strategy: host (CPU) or device (GPU)
+    bool tensor_is_host = true;
+    if (base_tensor->buffer) {
+        tensor_is_host = ggml_backend_buffer_is_host(base_tensor->buffer);
+    }
+
+    if (tensor_is_host) {
+        // ================================================================
+        // HOST PATH — three sub-strategies:
+        //
+        //   A) ZERO-COPY (mmap available):
+        //      Pointer-swap to the sharp mmap page.  The OS demand-pages
+        //      only the expert slices the MoE kernel actually reads.
+        //      Non-selected slices are never touched → never faulted in.
+        //      Cost: ~nanoseconds.  Heap allocation: ZERO.
+        //
+        //      This is THE critical optimisation.  Without it, every expert
+        //      tensor allocates a full combination buffer (e.g. 800 MiB for
+        //      a [4096, 1408, 128] Q4_K tensor) on the heap.  Across 48
+        //      layers × 3 expert tensors that's ~115 GiB of heap allocation
+        //      per apply cycle — far more than available RAM.
+        //
+        //   B) SAME-TYPE, NO MMAP:
+        //      Read only the selected expert slices from the sharp file
+        //      directly into the existing tensor buffer at the correct
+        //      expert offsets (in-place overwrite of blurry slices).
+        //      Cost: n_experts_req × slice_read.  Heap allocation: ZERO.
+        //      The backup saves the overwritten blurry slices so we can
+        //      restore later.
+        //
+        //   C) DIFFERENT-TYPE, NO MMAP:
+        //      Allocate a full combination buffer at the sharp type/size,
+        //      write selected expert slices, pointer-swap.  This is the
+        //      old (expensive) path — only used when mmap is unavailable
+        //      AND the types differ.
+        // ================================================================
+        backup_out.is_device = false;
+
+        int si = sharp_info.split_idx;
+        bool have_mmap = (si >= 0 && si < (int)bsctx->sharp_mmaps.size()
+                          && bsctx->sharp_mmaps[si]);
+
+        // Check RAM cache first — anonymous heap buffers that swap properly.
+        // Under memory pressure, these pages go to swap (fast SSD) instead
+        // of being dropped entirely like file-backed mmap pages.
+        bool used_ram_cache = false;
+        if (bsctx->ram_cache_populated) {
+            auto cache_it = bsctx->ram_cache.find(sharp_info.name);
+            if (cache_it != bsctx->ram_cache.end() && cache_it->second.size() >= sharp_info.nbytes) {
+                // Point tensor directly at the RAM cache buffer.
+                // Data lives in anonymous (swappable) memory, not file-backed mmap.
+                base_tensor->data = cache_it->second.data();
+                backup_out.zero_copy = true;
+                used_ram_cache = true;
+
+                // Release old blurry mmap pages
+                if (backup_out.original_data) {
+                    size_t old_nbytes = bs_tensor_nbytes(backup_out.original_type, backup_out.ne);
+                    bs_release_mmap_pages(backup_out.original_data, old_nbytes);
+                }
+            }
+        }
+
+        if (!used_ram_cache && have_mmap) {
+            // ---- Strategy A: ZERO-COPY mmap pointer swap ----
+            //
+            // KEY INSIGHT: MoE kernels only read selected expert slices:
+            //   if (matrix_row_counts[cur_a] == 0) continue;
+            //   src0_cur = src0->data + cur_a * nb02;
+            //
+            // By pointing the tensor at the sharp mmap, the kernel
+            // demand-pages only the pages that contain the selected
+            // experts.  Non-selected expert pages are never accessed,
+            // so they stay on disk and consume ZERO RAM.
+            //
+            // This is identical to bs_overlay_single_tensor's zero-copy
+            // path, and it is correct even for cross-type (e.g. base=IQ1_S,
+            // sharp=Q4_K) because the tensor type is updated to sharp and
+            // the kernel only reads sharp-typed slices.
+            const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+            if (sharp_info.file_offset + sharp_info.nbytes > bsctx->sharp_mmaps[si]->size()) {
+                LLAMA_LOG_ERROR("%s: mmap read out of bounds for expert tensor '%s' (split %d)\n",
+                               __func__, sharp_info.name.c_str(), si);
+                return -1;
+            }
+
+            // Release old blurry mmap pages — the tensor now points at the
+            // sharp mmap, so blurry file-backed pages can be dropped.
+            if (backup_out.original_data) {
+                size_t old_nbytes = bs_tensor_nbytes(backup_out.original_type, backup_out.ne);
+                bs_release_mmap_pages(backup_out.original_data, old_nbytes);
+            }
+
+            base_tensor->data = const_cast<uint8_t *>(mmap_base + sharp_info.file_offset);
+            backup_out.zero_copy = true;
+
+        } else if (!used_ram_cache && base_tensor->type == sharp_info.type && base_expert_slice == sharp_expert_slice) {
+            // ---- Strategy B: IN-PLACE slice overwrite (same type) ----
+            //
+            // Read the selected sharp expert slices directly into the
+            // existing tensor buffer, overwriting the blurry data at those
+            // offsets.  Save the overwritten blurry slices for restore.
+            // Heap allocation: only n_experts_req small slices for backup.
+            backup_out.zero_copy = false;
+
+            // Save the blurry expert slices we're about to overwrite
+            backup_out.expert_backup_ids.clear();
+            backup_out.expert_backup_data.clear();
+            backup_out.expert_backup_ids.reserve(n_experts_req);
+
+            uint8_t * base_data = (uint8_t *)base_tensor->data;
+
+            for (int32_t i = 0; i < n_experts_req; ++i) {
+                int32_t eidx = expert_ids[i];
+                size_t slice_offset = (size_t)eidx * base_expert_slice;
+
+                // Back up the blurry slice
+                backup_out.expert_backup_ids.push_back(eidx);
+                size_t old_size = backup_out.expert_backup_data.size();
+                backup_out.expert_backup_data.resize(old_size + base_expert_slice);
+                std::memcpy(backup_out.expert_backup_data.data() + old_size,
+                            base_data + slice_offset, base_expert_slice);
+
+                // Read sharp slice into the same offset.
+                // Try RAM cache first, then file.
+                size_t slice_file_offset = sharp_info.file_offset + (size_t)eidx * sharp_expert_slice;
+                bool slice_ok = false;
+
+                // RAM cache: read the expert slice directly from the cached buffer
+                if (bsctx->ram_cache_populated) {
+                    auto cache_it = bsctx->ram_cache.find(sharp_info.name);
+                    if (cache_it != bsctx->ram_cache.end() && cache_it->second.size() >= sharp_info.nbytes) {
+                        size_t slice_cache_offset = (size_t)eidx * sharp_expert_slice;
+                        std::memcpy(base_data + slice_offset,
+                                    cache_it->second.data() + slice_cache_offset,
+                                    sharp_expert_slice);
+                        slice_ok = true;
+                    }
+                }
+
+                // Fallback: file read
+                if (!slice_ok) {
+                    if (si >= 0 && si < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si]) {
+                        bsctx->sharp_files[si]->seek(slice_file_offset, SEEK_SET);
+                        bsctx->sharp_files[si]->read_raw(base_data + slice_offset, sharp_expert_slice);
+                        slice_ok = true;
+                    }
+                }
+
+                if (!slice_ok) {
+                    LLAMA_LOG_ERROR("%s: no data source for split %d (tensor '%s' expert %d)\n",
+                                   __func__, si, sharp_info.name.c_str(), eidx);
+                    // Restore already-overwritten slices
+                    size_t restore_off = 0;
+                    for (int32_t j = 0; j < i; ++j) {
+                        size_t roff = (size_t)backup_out.expert_backup_ids[j] * base_expert_slice;
+                        std::memcpy(base_data + roff,
+                                    backup_out.expert_backup_data.data() + restore_off,
+                                    base_expert_slice);
+                        restore_off += base_expert_slice;
+                    }
+                    return -1;
+                }
+            }
+
+            // Type and strides are unchanged (same type) — no update needed.
+            // base_tensor->data already points at the (now patched) buffer.
+
+            bsctx->metrics.n_direct_copies++;
+
+            int64_t total_sharp_bytes_read = (int64_t)sharp_expert_slice * n_experts_req;
+            if (bsctx->params.verbose) {
+                LLAMA_LOG_INFO("%s: host in-place expert overlay '%s': %d/%d experts, "
+                              "read %" PRId64 " bytes, backup %" PRId64 " bytes\n",
+                              __func__, sharp_info.name.c_str(),
+                              n_experts_req, n_expert_total,
+                              total_sharp_bytes_read,
+                              (int64_t)backup_out.expert_backup_data.size());
+            }
+
+            return total_sharp_bytes_read;
+
+        } else if (!used_ram_cache) {
+            // ---- Strategy C: FULL COMBINATION BUFFER (different types, no mmap) ----
+            // This is the expensive fallback — allocate sharp_info.nbytes on heap.
+            backup_out.zero_copy = false;
+            backup_out.sharp_data.resize(sharp_info.nbytes);
+            std::memset(backup_out.sharp_data.data(), 0, sharp_info.nbytes);
+
+            int64_t total_sharp_bytes_read = 0;
+            for (int32_t i = 0; i < n_experts_req; ++i) {
+                int32_t eidx = expert_ids[i];
+                size_t slice_file_offset = sharp_info.file_offset + (size_t)eidx * sharp_expert_slice;
+                size_t slice_buf_offset  = (size_t)eidx * sharp_expert_slice;
+
+                bool slice_ok = false;
+
+                // RAM cache: read the expert slice from the cached buffer
+                if (bsctx->ram_cache_populated) {
+                    auto cache_it = bsctx->ram_cache.find(sharp_info.name);
+                    if (cache_it != bsctx->ram_cache.end() && cache_it->second.size() >= sharp_info.nbytes) {
+                        std::memcpy(backup_out.sharp_data.data() + slice_buf_offset,
+                                    cache_it->second.data() + slice_buf_offset,
+                                    sharp_expert_slice);
+                        slice_ok = true;
+                    }
+                }
+
+                // Fallback: file read
+                if (!slice_ok) {
+                    if (si >= 0 && si < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si]) {
+                        bsctx->sharp_files[si]->seek(slice_file_offset, SEEK_SET);
+                        bsctx->sharp_files[si]->read_raw(
+                            backup_out.sharp_data.data() + slice_buf_offset,
+                            sharp_expert_slice);
+                        slice_ok = true;
+                    }
+                }
+
+                if (!slice_ok) {
+                    LLAMA_LOG_ERROR("%s: no data source for split %d (tensor '%s' expert %d)\n",
+                                   __func__, si, sharp_info.name.c_str(), eidx);
+                    backup_out.sharp_data.clear();
+                    return -1;
+                }
+                total_sharp_bytes_read += (int64_t)sharp_expert_slice;
+            }
+
+            base_tensor->data = backup_out.sharp_data.data();
+            // Fall through to update type/strides below
+        }
+
+        // Update type and byte strides to match the sharp tensor so that
+        // the kernel uses the correct dequantization and stride arithmetic
+        // when indexing into the selected expert slices.
+        if (base_tensor->type != sharp_info.type) {
+            base_tensor->type = sharp_info.type;
+            base_tensor->nb[0] = ggml_type_size(sharp_info.type);
+            base_tensor->nb[1] = base_tensor->nb[0] * (base_tensor->ne[0] / ggml_blck_size(sharp_info.type));
+            base_tensor->nb[2] = base_tensor->nb[1] * base_tensor->ne[1];
+            base_tensor->nb[3] = base_tensor->nb[2] * base_tensor->ne[2];
+        }
+
+        // Clear view_src for correct dispatch.
+        base_tensor->view_src = nullptr;
+
+        bsctx->metrics.n_direct_copies++;
+
+        int64_t total_sharp_bytes_read = (int64_t)sharp_expert_slice * n_experts_req;
+        if (bsctx->params.verbose) {
+            const char * strat = used_ram_cache ? "ram-cache" :
+                                 backup_out.zero_copy ? "zero-copy-mmap" : "combination-buf";
+            LLAMA_LOG_INFO("%s: host expert overlay '%s' (%s): %d/%d experts, "
+                          "read %" PRId64 " bytes (%.1f%% of full tensor %zu bytes)\n",
+                          __func__, sharp_info.name.c_str(), strat,
+                          n_experts_req, n_expert_total,
+                          total_sharp_bytes_read,
+                          100.0 * total_sharp_bytes_read / sharp_info.nbytes,
+                          sharp_info.nbytes);
+        }
+
+        return total_sharp_bytes_read;
+
+    } else {
+        // ================================================================
+        // DEVICE PATH: combination expert on GPU
+        //
+        // Three sub-strategies:
+        //
+        //   A) SAME TYPE + SAME SIZE: write selected expert slices directly
+        //      into the existing device buffer at the correct offsets via
+        //      ggml_backend_tensor_set with an offset.  ZERO extra VRAM.
+        //      Back up overwritten slices for restore.
+        //
+        //   B) DIFFERENT TYPE: allocate new device buffer at sharp size,
+        //      upload only selected expert slices (zeroed elsewhere).
+        //      This is the expensive path but unavoidable for cross-type.
+        //
+        //   C) CACHE HIT: reuse a previously allocated device buffer from
+        //      the cache, re-upload only the needed expert slices.
+        // ================================================================
+        backup_out.is_device = true;
+        backup_out.zero_copy = false;
+
+        ggml_backend_buffer_type_t device_buft = bs_get_device_buft(bsctx, base_tensor->buffer);
+
+        bool same_type = (base_tensor->type == sharp_info.type);
+        bool same_size = (base_total_bytes == sharp_info.nbytes);
+
+        if (same_type && same_size) {
+            // ---- Strategy A: IN-PLACE expert slice overwrite (zero extra VRAM) ----
+            //
+            // Write selected sharp expert slices directly into the existing
+            // device buffer at the correct byte offsets.  Back up the old
+            // device data for restore.
+            //
+            // This eliminates the enormous full-tensor device buffer allocation
+            // that was the primary cause of VRAM exhaustion in MoE models.
+
+            // Save blurry expert slices from device for later restore
+            backup_out.expert_backup_ids.clear();
+            backup_out.expert_backup_data.clear();
+            backup_out.expert_backup_ids.reserve(n_experts_req);
+            backup_out.original_buffer = base_tensor->buffer;
+
+            int64_t total_sharp_bytes_read = 0;
+
+            for (int32_t i = 0; i < n_experts_req; ++i) {
+                int32_t eidx = expert_ids[i];
+                size_t slice_offset_device = (size_t)eidx * base_expert_slice;
+                size_t slice_file_offset   = sharp_info.file_offset + (size_t)eidx * sharp_expert_slice;
+
+                // Back up the blurry expert slice FROM device
+                backup_out.expert_backup_ids.push_back(eidx);
+                size_t old_size = backup_out.expert_backup_data.size();
+                backup_out.expert_backup_data.resize(old_size + base_expert_slice);
+                ggml_backend_tensor_get(base_tensor,
+                    backup_out.expert_backup_data.data() + old_size,
+                    slice_offset_device, base_expert_slice);
+
+                // Read sharp expert slice into staging (reuse read_buf since
+                // staging may be too small for full tensors but is fine for
+                // individual expert slices)
+                int ssi = sharp_info.split_idx;
+                bool have_mmap = (ssi >= 0 && ssi < (int)bsctx->sharp_mmaps.size()
+                                  && bsctx->sharp_mmaps[ssi]);
+
+                const void * src_data = nullptr;
+
+                // Fastest path: RAM cache → pinned staging (swap-backed anonymous pages)
+                if (!src_data && bsctx->ram_cache_populated) {
+                    auto cache_it = bsctx->ram_cache.find(sharp_info.name);
+                    if (cache_it != bsctx->ram_cache.end() && cache_it->second.size() >= sharp_info.nbytes) {
+                        size_t slice_cache_offset = (size_t)eidx * sharp_expert_slice;
+                        if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
+                            memcpy(bsctx->pinned_staging_ptr,
+                                   cache_it->second.data() + slice_cache_offset,
+                                   sharp_expert_slice);
+                            src_data = bsctx->pinned_staging_ptr;
+                        } else {
+                            src_data = cache_it->second.data() + slice_cache_offset;
+                        }
+                    }
+                }
+
+                if (!src_data && have_mmap) {
+                    const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[ssi]->addr();
+                    if (slice_file_offset + sharp_expert_slice <= bsctx->sharp_mmaps[ssi]->size()) {
+                        // For pinned staging: copy mmap → pinned if staging is big enough
+                        if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
+                            memcpy(bsctx->pinned_staging_ptr, mmap_base + slice_file_offset, sharp_expert_slice);
+                            src_data = bsctx->pinned_staging_ptr;
+                        } else {
+                            // Use mmap pointer directly (pageable copy — slower but works)
+                            src_data = mmap_base + slice_file_offset;
+                        }
+                        bs_release_mmap_pages(mmap_base + slice_file_offset, sharp_expert_slice);
+                    } else {
+                        LLAMA_LOG_ERROR("%s: mmap OOB for expert %d of device tensor '%s'\n",
+                                       __func__, eidx, sharp_info.name.c_str());
+                        // Restore already-written slices
+                        size_t ro = 0;
+                        for (int32_t j = 0; j < i; ++j) {
+                            size_t roff = (size_t)backup_out.expert_backup_ids[j] * base_expert_slice;
+                            ggml_backend_tensor_set(base_tensor,
+                                backup_out.expert_backup_data.data() + ro,
+                                roff, base_expert_slice);
+                            ro += base_expert_slice;
+                        }
+                        return -1;
+                    }
+                }
+
+                if (!src_data && ssi >= 0 && ssi < (int)bsctx->sharp_files.size() && bsctx->sharp_files[ssi]) {
+                    bsctx->read_buf.resize(sharp_expert_slice);
+                    bsctx->sharp_files[ssi]->seek(slice_file_offset, SEEK_SET);
+                    bsctx->sharp_files[ssi]->read_raw(bsctx->read_buf.data(), sharp_expert_slice);
+                    if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
+                        memcpy(bsctx->pinned_staging_ptr, bsctx->read_buf.data(), sharp_expert_slice);
+                        src_data = bsctx->pinned_staging_ptr;
+                    } else {
+                        src_data = bsctx->read_buf.data();
+                    }
+                }
+
+                if (!src_data) {
+                    LLAMA_LOG_ERROR("%s: no data source for split %d (device tensor '%s' expert %d)\n",
+                                   __func__, ssi, sharp_info.name.c_str(), eidx);
+                    return -1;
+                }
+
+                // Write the sharp expert slice INTO the existing device buffer
+                ggml_backend_tensor_set(base_tensor, src_data, slice_offset_device, sharp_expert_slice);
+                total_sharp_bytes_read += (int64_t)sharp_expert_slice;
+            }
+
+            // Type and strides unchanged (same type) — tensor is still valid
+            // with the same layout.  Just mark the backup so restore knows
+            // to write back the saved expert slices.
+            backup_out.device_sharp_buffer = nullptr;  // no new allocation
+            backup_out.device_buf_cached   = false;
+
+            bsctx->metrics.n_direct_copies++;
+
+            if (bsctx->params.verbose) {
+                LLAMA_LOG_INFO("%s: device in-place expert overlay '%s': %d/%d experts, "
+                              "read %" PRId64 " bytes, zero extra VRAM\n",
+                              __func__, sharp_info.name.c_str(),
+                              n_experts_req, n_expert_total,
+                              total_sharp_bytes_read);
+            }
+
+            return total_sharp_bytes_read;
+
+        } else {
+            // ---- Strategy B: NEW DEVICE BUFFER (different type/size) ----
+            //
+            // Allocate a device buffer at the sharp tensor size, upload
+            // only the selected expert slices, pointer-swap.
+            //
+            // This allocates sharp_info.nbytes of extra VRAM per expert
+            // tensor.  It's the only option when types differ.
+
+            // Check device buffer cache first
+            if (bsctx->retain_device_buffers) {
+                auto cache_it = bsctx->device_cache.find(sharp_info.name);
+                if (cache_it != bsctx->device_cache.end() &&
+                    cache_it->second.buffer &&
+                    cache_it->second.nbytes >= sharp_info.nbytes) {
+                    // Cache hit — reuse the buffer.  Re-upload expert slices
+                    // (we can't know which experts were cached from a prior call).
+                    cache_it->second.use_sequence = bsctx->cache_use_counter++;
+
+                    backup_out.original_buffer     = base_tensor->buffer;
+                    backup_out.device_sharp_buffer = cache_it->second.buffer;
+                    backup_out.device_buf_cached   = true;
+
+                    void * cached_base = ggml_backend_buffer_get_base(cache_it->second.buffer);
+                    base_tensor->data   = cached_base;
+                    base_tensor->buffer = cache_it->second.buffer;
+                    base_tensor->type   = sharp_info.type;
+                    base_tensor->nb[0]  = ggml_type_size(sharp_info.type);
+                    base_tensor->nb[1]  = base_tensor->nb[0] * (base_tensor->ne[0] / ggml_blck_size(sharp_info.type));
+                    base_tensor->nb[2]  = base_tensor->nb[1] * base_tensor->ne[1];
+                    base_tensor->nb[3]  = base_tensor->nb[2] * base_tensor->ne[2];
+                    base_tensor->view_src = nullptr;
+                    base_tensor->extra    = nullptr;
+
+                    // Zero the buffer, then upload only selected expert slices
+                    ggml_backend_buffer_clear(cache_it->second.buffer, 0);
+
+                    int si_idx = sharp_info.split_idx;
+                    int64_t total_sharp_bytes_read = 0;
+                    for (int32_t i = 0; i < n_experts_req; ++i) {
+                        int32_t eidx = expert_ids[i];
+                        size_t slice_file_offset = sharp_info.file_offset + (size_t)eidx * sharp_expert_slice;
+                        size_t slice_buf_offset  = (size_t)eidx * sharp_expert_slice;
+
+                        bool have_mm = (si_idx >= 0 && si_idx < (int)bsctx->sharp_mmaps.size()
+                                        && bsctx->sharp_mmaps[si_idx]);
+                        const void * src_data = nullptr;
+
+                        // RAM cache: fastest path (swap-backed anonymous pages)
+                        if (!src_data && bsctx->ram_cache_populated) {
+                            auto rc_it = bsctx->ram_cache.find(sharp_info.name);
+                            if (rc_it != bsctx->ram_cache.end() && rc_it->second.size() >= sharp_info.nbytes) {
+                                size_t slice_cache_offset = (size_t)eidx * sharp_expert_slice;
+                                if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
+                                    memcpy(bsctx->pinned_staging_ptr,
+                                           rc_it->second.data() + slice_cache_offset,
+                                           sharp_expert_slice);
+                                    src_data = bsctx->pinned_staging_ptr;
+                                } else {
+                                    src_data = rc_it->second.data() + slice_cache_offset;
+                                }
+                            }
+                        }
+
+                        if (!src_data && have_mm) {
+                            const uint8_t * mm_base = (const uint8_t *)bsctx->sharp_mmaps[si_idx]->addr();
+                            if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
+                                memcpy(bsctx->pinned_staging_ptr, mm_base + slice_file_offset, sharp_expert_slice);
+                                src_data = bsctx->pinned_staging_ptr;
+                            } else {
+                                src_data = mm_base + slice_file_offset;
+                            }
+                            bs_release_mmap_pages(mm_base + slice_file_offset, sharp_expert_slice);
+                        }
+
+                        if (!src_data && si_idx >= 0 && si_idx < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si_idx]) {
+                            bsctx->read_buf.resize(sharp_expert_slice);
+                            bsctx->sharp_files[si_idx]->seek(slice_file_offset, SEEK_SET);
+                            bsctx->sharp_files[si_idx]->read_raw(bsctx->read_buf.data(), sharp_expert_slice);
+                            src_data = bsctx->read_buf.data();
+                        }
+                        if (src_data) {
+                            ggml_backend_tensor_set(base_tensor, src_data, slice_buf_offset, sharp_expert_slice);
+                            total_sharp_bytes_read += (int64_t)sharp_expert_slice;
+                        }
+                    }
+
+                    bsctx->n_cache_hits++;
+                    bsctx->metrics.n_direct_copies++;
+                    return total_sharp_bytes_read;
+                }
+            }
+
+            // No cache hit — check GPU budget (with LRU eviction)
+            ggml_type saved_type = base_tensor->type;
+            size_t saved_nb[GGML_MAX_DIMS];
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) saved_nb[d] = base_tensor->nb[d];
+
+            // Set type/strides to sharp for correct alloc_size computation
+            base_tensor->type  = sharp_info.type;
+            base_tensor->nb[0] = ggml_type_size(sharp_info.type);
+            base_tensor->nb[1] = base_tensor->nb[0] * (base_tensor->ne[0] / ggml_blck_size(sharp_info.type));
+            base_tensor->nb[2] = base_tensor->nb[1] * base_tensor->ne[1];
+            base_tensor->nb[3] = base_tensor->nb[2] * base_tensor->ne[2];
+
+            size_t alloc_size = ggml_backend_buft_get_alloc_size(device_buft, base_tensor);
+            if (alloc_size < sharp_info.nbytes) alloc_size = sharp_info.nbytes;
+
+            // Restore type/strides temporarily
+            base_tensor->type = saved_type;
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) base_tensor->nb[d] = saved_nb[d];
+
+            int64_t effective_device_bytes = bsctx->retain_device_buffers
+                ? bsctx->device_cache_bytes
+                : bsctx->current_device_sharp_bytes;
+
+            if (bsctx->params.gpu_budget_bytes > 0 &&
+                (effective_device_bytes + (int64_t)alloc_size) > bsctx->params.gpu_budget_bytes) {
+
+                // Try LRU eviction if retain_device_buffers is on
+                if (bsctx->retain_device_buffers && !bsctx->device_cache.empty()) {
+                    int64_t needed = (effective_device_bytes + (int64_t)alloc_size)
+                                   - bsctx->params.gpu_budget_bytes;
+                    int64_t freed = 0;
+                    bool synced = false;
+                    while (freed < needed && !bsctx->device_cache.empty()) {
+                        auto lru_it = bsctx->device_cache.end();
+                        uint64_t min_seq = UINT64_MAX;
+                        for (auto it = bsctx->device_cache.begin(); it != bsctx->device_cache.end(); ++it) {
+                            if (it->second.buffer && it->second.use_sequence < min_seq) {
+                                bool in_use = false;
+                                if (it->second.layer_idx >= 0) {
+                                    // Guard against self-eviction during layer construction
+                                    if (it->second.layer_idx == bsctx->building_layer_idx) {
+                                        in_use = true;
+                                    }
+                                    auto lb_it = bsctx->layer_backups.find(it->second.layer_idx);
+                                    if (lb_it != bsctx->layer_backups.end() && lb_it->second.is_sharpened) {
+                                        in_use = true;
+                                    }
+                                }
+                                if (!in_use) {
+                                    min_seq = it->second.use_sequence;
+                                    lru_it = it;
+                                }
+                            }
+                        }
+                        if (lru_it == bsctx->device_cache.end()) break;
+                        // Sync device before first free to prevent async
+                        // CUDA kernels from reading freed memory.
+                        if (!synced) {
+                            bs_sync_device_before_eviction(bsctx);
+                            synced = true;
+                        }
+                        freed += (int64_t)lru_it->second.nbytes;
+                        bsctx->device_cache_bytes -= (int64_t)lru_it->second.nbytes;
+                        ggml_backend_buffer_free(lru_it->second.buffer);
+                        bsctx->device_cache.erase(lru_it);
+                        bsctx->n_cache_evictions++;
+                    }
+                    effective_device_bytes = bsctx->device_cache_bytes;
+                }
+
+                // Re-check after eviction
+                if (bsctx->params.gpu_budget_bytes > 0 &&
+                    (effective_device_bytes + (int64_t)alloc_size) > bsctx->params.gpu_budget_bytes) {
+                    if (bsctx->params.verbose) {
+                        LLAMA_LOG_WARN("%s: GPU budget exceeded, skipping device expert tensor '%s' "
+                                      "(need %zu, budget %" PRId64 ", used %" PRId64 ")\n",
+                                      __func__, sharp_info.name.c_str(),
+                                      alloc_size, bsctx->params.gpu_budget_bytes,
+                                      effective_device_bytes);
+                    }
+                    bsctx->n_device_tensors_skipped++;
+                    return -1;
+                }
+            }
+
+            ggml_backend_buffer_t sharp_buf = ggml_backend_buft_alloc_buffer(device_buft, alloc_size);
+            if (!sharp_buf) {
+                LLAMA_LOG_ERROR("%s: failed to allocate device buffer (%zu bytes) "
+                               "for combination expert tensor '%s'\n",
+                               __func__, alloc_size, sharp_info.name.c_str());
+                bsctx->n_device_tensors_skipped++;
+                return -1;
+            }
+
+            ggml_backend_buffer_set_usage(sharp_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_backend_buffer_clear(sharp_buf, 0);
+
+            // Pointer-swap to new buffer
+            backup_out.original_buffer     = base_tensor->buffer;
+            backup_out.device_sharp_buffer = sharp_buf;
+
+            void * sharp_base = ggml_backend_buffer_get_base(sharp_buf);
+            base_tensor->data     = sharp_base;
+            base_tensor->buffer   = sharp_buf;
+            base_tensor->type     = sharp_info.type;
+            base_tensor->nb[0]    = ggml_type_size(sharp_info.type);
+            base_tensor->nb[1]    = base_tensor->nb[0] * (base_tensor->ne[0] / ggml_blck_size(sharp_info.type));
+            base_tensor->nb[2]    = base_tensor->nb[1] * base_tensor->ne[1];
+            base_tensor->nb[3]    = base_tensor->nb[2] * base_tensor->ne[2];
+            base_tensor->view_src = nullptr;
+            base_tensor->extra    = nullptr;
+
+            // Upload only the selected expert slices (not the entire tensor)
+            int si_idx = sharp_info.split_idx;
+            int64_t total_sharp_bytes_read = 0;
+
+            for (int32_t i = 0; i < n_experts_req; ++i) {
+                int32_t eidx = expert_ids[i];
+                size_t slice_file_offset = sharp_info.file_offset + (size_t)eidx * sharp_expert_slice;
+                size_t slice_buf_offset  = (size_t)eidx * sharp_expert_slice;
+
+                bool have_mmap = (si_idx >= 0 && si_idx < (int)bsctx->sharp_mmaps.size()
+                                  && bsctx->sharp_mmaps[si_idx]);
+                const void * src_data = nullptr;
+
+                // RAM cache: fastest path (swap-backed anonymous pages)
+                if (bsctx->ram_cache_populated) {
+                    auto rc_it = bsctx->ram_cache.find(sharp_info.name);
+                    if (rc_it != bsctx->ram_cache.end() && rc_it->second.size() >= sharp_info.nbytes) {
+                        size_t slice_cache_offset = (size_t)eidx * sharp_expert_slice;
+                        if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
+                            memcpy(bsctx->pinned_staging_ptr,
+                                   rc_it->second.data() + slice_cache_offset,
+                                   sharp_expert_slice);
+                            src_data = bsctx->pinned_staging_ptr;
+                        } else {
+                            src_data = rc_it->second.data() + slice_cache_offset;
+                        }
+                    }
+                }
+
+                if (!src_data && have_mmap) {
+                    const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si_idx]->addr();
+                    if (slice_file_offset + sharp_expert_slice <= bsctx->sharp_mmaps[si_idx]->size()) {
+                        if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
+                            memcpy(bsctx->pinned_staging_ptr, mmap_base + slice_file_offset, sharp_expert_slice);
+                            src_data = bsctx->pinned_staging_ptr;
+                        } else {
+                            src_data = mmap_base + slice_file_offset;
+                        }
+                        bs_release_mmap_pages(mmap_base + slice_file_offset, sharp_expert_slice);
+                    } else {
+                        LLAMA_LOG_ERROR("%s: mmap OOB for expert %d of device tensor '%s'\n",
+                                       __func__, eidx, sharp_info.name.c_str());
+                        ggml_backend_buffer_free(sharp_buf);
+                        return -1;
+                    }
+                }
+
+                if (!src_data && si_idx >= 0 && si_idx < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si_idx]) {
+                    bsctx->read_buf.resize(sharp_expert_slice);
+                    bsctx->sharp_files[si_idx]->seek(slice_file_offset, SEEK_SET);
+                    bsctx->sharp_files[si_idx]->read_raw(bsctx->read_buf.data(), sharp_expert_slice);
+                    if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
+                        memcpy(bsctx->pinned_staging_ptr, bsctx->read_buf.data(), sharp_expert_slice);
+                        src_data = bsctx->pinned_staging_ptr;
+                    } else {
+                        src_data = bsctx->read_buf.data();
+                    }
+                }
+
+                if (!src_data) {
+                    LLAMA_LOG_ERROR("%s: no data source for split %d (device tensor '%s' expert %d)\n",
+                                   __func__, si_idx, sharp_info.name.c_str(), eidx);
+                    ggml_backend_buffer_free(sharp_buf);
+                    return -1;
+                }
+
+                if (src_data) {
+                    ggml_backend_tensor_set(base_tensor, src_data, slice_buf_offset, sharp_expert_slice);
+                    total_sharp_bytes_read += (int64_t)sharp_expert_slice;
+                }
+            }
+
+            // Track GPU memory
+            bsctx->current_device_sharp_bytes += (int64_t)alloc_size;
+
+            if (bsctx->retain_device_buffers) {
+                blurry_sharp_device_cache_entry entry;
+                entry.buffer       = sharp_buf;
+                entry.nbytes       = alloc_size;
+                entry.populated    = true;
+                entry.use_sequence = bsctx->cache_use_counter++;
+                entry.layer_idx    = sharp_info.layer_idx;
+                bsctx->device_cache[sharp_info.name] = entry;
+                bsctx->device_cache_bytes += (int64_t)alloc_size;
+                bsctx->n_cache_allocs++;
+                backup_out.device_buf_cached = true;
+            }
+
+            bsctx->metrics.n_direct_copies++;
+
+            if (bsctx->params.verbose) {
+                LLAMA_LOG_INFO("%s: device new-buffer expert '%s': %d/%d experts, "
+                              "read %" PRId64 " bytes, alloc %zu bytes VRAM\n",
+                              __func__, sharp_info.name.c_str(),
+                              n_experts_req, n_expert_total,
+                              total_sharp_bytes_read, alloc_size);
+            }
+
+            return total_sharp_bytes_read;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Apply sharp weights for specific experts within a layer.
+// Non-expert tensors get full overlay; expert tensors get selective overlay.
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_apply_experts(
+        llama_blurry_sharp_context * bsctx,
+        int32_t                      layer_idx,
+        const int32_t              * expert_ids,
+        int32_t                      n_experts_req) {
+    if (!bsctx || !bsctx->initialized) return -1;
+    if (!expert_ids || n_experts_req <= 0) return -1;
+    std::lock_guard<std::mutex> lock(bsctx->mtx);
+
+    // Check eligibility
+    if (bsctx->eligible_layers.find(layer_idx) == bsctx->eligible_layers.end()) {
+        if (bsctx->params.verbose) {
+            LLAMA_LOG_INFO("%s: layer %d is not eligible for sharpening\n",
+                          __func__, layer_idx);
+        }
+        return -1;
+    }
+
+    // Check if already sharpened (full layer overlay takes precedence)
+    {
+        auto it = bsctx->layer_backups.find(layer_idx);
+        if (it != bsctx->layer_backups.end() && it->second.is_sharpened) {
+            it->second.apply_sequence = bsctx->apply_sequence_counter++;
+            it->second.apply_timestamp_us = bs_time_us();
+            return 0;
+        }
+    }
+
+    // Check max_sharp_layers limit
+    if (bsctx->params.max_sharp_layers > 0) {
+        int32_t n_currently_sharp = 0;
+        for (auto & kv : bsctx->layer_backups) {
+            if (kv.second.is_sharpened) n_currently_sharp++;
+        }
+        if (n_currently_sharp >= bsctx->params.max_sharp_layers) {
+            int64_t budget = bsctx->current_backup_bytes;
+            llama_blurry_sharp_evict_to_budget(bsctx, budget > 0 ? budget - 1 : 0);
+            n_currently_sharp = 0;
+            for (auto & kv : bsctx->layer_backups) {
+                if (kv.second.is_sharpened) n_currently_sharp++;
+            }
+            if (n_currently_sharp >= bsctx->params.max_sharp_layers) {
+                LLAMA_LOG_WARN("%s: max_sharp_layers=%d reached\n",
+                              __func__, bsctx->params.max_sharp_layers);
+                return -3;
+            }
+        }
+    }
+
+    // Get tensor names for this layer
+    auto layer_it = bsctx->layer_tensor_names.find(layer_idx);
+    if (layer_it == bsctx->layer_tensor_names.end() || layer_it->second.empty()) {
+        LLAMA_LOG_WARN("%s: no sharp tensors for layer %d\n", __func__, layer_idx);
+        return -2;
+    }
+
+    // Check if any tensor in this layer is actually an expert tensor.
+    // If not, fall back to standard full-layer overlay.
+    bool has_expert_tensors = false;
+    for (const auto & tensor_name : layer_it->second) {
+        if (bs_is_expert_tensor(tensor_name)) {
+            has_expert_tensors = true;
+            break;
+        }
+    }
+    if (!has_expert_tensors) {
+        if (bsctx->params.verbose) {
+            LLAMA_LOG_INFO("%s: layer %d has no expert tensors, falling back to full layer overlay\n",
+                          __func__, layer_idx);
+        }
+        // Unlock and call apply_layer (which takes its own lock)
+        // Can't call apply_layer directly since we hold the lock.
+        // Instead, inline the same logic but without re-locking.
+        // For simplicity, just proceed with full overlay below.
+    }
+
+    int64_t t_start = bs_time_us();
+
+    blurry_sharp_layer_backup layer_backup;
+    layer_backup.layer_idx          = layer_idx;
+    layer_backup.is_sharpened       = false;
+    layer_backup.backup_bytes       = 0;
+    layer_backup.sharp_bytes_read   = 0;
+    layer_backup.apply_timestamp_us = t_start;
+    layer_backup.apply_sequence     = bsctx->apply_sequence_counter++;
+
+    bool any_hard_failed = false;   // real errors (I/O, alloc, OOM)
+    int  n_jit_skipped = 0;         // JIT cross-type host skips (expected, non-fatal)
+    int  n_expert_tensors_overlaid = 0;
+    int  n_nonexpert_tensors_overlaid = 0;
+
+    // Mark this layer as "being built" so the LRU eviction code inside
+    // bs_overlay_single_tensor / bs_overlay_expert_tensor does NOT evict
+    // cache entries that were just allocated for earlier tensors of THIS
+    // layer.  Without this guard, overlaying tensor B could evict tensor
+    // A's freshly-cached buffer, leaving tensor A's base_tensor->data
+    // pointing at freed GPU memory → illegal memory access when the
+    // compute kernel runs.
+    bsctx->building_layer_idx = layer_idx;
+
+    // Prefetch this layer's sharp data
+    bs_prefetch_layer_mmap(bsctx, layer_idx);
+
+    for (const auto & tensor_name : layer_it->second) {
+        auto info_it = bsctx->sharp_index.find(tensor_name);
+        if (info_it == bsctx->sharp_index.end()) continue;
+
+        const auto & sharp_info = info_it->second;
+
+        ggml_tensor * base_tensor = sharp_info.base_tensor;
+        if (!base_tensor) {
+            base_tensor = bs_find_model_tensor(bsctx->model, tensor_name.c_str());
+        }
+        if (!base_tensor) {
+            LLAMA_LOG_WARN("%s: base tensor '%s' not found, skipping\n",
+                          __func__, tensor_name.c_str());
+            continue;
+        }
+
+        // In JIT mode, check if this tensor would be a cross-type host
+        // overlay BEFORE doing any work.  These are expected skips (not
+        // errors) because the backend scheduler's device copies are
+        // pre-allocated at the blurry size.  Count them separately so we
+        // don't roll back the tensors that DID succeed.
+        if (bsctx->jit_active) {
+            bool tih = true;
+            if (base_tensor->buffer) {
+                tih = ggml_backend_buffer_is_host(base_tensor->buffer);
+            }
+            if (tih && base_tensor->type != sharp_info.type) {
+                n_jit_skipped++;
+                continue;  // silently skip — the overlay functions already logged
+            }
+        }
+
+        // Check memory budget
+        // For expert tensors, the cost is the full tensor (we need the
+        // combination buffer), but the I/O is only the expert slices.
+        int64_t cost = (int64_t)sharp_info.nbytes;
+        if (bsctx->params.memory_budget_bytes > 0 &&
+            (bsctx->current_backup_bytes + cost) > bsctx->params.memory_budget_bytes) {
+            int64_t target = bsctx->current_backup_bytes
+                           - ((bsctx->current_backup_bytes + cost) - bsctx->params.memory_budget_bytes);
+            if (target < 0) target = 0;
+            llama_blurry_sharp_evict_to_budget(bsctx, target);
+            if ((bsctx->current_backup_bytes + cost) > bsctx->params.memory_budget_bytes) {
+                LLAMA_LOG_WARN("%s: memory budget exceeded for tensor '%s'\n",
+                              __func__, tensor_name.c_str());
+                any_hard_failed = true;
+                continue;
+            }
+        }
+
+        blurry_sharp_tensor_backup tb;
+        int64_t sharp_bytes;
+
+        if (has_expert_tensors && bs_is_expert_tensor(tensor_name)) {
+            // Expert tensor: use selective expert overlay
+            sharp_bytes = bs_overlay_expert_tensor(
+                bsctx, sharp_info, base_tensor,
+                expert_ids, n_experts_req, tb);
+            if (sharp_bytes >= 0) n_expert_tensors_overlaid++;
+        } else {
+            // Non-expert tensor (attention, norms, gate_inp): full overlay
+            sharp_bytes = bs_overlay_single_tensor(bsctx, sharp_info, base_tensor, tb);
+            if (sharp_bytes >= 0) n_nonexpert_tensors_overlaid++;
+        }
+
+        if (sharp_bytes < 0) {
+            LLAMA_LOG_ERROR("%s: failed to overlay tensor '%s'\n",
+                           __func__, tensor_name.c_str());
+            any_hard_failed = true;
+            continue;
+        }
+
+        layer_backup.backup_bytes     += sharp_bytes;
+        layer_backup.sharp_bytes_read += sharp_bytes;
+        layer_backup.tensor_backups.push_back(std::move(tb));
+
+        bsctx->current_backup_bytes += sharp_bytes;
+        bsctx->metrics.total_sharp_bytes_read += sharp_bytes;
+        bsctx->metrics.total_backup_bytes_written += sharp_bytes;
+    }
+
+    if (layer_backup.tensor_backups.empty()) {
+        bsctx->building_layer_idx = -1;
+        return (any_hard_failed || n_jit_skipped > 0) ? -4 : -2;
+    }
+
+    // Roll back on hard failure (I/O error, allocation failure, etc.)
+    // JIT cross-type skips are NOT hard failures — they're expected when
+    // expert tensors are on the CPU with a different quant type.  In that
+    // case we keep the successful overlays (e.g. attention/norm tensors on
+    // GPU) and run with a partially sharpened layer.
+    if (any_hard_failed) {
+        LLAMA_LOG_WARN("%s: layer %d had failures — rolling back %d overlays\n",
+                      __func__, layer_idx,
+                      (int)layer_backup.tensor_backups.size());
+
+        for (auto & tb : layer_backup.tensor_backups) {
+            if (tb.is_device && tb.device_buf_cached) {
+                auto cache_it = bsctx->device_cache.find(tb.tensor_name);
+                if (cache_it != bsctx->device_cache.end()) {
+                    if (cache_it->second.buffer) {
+                        bsctx->device_cache_bytes -= (int64_t)cache_it->second.nbytes;
+                        ggml_backend_buffer_free(cache_it->second.buffer);
+                    }
+                    bsctx->device_cache.erase(cache_it);
+                }
+                // Null out the pointer so bs_restore_single_tensor does NOT
+                // double-free the same buffer we just freed via the cache.
+                tb.device_sharp_buffer = nullptr;
+                tb.device_buf_cached = false;
+            }
+            bs_restore_single_tensor(bsctx, tb);
+        }
+        bsctx->current_backup_bytes -= layer_backup.backup_bytes;
+        bsctx->building_layer_idx = -1;
+        return -4;
+    }
+
+    layer_backup.is_sharpened = true;
+    bsctx->layer_backups[layer_idx] = std::move(layer_backup);
+    bsctx->building_layer_idx = -1;
+
+    int64_t t_end = bs_time_us();
+    bsctx->metrics.n_apply_calls++;
+    bsctx->metrics.total_time_apply_us += (t_end - t_start);
+
+    if (bsctx->params.verbose || n_jit_skipped > 0) {
+        LLAMA_LOG_INFO("%s: layer %d combination-expert sharpened "
+                      "(%d expert tensors with %d/%d experts + %d non-expert tensors",
+                      __func__, layer_idx,
+                      n_expert_tensors_overlaid, n_experts_req,
+                      llama_blurry_sharp_n_experts(bsctx),
+                      n_nonexpert_tensors_overlaid);
+        if (n_jit_skipped > 0) {
+            LLAMA_LOG_INFO(", %d cross-type host tensors skipped (JIT mode)", n_jit_skipped);
+        }
+        LLAMA_LOG_INFO(", %" PRId64 " bytes read, %" PRId64 " us)\n",
+                      bsctx->layer_backups[layer_idx].sharp_bytes_read,
+                      t_end - t_start);
+    }
+
+    return 0;
+}

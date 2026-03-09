@@ -469,6 +469,61 @@ struct gpt_params {
     std::string lora_outfile = "ggml-lora-merged-f16.gguf";
 
     bool sweep_bench_output_jsonl = false;
+
+    // blurry-sharp overlay params
+    std::string sharp_model;                          // path to the sharp (high-quality) GGUF model
+    int         bs_router_strategy     = 0;           // 0=always, 1=never, 2=norm
+    float       bs_router_confidence   = 0.8f;        // min confidence for norm router
+    int         bs_max_sharp_layers    = 0;           // 0=unlimited
+    int64_t     bs_memory_budget_mb    = 0;           // 0=unlimited
+    int64_t     bs_gpu_budget_mb       = 0;           // 0=unlimited; max GPU MiB for sharp device buffers
+    bool        bs_restore_after_fwd   = true;        // restore blurry weights after each layer forward
+    bool        bs_verbose             = false;       // verbose overlay logging
+    bool        bs_use_mmap            = true;        // mmap the sharp file (recommended)
+    bool        bs_precache_ram        = false;       // pre-read sharp data into anonymous heap (swap-backed)
+    bool        bs_stage_swap          = false;       // after precache, move pages to swap (free RAM)
+    bool        bs_lazy_swap           = false;       // lazy per-layer swap staging: populate RAM cache
+                                                      // on first layer access, MADV_PAGEOUT on restore.
+                                                      // Instant startup (no 30-min precache), subsequent
+                                                      // accesses swap-in from SSD.
+    bool        bs_compare             = false;       // run blurry-only then blurry+sharp and compare
+    bool        bs_dynamic             = false;       // per-token entropy-based dynamic sharpening
+    float       bs_entropy_threshold   = 3.0f;        // logit entropy above this triggers sharpening
+    int         bs_dynamic_top_k       = 8;           // how many layers to sharpen when uncertain
+
+    // Probe mode: periodically ask the sharp model if blurry is on track.
+    // Every bs_probe_interval tokens, sharpen + re-decode the last token.
+    // If sharp disagrees (different top-1), stay sharp for bs_probe_hold tokens.
+    int         bs_probe_interval      = 0;           // 0=disabled; e.g. 8 = probe every 8 tokens
+    int         bs_probe_hold          = 16;          // stay sharp for this many tokens after a disagreement
+
+    // Speculative verification mode: generate bs_spec_draft tokens with blurry,
+    // then verify all at once with sharp.  Accept the longest agreeing prefix,
+    // take sharp's token at the first divergence.  Inspired by speculative decoding.
+    bool        bs_speculative         = false;       // enable speculative verification mode
+    int         bs_spec_draft          = 8;           // number of draft (blurry) tokens per batch
+    bool        bs_retain_buffers      = false;       // keep GPU buffers across restore cycles (faster re-sharpen)
+
+    // Combined mode: unified pipeline that merges entropy, probing, and speculative
+    // verification.  Drafts up to bs_spec_draft tokens, uses entropy + periodic probes
+    // to adaptively shorten the draft when quality is at risk, then verifies with sharp.
+    // Result: sharp-level quality at a fraction of the cost.
+    bool        bs_combined            = false;       // enable combined adaptive mode
+    int         bs_combined_probe_stride = 4;         // within a draft, probe every N tokens
+
+    // MoE Combination Expert mode: for Mixture-of-Experts models, instead of
+    // sharpening entire layers (all experts), only sharpen the experts that are
+    // actually activated by the router.  Creates "combination tensors" that are
+    // mostly blurry with selected expert slices replaced by sharp data.
+    // Reduces I/O by n_expert / n_expert_used (e.g., 16x for 128-expert top-8).
+    //
+    // In combined+moe mode: drafts with blurry, tracks which experts fire,
+    // then verifies by sharpening only those experts.
+    bool        bs_moe_combination     = false;       // enable MoE combination expert mode
+    int         bs_moe_top_k_override  = 0;           // override n_expert_used (0=use model default)
+
+    std::vector<int> bs_layer_allowlist;               // only sharpen these layers (empty=all)
+    std::vector<int> bs_layer_denylist;                // never sharpen these layers (empty=none)
 };
 
 

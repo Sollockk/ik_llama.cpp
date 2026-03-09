@@ -1491,7 +1491,371 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API void llama_dump_timing_info_yaml(FILE * stream, const struct llama_context * ctx);
 
     //
+    // Blurry→Sharp overlay system
+    //
+    // Enables selective quality upgrading during inference: load a low-quality
+    // (blurry) GGUF model for speed, then hotswap specific layer weights from
+    // a high-quality (sharp) GGUF model on-the-fly based on routing decisions.
+    //
+
+    struct llama_blurry_sharp_context;
+
+    enum llama_blurry_sharp_router_strategy {
+        LLAMA_BS_ROUTER_ALWAYS = 0,   // always sharpen eligible layers
+        LLAMA_BS_ROUTER_NEVER  = 1,   // never sharpen (useful for A/B testing)
+        LLAMA_BS_ROUTER_NORM   = 2,   // activation L2-norm heuristic
+    };
+
+    enum llama_blurry_sharp_eviction_policy {
+        LLAMA_BS_EVICT_LRU      = 0,
+        LLAMA_BS_EVICT_FIFO     = 1,
+        LLAMA_BS_EVICT_PRIORITY = 2,
+    };
+
+    struct llama_blurry_sharp_params {
+        const char * sharp_model_path;          // path to the sharp (high-quality) GGUF file
+
+        enum llama_blurry_sharp_router_strategy router_strategy; // default: ALWAYS
+        float    router_min_confidence;         // threshold for NORM router [0,1], default 0.8
+        int32_t  max_sharp_layers;              // 0 = unlimited
+        int64_t  memory_budget_bytes;           // 0 = unlimited (total CPU+GPU backup budget)
+        int64_t  gpu_budget_bytes;              // 0 = unlimited; max GPU memory the overlay may allocate
+                                                // for sharp device buffers.  When exceeded, device tensors
+                                                // are skipped (CPU tensors still use zero-copy mmap).
+        bool     restore_after_forward;         // restore blurry weights after each layer
+        enum llama_blurry_sharp_eviction_policy eviction_policy; // default: LRU
+
+        const int32_t * layer_allowlist;        // NULL = all layers eligible
+        int32_t         n_layer_allowlist;
+        const int32_t * layer_denylist;         // NULL = no layers denied
+        int32_t         n_layer_denylist;
+
+        bool     use_mmap;                      // mmap the sharp file (recommended)
+        bool     verbose;                       // detailed logging
+        bool     retain_device_buffers;         // keep GPU buffers across restore cycles so
+                                                // re-sharpening skips cudaMalloc + PCIe copy.
+                                                // Uses more persistent VRAM but dramatically
+                                                // speeds up repeated sharpen/restore cycles
+                                                // (e.g. combined/speculative mode).
+
+        bool     permanent;                     // one-way sharpen: overwrite blurry weights
+                                                // in-place with no backup.  Cannot be restored.
+                                                // For GPU tensors with same type/size: writes
+                                                // sharp data directly into the existing device
+                                                // buffer (zero extra VRAM).  For different
+                                                // types: allocates a new buffer but does NOT
+                                                // keep the blurry backup.
+                                                // For CPU tensors: pointer-swaps to sharp mmap
+                                                // and releases blurry pages immediately.
+                                                // Use for static overlay (apply once at startup)
+                                                // to avoid doubling memory usage.
+
+        bool     lazy_swap;                     // lazy per-layer swap staging: instead of
+                                                // pre-reading the entire sharp model into RAM
+                                                // and staging to swap at startup (slow), lazily
+                                                // populate the RAM cache per-layer on first
+                                                // apply_layer() call, and MADV_PAGEOUT the
+                                                // cached pages on restore.  Subsequent accesses
+                                                // swap-in from SSD (fast) instead of re-reading
+                                                // from the GGUF file (slow).
+                                                // Eliminates the 30-minute startup cost of
+                                                // --bs-stage-swap by spreading disk->RAM->swap
+                                                // migration across the first inference pass.
+    };
+
+    struct llama_blurry_sharp_state {
+        int32_t n_layers_total;
+        int32_t n_layers_sharpened;
+        int64_t total_backup_bytes;
+        int64_t total_sharp_bytes_read;
+        int64_t memory_budget_bytes;
+        int64_t gpu_budget_bytes;               // configured GPU budget (0 = unlimited)
+        int64_t gpu_device_bytes_used;          // current GPU memory allocated by overlay
+        int32_t max_sharp_layers;
+        int32_t n_device_tensors_skipped;       // tensors skipped due to GPU budget
+    };
+
+    // Get default blurry-sharp parameters
+    LLAMA_API struct llama_blurry_sharp_params llama_blurry_sharp_default_params(void);
+
+    // Initialize overlay system.  Opens the sharp GGUF, builds tensor index.
+    // Returns NULL on failure (error is logged).
+    LLAMA_API struct llama_blurry_sharp_context * llama_blurry_sharp_init(
+            struct llama_model              * model,
+            struct llama_blurry_sharp_params  params);
+
+    // Free all resources owned by the blurry-sharp context.
+    // Restores all layers to blurry weights before freeing.
+    LLAMA_API void llama_blurry_sharp_free(
+            struct llama_blurry_sharp_context * bsctx);
+
+    // Apply sharp weights for a specific layer (backs up blurry data).
+    // Returns 0 on success, negative on error.
+    LLAMA_API int32_t llama_blurry_sharp_apply_layer(
+            struct llama_blurry_sharp_context * bsctx,
+            int32_t                             layer_idx);
+
+    // Restore a layer to its original blurry weights.
+    // Returns 0 on success, -1 if layer was not sharpened.
+    LLAMA_API int32_t llama_blurry_sharp_restore_layer(
+            struct llama_blurry_sharp_context * bsctx,
+            int32_t                             layer_idx);
+
+    // Restore all currently-sharpened layers.
+    LLAMA_API void llama_blurry_sharp_restore_all(
+            struct llama_blurry_sharp_context * bsctx);
+
+    // Route + auto-sharpen in one call.  Returns number of layers sharpened.
+    // activations: optional float[n_tokens * n_embd] for NORM router.
+    LLAMA_API int32_t llama_blurry_sharp_auto_sharpen(
+            struct llama_blurry_sharp_context * bsctx,
+            const float                       * activations,
+            int32_t                             n_tokens,
+            int32_t                             n_embd);
+
+    // Query whether a layer is currently sharpened.
+    LLAMA_API bool llama_blurry_sharp_is_layer_sharp(
+            const struct llama_blurry_sharp_context * bsctx,
+            int32_t                                   layer_idx);
+
+    // Get aggregate overlay state.
+    LLAMA_API struct llama_blurry_sharp_state llama_blurry_sharp_get_state(
+            const struct llama_blurry_sharp_context * bsctx);
+
+    // Evict sharpened layers until backup bytes <= target_bytes.
+    // Returns the number of layers evicted.
+    LLAMA_API int32_t llama_blurry_sharp_evict_to_budget(
+            struct llama_blurry_sharp_context * bsctx,
+            int64_t                             target_bytes);
+
+    // Apply all eligible layers in one call.
+    // Prefetches mmap pages with madvise(WILLNEED) before starting,
+    // reducing page-fault latency during the overlay loop.
+    // Returns the number of layers successfully sharpened.
+    LLAMA_API int32_t llama_blurry_sharp_apply_all(
+            struct llama_blurry_sharp_context * bsctx);
+
+    // Prefetch live zero-copy tensor pages into the page cache (RAM).
+    // After sharpening, CPU zero-copy tensors point at mmap pages that may
+    // not be resident in RAM yet.  This tells the kernel to pull them in
+    // using available RAM, avoiding page-fault stalls during generation.
+    // For GPU tensors this is a no-op (data is in VRAM).
+    LLAMA_API void llama_blurry_sharp_warm_live_pages(
+            struct llama_blurry_sharp_context * bsctx);
+
+    // Prefetch a layer's sharp data from disk into the page cache (RAM).
+    // Issues madvise(WILLNEED) on the layer's mmap regions, which tells the
+    // kernel to begin asynchronous readahead.  This is non-blocking and
+    // returns immediately.  Call this N layers ahead of apply_layer /
+    // apply_experts to give the kernel time to bring pages into RAM before
+    // they are needed.  Safe to call for any memory tier — if the layer
+    // uses RAM cache instead of mmap, or if tensors are on GPU, this is
+    // effectively a no-op for those tensors (the mmap prefetch still helps
+    // for the source data that will be copied to staging/device buffers).
+    LLAMA_API void llama_blurry_sharp_prefetch_layer(
+            struct llama_blurry_sharp_context * bsctx,
+            int32_t                             layer_idx);
+
+    // Pre-allocate device (GPU) buffers for all eligible tensors.
+    // Moves cudaMalloc out of the apply hot-path so that subsequent
+    // apply_layer / apply_all calls only need the PCIe data copy.
+    // Implicitly enables retain_device_buffers.
+    // Returns the number of device buffers pre-allocated.
+    LLAMA_API int32_t llama_blurry_sharp_preload_device_cache(
+            struct llama_blurry_sharp_context * bsctx);
+
+    // -----------------------------------------------------------------------
+    // Memory-tier management: VRAM > RAM > Swap > Disk
+    //
+    // By default, CPU tensors use mmap zero-copy: their data pointers point
+    // directly at file-backed mmap pages.  Under memory pressure, the kernel
+    // DROPS these pages (they're clean/file-backed) and re-faults from disk.
+    // This means the memory hierarchy is effectively: VRAM > Disk, skipping
+    // both RAM and Swap tiers entirely.
+    //
+    // These functions populate a RAM cache of anonymous heap buffers.
+    // Anonymous pages behave differently under pressure: instead of being
+    // dropped, they are SWAPPED OUT to the swap partition.  Swap-in from
+    // an SSD is typically 10-50x faster than random I/O from a GGUF file.
+    //
+    // Recommended startup sequence:
+    //   1. llama_blurry_sharp_init()
+    //   2. llama_blurry_sharp_precache_ram()    — fills RAM with sharp data
+    //   3. llama_blurry_sharp_stage_to_swap()   — moves to swap, frees RAM
+    //   4. llama_blurry_sharp_preload_device_cache()  — pre-alloc GPU buffers
+    //   5. llama_blurry_sharp_apply_all() / apply_layer()
+    //
+    // After step 3, the sharp data lives in swap (fast SSD) and RAM is free
+    // for the blurry model, KV cache, and other active data.  When apply
+    // needs sharp data, it reads from the RAM cache (swap-backed) instead
+    // of from the GGUF file on disk.
+    // -----------------------------------------------------------------------
+
+    // Pre-read all sharp tensor data into anonymous heap buffers (RAM cache).
+    // This fills available RAM with sharp data.  Under memory pressure, these
+    // anonymous pages are swapped out (not dropped like file-backed mmap pages).
+    // Re-access comes from swap (fast SSD) instead of the GGUF file (slow).
+    // Returns the number of tensors cached.
+    LLAMA_API int32_t llama_blurry_sharp_precache_ram(
+            struct llama_blurry_sharp_context * bsctx);
+
+    // Proactively move RAM-cached pages to swap using MADV_PAGEOUT (Linux 5.4+).
+    // This frees RAM for the blurry model / KV cache while keeping sharp data
+    // quickly accessible via swap-in.  No-op on systems without MADV_PAGEOUT.
+    // Returns the number of tensors whose pages were staged to swap.
+    LLAMA_API int32_t llama_blurry_sharp_stage_to_swap(
+            struct llama_blurry_sharp_context * bsctx);
+
+    // -----------------------------------------------------------------------
+    // MoE Combination Expert API
+    //
+    // For Mixture-of-Experts models, expert FFN tensors (ffn_gate_exps,
+    // ffn_up_exps, ffn_down_exps) are 3D tensors where the outermost
+    // dimension (ne[2]) is the expert index.  Instead of sharpening an
+    // entire layer (which replaces ALL experts, including inactive ones),
+    // these functions allow sharpening individual expert slices.
+    //
+    // This creates a "combination expert" tensor: mostly blurry (fast)
+    // expert weights with selected expert slices replaced by sharp
+    // (high-quality) data.  Only the active experts need sharpening,
+    // reducing I/O by a factor of n_expert / n_expert_used.
+    //
+    // Non-expert tensors in the layer (attention, norms) are always
+    // sharpened in full when apply_experts is called, since they are
+    // shared across all experts and are comparatively small.
+    // -----------------------------------------------------------------------
+
+    // Apply sharp weights for specific expert(s) within a layer.
+    // Creates a "combination tensor" per expert tensor: copies the full
+    // blurry tensor, then overwrites only the requested expert slices
+    // with sharp data.  Non-expert tensors (attn, norms) in the layer
+    // are sharpened in full.
+    //
+    // expert_ids:   array of expert indices to sharpen
+    // n_experts:    number of entries in expert_ids
+    //
+    // Returns 0 on success, negative on error.
+    // If the layer has no expert tensors (dense model), falls back to
+    // llama_blurry_sharp_apply_layer().
+    LLAMA_API int32_t llama_blurry_sharp_apply_experts(
+            struct llama_blurry_sharp_context * bsctx,
+            int32_t                             layer_idx,
+            const int32_t                     * expert_ids,
+            int32_t                             n_experts);
+
+    // Query the number of experts per MoE layer in the sharp model.
+    // Returns 0 if the model is not MoE or if the context is invalid.
+    // Inspects the ne[2] dimension of the first ffn_gate_exps tensor found.
+    LLAMA_API int32_t llama_blurry_sharp_n_experts(
+            const struct llama_blurry_sharp_context * bsctx);
+
+    // Query the number of active (routed) experts per token.
+    // Returns 0 if unknown or not MoE.
+    LLAMA_API int32_t llama_blurry_sharp_n_experts_used(
+            const struct llama_blurry_sharp_context * bsctx);
+
+    // Check whether a tensor name corresponds to a merged expert tensor
+    // (ffn_gate_exps, ffn_up_exps, ffn_down_exps).
+    // Returns true if the tensor is a merged expert tensor.
+    LLAMA_API bool llama_blurry_sharp_is_expert_tensor(
+            const char * tensor_name);
+
+    // -----------------------------------------------------------------------
+    // MoE Router Recording
+    //
+    // During llama_decode(), MoE layers select top-k experts per token via a
+    // learned router (gate).  These functions allow recording those selections
+    // so that external code (e.g. the blurry-sharp overlay) can later sharpen
+    // only the exact experts that were active during a draft phase.
+    //
+    // Usage:
+    //   1. llama_router_start_recording(ctx)   — clears old data, starts recording
+    //   2. llama_decode(ctx, batch) [one or more times]
+    //   3. llama_router_get_layer_experts(ctx, layer, ...) — query results
+    //   4. llama_router_stop_recording(ctx)    — stop (data persists until clear/start)
+    //
+    // Recording works by intercepting the "ffn_moe_topk-{layer}" tensors
+    // during graph execution via the backend scheduler eval callback.
+    // The overhead is minimal: only a few bytes per MoE layer per token
+    // are copied from the compute tensor to a persistent set.
+    // -----------------------------------------------------------------------
+
+    // Start recording MoE router expert selections.
+    // Clears any previously recorded data.
+    // Recording persists across multiple llama_decode() calls until stopped.
+    LLAMA_API void llama_router_start_recording(struct llama_context * ctx);
+
+    // Stop recording.  Recorded data persists until cleared or next start.
+    LLAMA_API void llama_router_stop_recording(struct llama_context * ctx);
+
+    // Check if router recording is currently active.
+    LLAMA_API bool llama_router_is_recording(const struct llama_context * ctx);
+
+    // Get the unique expert IDs used in a specific model layer across all
+    // recorded llama_decode() calls since the last start/clear.
+    //
+    // out_expert_ids: buffer to receive unique expert IDs (sorted ascending).
+    //                 Pass NULL to just query the count.
+    // max_ids:        capacity of out_expert_ids (ignored when NULL).
+    //
+    // Returns the number of unique expert IDs for that layer,
+    //         0 if the layer had no MoE routing recorded,
+    //         or negative on error.
+    LLAMA_API int32_t llama_router_get_layer_experts(
+            const struct llama_context * ctx,
+            int32_t                      layer_idx,
+            int32_t                    * out_expert_ids,
+            int32_t                      max_ids);
+
+    // Get the number of distinct MoE layers that have recorded data.
+    LLAMA_API int32_t llama_router_n_recorded_layers(const struct llama_context * ctx);
+
+    // Clear all recorded router data without stopping recording.
+    LLAMA_API void llama_router_clear(struct llama_context * ctx);
+
+    // -----------------------------------------------------------------------
+    // JIT (Just-In-Time) Per-Layer Sharpening
+    //
+    // Instead of sharpening ALL layers at once (which requires the entire
+    // sharp model to be resident in memory simultaneously), JIT sharpening
+    // hooks into the forward pass via the eval callback and sharpens ONE
+    // layer at a time:
+    //
+    //   1. The MoE gate/router runs with blurry weights → selects experts
+    //   2. The eval callback intercepts "ffn_moe_topk-{il}" → reads expert IDs
+    //   3. Sharpens ONLY that layer's expert weight tensors (zero-copy mmap
+    //      on CPU, in-place overwrite on GPU for same-type)
+    //   4. The expert FFN ops run with sharp weights
+    //   5. When the next layer's topk fires, the previous layer is restored
+    //
+    // Memory usage: bounded to ~one layer's worth of sharp data at a time,
+    // regardless of total model size.  No re-decode needed — sharp weights
+    // are used during the original forward pass.
+    //
+    // Usage:
+    //   llama_blurry_sharp_start_jit(bsctx, ctx);
+    //   llama_decode(ctx, batch);
+    //   llama_blurry_sharp_stop_jit(bsctx, ctx);
+    //
+    // Requires single-slot mode (-np 1).  Automatically enables router
+    // recording so expert selections are available after decode.
+    // -----------------------------------------------------------------------
+
+    // Start per-layer JIT sharpening for subsequent llama_decode() calls.
+    // Installs an eval callback that sharpens/restores one layer at a time.
+    LLAMA_API void llama_blurry_sharp_start_jit(
+            struct llama_blurry_sharp_context * bsctx,
+            struct llama_context              * ctx);
+
+    // Stop JIT sharpening.  Restores any still-sharpened layer and removes
+    // the eval callback.  Must be called after llama_decode() returns.
+    LLAMA_API void llama_blurry_sharp_stop_jit(
+            struct llama_blurry_sharp_context * bsctx,
+            struct llama_context              * ctx);
+
+    //
     // MTP
+    //
     //
 
     LLAMA_API int32_t llama_model_n_nextn_layer(const struct llama_model * model);

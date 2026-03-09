@@ -5,6 +5,8 @@
 
 #include "common.h"
 #include "llama.h"
+
+#include <unordered_set>
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -13,6 +15,12 @@
 
 
 server_context::~server_context() {
+    // Free blurry-sharp overlay before model (it holds references to model tensors)
+    if (bsctx) {
+        llama_blurry_sharp_free(bsctx);
+        bsctx = nullptr;
+    }
+
     if (ctx) {
         llama_free(ctx);
         ctx = nullptr;
@@ -163,6 +171,177 @@ bool server_context::load_model(const gpt_params& params_) {
         LOG_WARNING("WARNING: -mtp flag provided, but model has 0 NextN layers. MTP will be disabled.\n", {});
         params_base.has_mtp = false;
     }
+
+    // -----------------------------------------------------------------------
+    // Blurry-sharp overlay initialization
+    //
+    // If --sharp was provided, open the sharp GGUF and either:
+    //   (a) Apply all layers at startup (static mode — works multi-slot), or
+    //   (b) Set up MoE combination mode for per-decode expert-selective
+    //       sharpening via router hooks (requires -np 1).
+    // -----------------------------------------------------------------------
+    if (!params_base.sharp_model.empty()) {
+        LOG_INFO("Initializing blurry-sharp overlay", {
+            {"sharp_model", params_base.sharp_model},
+        });
+
+        llama_blurry_sharp_params bs_params = llama_blurry_sharp_default_params();
+        bs_params.sharp_model_path      = params_base.sharp_model.c_str();
+        bs_params.router_strategy       = (llama_blurry_sharp_router_strategy)params_base.bs_router_strategy;
+        bs_params.router_min_confidence = params_base.bs_router_confidence;
+        bs_params.max_sharp_layers      = params_base.bs_max_sharp_layers;
+        bs_params.memory_budget_bytes   = params_base.bs_memory_budget_mb * 1024 * 1024;
+        bs_params.gpu_budget_bytes      = params_base.bs_gpu_budget_mb * 1024 * 1024;
+        bs_params.restore_after_forward = params_base.bs_restore_after_fwd;
+        bs_params.verbose               = params_base.bs_verbose;
+        bs_params.use_mmap              = params_base.bs_use_mmap;
+        bs_params.lazy_swap             = params_base.bs_lazy_swap;
+
+        // For MoE combination mode: enable device buffer caching so that
+        // repeated sharpen/restore cycles reuse GPU allocations (skip
+        // cudaMalloc + PCIe copy when the same experts are selected again).
+        // For static mode: permanent=true makes caching irrelevant.
+        bs_params.retain_device_buffers = params_base.bs_retain_buffers
+            || params_base.bs_moe_combination;
+
+        // Static overlay (non-MoE-combination) uses permanent mode:
+        // overwrites blurry weights in-place with no backup.  This avoids
+        // doubling memory usage (both blurry + sharp resident at once).
+        // For same-type GPU tensors this means zero extra VRAM.
+        // MoE combination mode needs restore capability, so permanent=false.
+        bs_params.permanent = !params_base.bs_moe_combination;
+
+        if (!params_base.bs_layer_allowlist.empty()) {
+            bs_params.layer_allowlist   = params_base.bs_layer_allowlist.data();
+            bs_params.n_layer_allowlist = (int32_t)params_base.bs_layer_allowlist.size();
+        }
+        if (!params_base.bs_layer_denylist.empty()) {
+            bs_params.layer_denylist    = params_base.bs_layer_denylist.data();
+            bs_params.n_layer_denylist  = (int32_t)params_base.bs_layer_denylist.size();
+        }
+
+        bsctx = llama_blurry_sharp_init(model, bs_params);
+
+        if (!bsctx) {
+            LOG_WARNING("Failed to initialize blurry-sharp overlay, proceeding without it", {});
+        } else {
+            // Determine mode
+            bool use_moe_dynamic = params_base.bs_moe_combination;
+            int32_t n_expert      = llama_blurry_sharp_n_experts(bsctx);
+            int32_t n_expert_used = llama_blurry_sharp_n_experts_used(bsctx);
+            bool is_moe = (n_expert > 1 && n_expert_used > 0);
+
+            if (use_moe_dynamic && !is_moe) {
+                LOG_WARNING("--bs-moe-combination requested but model is not MoE, falling back to static overlay", {
+                    {"n_expert", n_expert},
+                    {"n_expert_used", n_expert_used},
+                });
+                use_moe_dynamic = false;
+            }
+            if (use_moe_dynamic && params_base.n_parallel > 1) {
+                LOG_WARNING("--bs-moe-combination requires single-slot mode (-np 1), falling back to static overlay", {
+                    {"n_parallel", params_base.n_parallel},
+                });
+                use_moe_dynamic = false;
+            }
+
+            if (use_moe_dynamic) {
+                // ---- MoE combination mode (JIT per-layer hotswapping) ----
+                //
+                // During each llama_decode(), the JIT eval callback intercepts
+                // ffn_moe_topk-N tensors and sharpens ONE layer at a time:
+                //
+                //   layer N topk computed → restore layer N-1, sharpen layer N
+                //   layer N+1 topk computed → restore layer N, sharpen layer N+1
+                //   ...
+                //   decode finishes → stop_jit restores last layer
+                //
+                // Only one layer's expert data is ever resident at a time.
+                // Memory overhead ≈ one layer's expert slices, not the full
+                // sharp model.  No re-decode needed — sharpening happens
+                // DURING the forward pass.
+                //
+                // CPU tensors use zero-copy mmap (zero extra RAM).
+                // GPU same-type tensors use in-place overwrite (zero extra VRAM).
+                // GPU cross-type tensors need a per-tensor device buffer
+                // (bounded by --bs-gpu-budget-mb).
+                bs_moe_dynamic = true;
+
+                // ---- Memory-tier initialization (VRAM > RAM > Swap > Disk) ----
+                // --bs-stage-swap implies --bs-precache-ram.
+                // Pre-read sharp tensor data into anonymous heap buffers so that
+                // under memory pressure pages go to swap (fast SSD) instead of
+                // being dropped like file-backed mmap pages.
+                const bool do_precache = (params_base.bs_precache_ram || params_base.bs_stage_swap) && !params_base.bs_lazy_swap;
+                if (params_base.bs_lazy_swap) {
+                    LOG_INFO("Lazy per-layer swap staging enabled (no upfront precache)", {});
+                    LOG_INFO("Sharp data will be cached into RAM on first layer access, "
+                             "then staged to swap on restore", {});
+                }
+                if (do_precache) {
+                    LOG_INFO("Pre-caching sharp data into RAM (anonymous/swappable memory)", {});
+                    const auto t0 = ggml_time_us();
+                    int32_t n_precached = llama_blurry_sharp_precache_ram(bsctx);
+                    const auto t1 = ggml_time_us();
+                    LOG_INFO("RAM cache populated", {
+                        {"n_tensors", n_precached},
+                        {"time_ms", (t1 - t0) / 1000.0},
+                    });
+
+                    if (params_base.bs_stage_swap) {
+                        const auto t2 = ggml_time_us();
+                        int32_t n_staged = llama_blurry_sharp_stage_to_swap(bsctx);
+                        const auto t3 = ggml_time_us();
+                        LOG_INFO("Sharp data staged to swap (RAM freed for blurry model / KV cache)", {
+                            {"n_tensors_staged", n_staged},
+                            {"time_ms", (t3 - t2) / 1000.0},
+                        });
+                    }
+                }
+
+                llama_blurry_sharp_state st = llama_blurry_sharp_get_state(bsctx);
+                LOG_INFO("Blurry-sharp MoE combination mode ready (JIT per-layer hotswap)", {
+                    {"n_layers", st.n_layers_total},
+                    {"n_expert", n_expert},
+                    {"n_expert_used", n_expert_used},
+                    {"gpu_budget_mb", params_base.bs_gpu_budget_mb},
+                    {"mode", "jit_per_layer"},
+                    {"memory_tier", (do_precache || params_base.bs_lazy_swap) ? "VRAM > RAM > Swap > Disk" : "VRAM > Disk"},
+                    {"lazy_swap", params_base.bs_lazy_swap},
+                });
+            } else {
+                // ---- Static overlay mode (permanent) ----
+                // Apply all sharp layers now with permanent=true.  This overwrites
+                // blurry weights in-place: for same-type GPU tensors, sharp data is
+                // written directly into the existing device buffer (zero extra VRAM).
+                // For different-type tensors, a new buffer is allocated but no backup
+                // of the blurry data is kept, so peak memory ≈ max(blurry, sharp)
+                // instead of sum(blurry, sharp).
+                LOG_INFO("Applying sharp overlay to all layers (static/permanent mode, no backup)", {});
+
+                const auto t_start = ggml_time_us();
+                int32_t n_sharpened = llama_blurry_sharp_apply_all(bsctx);
+                const auto t_end = ggml_time_us();
+
+                llama_blurry_sharp_warm_live_pages(bsctx);
+
+                llama_blurry_sharp_state st = llama_blurry_sharp_get_state(bsctx);
+                LOG_INFO("Sharp overlay applied (permanent mode, no per-token overhead)", {
+                    {"n_sharpened", n_sharpened},
+                    {"n_layers_total", st.n_layers_total},
+                    {"time_ms", (t_end - t_start) / 1000.0},
+                    {"permanent", true},
+                });
+
+                if (st.n_device_tensors_skipped > 0) {
+                    LOG_WARNING("Some device tensors skipped, consider reducing -ngl or increasing --bs-gpu-budget-mb", {
+                        {"n_device_tensors_skipped", st.n_device_tensors_skipped},
+                    });
+                }
+            }
+        }
+    }
+
     return true;
 }
 
@@ -3382,6 +3561,25 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             0, 0, 0, // unused
         };
 
+        // ---------------------------------------------------------------
+        // Blurry-sharp MoE combination: JIT per-layer hotswapping.
+        //
+        // Instead of sharpening ALL layers at once (which requires the
+        // entire sharp model resident in memory), JIT sharpening hooks
+        // into the eval callback and sharpens ONE layer at a time:
+        //
+        //   layer N starts → sharpen layer N (swap expert weights)
+        //   layer N ends   → restore layer N
+        //   layer N+1 starts → sharpen layer N+1 ...
+        //
+        // Only one layer's worth of sharp data is ever resident.
+        // Memory usage ≈ one layer's expert slices, not the full model.
+        // ---------------------------------------------------------------
+        const bool bs_moe_active = bs_moe_dynamic && bsctx;
+        if (bs_moe_active) {
+            llama_blurry_sharp_start_jit(bsctx, ctx);
+        }
+
         const int ret = llama_decode(ctx, batch_view);
         if (ret != 0) {
             if (n_batch == 1 || ret < 0) {
@@ -3420,6 +3618,21 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 });
 
             continue; // continue loop of n_batch
+        }
+
+        // ---------------------------------------------------------------
+        // Blurry-sharp MoE combination: stop JIT sharpening.
+        //
+        // The JIT callback already sharpened/restored each layer during
+        // the decode above.  stop_jit restores the last layer (if any)
+        // and clears the callback.  The decode produced sharp-quality
+        // logits with only one layer ever sharpened at a time.
+        //
+        // No re-decode needed — sharpening happened DURING the decode.
+        // ---------------------------------------------------------------
+        if (bs_moe_active) {
+            llama_blurry_sharp_stop_jit(bsctx, ctx);
+            llama_router_clear(ctx);
         }
 
         for (auto& slot : slots) {

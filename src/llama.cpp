@@ -17,6 +17,7 @@
 #include "llama-cparams.h"
 #include "llama-hparams.h"
 #include "llama-context.h"
+#include "llama-blurry-sharp.h"
 
 #include "unicode.h"
 
@@ -3151,6 +3152,176 @@ static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
 
 // decode a batch of tokens by evaluating the transformer
 //
+// ---------------------------------------------------------------------------
+// MoE Router Recording + JIT Sharpening — eval callback
+//
+// When router recording is active on the context, this callback is registered
+// with the backend scheduler.  It intercepts "ffn_moe_topk-{il}" tensors
+// (the output of ggml_top_k in the MoE gate) and copies the selected expert
+// IDs into a persistent per-layer set on the context.
+//
+// When JIT sharpening is ALSO active, the callback additionally:
+//   1. Restores the PREVIOUS layer's expert weights (if any were sharpened)
+//   2. Sharpens THIS layer's expert weights with the just-read expert IDs
+//
+// This means only ONE layer's worth of sharp data is resident at any time.
+// The expert FFN ops (mul_mat_id for up/gate/down) that execute immediately
+// after the topk node will use the freshly-sharpened weight tensors.
+//
+// The callback chains with the user's original cb_eval if one was set.
+// ---------------------------------------------------------------------------
+static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * lctx = (llama_context *) user_data;
+
+    const char * prefix = "ffn_moe_topk-";
+    const size_t prefix_len = 13;
+    const bool is_topk = (strncmp(t->name, prefix, prefix_len) == 0);
+
+    if (ask) {
+        if (is_topk) {
+            return true; // we want data from this tensor
+        }
+        // delegate to user callback
+        if (lctx->cparams.cb_eval) {
+            return lctx->cparams.cb_eval(t, true, lctx->cparams.cb_eval_user_data);
+        }
+        return false;
+    }
+
+    // --- data phase ---
+    if (is_topk) {
+        // parse layer index from "ffn_moe_topk-42"
+        int layer_idx = atoi(t->name + prefix_len);
+
+        // t has shape [n_expert_used, n_tokens] and type I32
+        const int64_t n_expert_used = t->ne[0];
+        const int64_t n_tokens      = t->ne[1];
+        const size_t  n_ids         = (size_t)(n_expert_used * n_tokens);
+
+        // read expert IDs (may be on GPU)
+        std::vector<int32_t> ids(n_ids);
+        if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+            ggml_backend_tensor_get(t, ids.data(), 0, n_ids * sizeof(int32_t));
+        } else if (t->data) {
+            memcpy(ids.data(), t->data, n_ids * sizeof(int32_t));
+        }
+
+        // insert into per-layer expert set (router recording)
+        if (lctx->router_recording) {
+            auto & expert_set = lctx->router_expert_sets[layer_idx];
+            for (size_t i = 0; i < n_ids; ++i) {
+                if (ids[i] >= 0) {
+                    expert_set.insert(ids[i]);
+                }
+            }
+        }
+
+        // ----- JIT per-layer sharpening -----
+        // This is the core of the "hot-swap one layer at a time" approach.
+        // Only one layer is ever sharpened simultaneously.
+        if (lctx->jit_sharpening && lctx->jit_bsctx) {
+            // 1) Restore the previous layer (if any)
+            if (lctx->jit_current_layer >= 0) {
+                llama_blurry_sharp_restore_layer(lctx->jit_bsctx, lctx->jit_current_layer);
+                lctx->jit_current_layer = -1;
+            }
+
+            // 2) Collect unique expert IDs for this layer
+            std::unordered_set<int32_t> unique_ids;
+            for (size_t i = 0; i < n_ids; ++i) {
+                if (ids[i] >= 0) {
+                    unique_ids.insert(ids[i]);
+                }
+            }
+
+            if (!unique_ids.empty()) {
+                std::vector<int32_t> expert_vec(unique_ids.begin(), unique_ids.end());
+
+                // 3) Sharpen this layer's expert weights
+                int32_t ret = llama_blurry_sharp_apply_experts(
+                    lctx->jit_bsctx, layer_idx,
+                    expert_vec.data(), (int32_t)expert_vec.size());
+
+                if (ret == 0) {
+                    lctx->jit_current_layer = layer_idx;
+                }
+                // If sharpening fails, we just continue with blurry weights
+                // for this layer — degraded quality but no crash.
+            }
+        }
+    }
+
+    // delegate to user callback
+    if (lctx->cparams.cb_eval) {
+        return lctx->cparams.cb_eval(t, false, lctx->cparams.cb_eval_user_data);
+    }
+    return true; // continue graph computation
+}
+
+// ---------------------------------------------------------------------------
+// JIT Sharpening — start / stop
+// ---------------------------------------------------------------------------
+
+void llama_blurry_sharp_start_jit(
+        struct llama_blurry_sharp_context * bsctx,
+        struct llama_context              * ctx) {
+    if (!bsctx || !ctx) return;
+
+    // Store the blurry-sharp context on the llama context so the eval
+    // callback can access it.
+    ctx->jit_bsctx         = bsctx;
+    ctx->jit_current_layer = -1;
+    ctx->jit_sharpening    = true;
+
+    // Mark the blurry-sharp context as JIT-active so that overlay functions
+    // know they are being called mid-graph-execution.  Cross-type overlays
+    // on host tensors are unsafe in this mode because the backend scheduler
+    // has already allocated device copy tensors at the original (blurry) size.
+    if (bsctx) {
+        bsctx->jit_active = true;
+        bsctx->n_jit_host_crosstype_skipped = 0;
+    }
+
+    // Also enable router recording — the JIT callback needs expert IDs
+    // from the topk tensor, and recording accumulates them for later query.
+    ctx->router_expert_sets.clear();
+    ctx->router_recording = true;
+
+    LLAMA_LOG_DEBUG("%s: JIT per-layer sharpening enabled\n", __func__);
+}
+
+void llama_blurry_sharp_stop_jit(
+        struct llama_blurry_sharp_context * bsctx,
+        struct llama_context              * ctx) {
+    if (!ctx) return;
+
+    // Restore the last sharpened layer (if any)
+    if (ctx->jit_current_layer >= 0 && ctx->jit_bsctx) {
+        llama_blurry_sharp_restore_layer(ctx->jit_bsctx, ctx->jit_current_layer);
+        ctx->jit_current_layer = -1;
+    }
+
+    ctx->jit_sharpening = false;
+    // Note: we intentionally do NOT clear jit_bsctx or stop router_recording
+    // here — the caller may want to query recorded expert sets after decode.
+    // Router recording is stopped explicitly via llama_router_stop_recording.
+
+    // Clear the JIT-active flag on the blurry-sharp context.
+    if (bsctx) {
+        if (bsctx->n_jit_host_crosstype_skipped > 0) {
+            LLAMA_LOG_WARN("%s: %d host cross-type tensor(s) were skipped during JIT sharpening.\n"
+                           "  These tensors are on the CPU but need a different quant type than the\n"
+                           "  blurry model.  The backend scheduler's device copies are pre-allocated\n"
+                           "  at the blurry size, so cross-type overlays would crash.\n"
+                           "  To sharpen these layers, increase -ngl to move them to GPU.\n",
+                           __func__, bsctx->n_jit_host_crosstype_skipped);
+        }
+        bsctx->jit_active = false;
+    }
+
+    LLAMA_LOG_DEBUG("%s: JIT per-layer sharpening stopped\n", __func__);
+}
+
 //   - lctx:      llama context
 //   - batch:     batch to evaluate
 //
@@ -3397,7 +3568,15 @@ static int llama_decode_internal(
         ggml_cgraph * gf = nullptr;
         if (!lctx.can_reuse_graph(u_batch)) {
             lctx.reset_scheduler();
-            ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+            // Chain with router recording / JIT sharpening callback if active.
+            // Both features use the same callback (llama_router_eval_callback)
+            // which handles router recording AND JIT sharpening based on the
+            // flags set on the context (router_recording, jit_sharpening).
+            if (lctx.router_recording || lctx.jit_sharpening) {
+                ggml_backend_sched_set_eval_callback(lctx.sched, llama_router_eval_callback, &lctx);
+            } else {
+                ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
+            }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_reset(...): %d us\n", int(tim2-tim1));
@@ -4315,6 +4494,50 @@ void llama_lora_adapter_clear(struct llama_context * ctx) {
 void llama_lora_adapter_free(struct llama_lora_adapter * adapter) {
     delete adapter;
 }
+
+//
+// Blurry→Sharp overlay C API
+//
+
+struct llama_blurry_sharp_params llama_blurry_sharp_default_params() {
+    struct llama_blurry_sharp_params params;
+    params.sharp_model_path      = nullptr;
+    params.router_strategy       = LLAMA_BS_ROUTER_ALWAYS;
+    params.router_min_confidence = 0.8f;
+    params.max_sharp_layers      = 0;
+    params.memory_budget_bytes   = 0;
+    params.gpu_budget_bytes      = 0;
+    params.restore_after_forward = true;
+    params.eviction_policy       = LLAMA_BS_EVICT_LRU;
+    params.layer_allowlist       = nullptr;
+    params.n_layer_allowlist     = 0;
+    params.layer_denylist        = nullptr;
+    params.n_layer_denylist      = 0;
+    params.use_mmap              = true;
+    params.verbose               = false;
+    params.retain_device_buffers = false;
+    params.permanent             = false;
+    params.lazy_swap             = false;
+    return params;
+}
+
+// The init / free / apply / restore / query functions are implemented in
+// llama-blurry-sharp.cpp.  We provide thin C-linkage wrappers here so
+// the public llama.h declarations (which use the LLAMA_API macro and
+// extern "C") resolve correctly.
+//
+// Note: llama_blurry_sharp_init, llama_blurry_sharp_free,
+// llama_blurry_sharp_apply_layer, llama_blurry_sharp_restore_layer,
+// llama_blurry_sharp_restore_all, llama_blurry_sharp_auto_sharpen,
+// llama_blurry_sharp_is_layer_sharp, llama_blurry_sharp_get_state,
+// and llama_blurry_sharp_evict_to_budget are all defined in
+// llama-blurry-sharp.cpp with the same signatures as declared in
+// llama.h, so no additional wrappers are needed here — the linker
+// will resolve them directly.
+//
+// Only llama_blurry_sharp_default_params is defined above because it
+// is a trivial value-returning function that doesn't need access to
+// the overlay engine internals.
 
 //
 // interface implementation
@@ -7143,6 +7366,63 @@ int32_t llama_decode(
 
 void llama_set_mtp_op_type(llama_context * ctx, llama_mtp_op_type mtp_op_type) {
     ctx->set_mtp_op_type(mtp_op_type);
+}
+
+// ---------------------------------------------------------------------------
+// MoE Router Recording API
+// ---------------------------------------------------------------------------
+
+void llama_router_start_recording(struct llama_context * ctx) {
+    if (!ctx) return;
+    ctx->router_expert_sets.clear();
+    ctx->router_recording = true;
+}
+
+void llama_router_stop_recording(struct llama_context * ctx) {
+    if (!ctx) return;
+    ctx->router_recording = false;
+}
+
+bool llama_router_is_recording(const struct llama_context * ctx) {
+    if (!ctx) return false;
+    return ctx->router_recording;
+}
+
+int32_t llama_router_get_layer_experts(
+        const struct llama_context * ctx,
+        int32_t                      layer_idx,
+        int32_t                    * out_expert_ids,
+        int32_t                      max_ids) {
+    if (!ctx) return -1;
+
+    auto it = ctx->router_expert_sets.find(layer_idx);
+    if (it == ctx->router_expert_sets.end()) {
+        return 0; // no data for this layer
+    }
+
+    const auto & expert_set = it->second;
+    int32_t count = (int32_t)expert_set.size();
+
+    if (out_expert_ids && max_ids > 0) {
+        // copy sorted expert IDs
+        std::vector<int32_t> sorted_ids(expert_set.begin(), expert_set.end());
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+
+        int32_t n_copy = std::min(count, max_ids);
+        memcpy(out_expert_ids, sorted_ids.data(), n_copy * sizeof(int32_t));
+    }
+
+    return count;
+}
+
+int32_t llama_router_n_recorded_layers(const struct llama_context * ctx) {
+    if (!ctx) return 0;
+    return (int32_t)ctx->router_expert_sets.size();
+}
+
+void llama_router_clear(struct llama_context * ctx) {
+    if (!ctx) return;
+    ctx->router_expert_sets.clear();
 }
 
 void llama_synchronize(struct llama_context * ctx) {

@@ -9,6 +9,8 @@ struct llama_model;
 #include <vector>
 #include <map>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <memory>
 
 struct llama_kv_cell {
@@ -192,6 +194,39 @@ struct llama_context {
     void *              abort_callback_data = nullptr;
 
     const float * draft_input_hidden_state = nullptr;
+
+    // -----------------------------------------------------------------------
+    // MoE router expert recording
+    //
+    // When enabled, the eval callback intercepts "ffn_moe_topk-{il}" tensors
+    // during graph execution and records which expert IDs were selected by the
+    // router for each MoE layer.  The per-layer sets accumulate across multiple
+    // llama_decode() calls so that the caller can query the union of all experts
+    // that were active during a draft phase.
+    // -----------------------------------------------------------------------
+    bool router_recording = false;
+
+    // key = model layer index, value = set of unique expert IDs seen
+    std::unordered_map<int32_t, std::unordered_set<int32_t>> router_expert_sets;
+
+    // -----------------------------------------------------------------------
+    // JIT (just-in-time) per-layer sharpening
+    //
+    // When enabled, the eval callback intercepts "ffn_moe_topk-{il}" tensors
+    // during graph execution and:
+    //   1. Restores the PREVIOUS layer's expert weights (if any)
+    //   2. Reads the selected expert IDs from the topk tensor
+    //   3. Sharpens THIS layer's expert weights with those IDs
+    //
+    // Only one layer is sharpened at a time → memory usage is bounded to
+    // ~one layer's worth of sharp data, regardless of model size.
+    //
+    // After llama_decode() returns, the caller MUST call
+    // llama_blurry_sharp_stop_jit() to restore the last sharpened layer.
+    // -----------------------------------------------------------------------
+    bool                             jit_sharpening = false;
+    struct llama_blurry_sharp_context * jit_bsctx   = nullptr;
+    int                              jit_current_layer = -1;  // layer currently sharpened (-1 = none)
 
     // input tensors
     struct ggml_tensor * inp_tokens;      // I32 [n_batch]

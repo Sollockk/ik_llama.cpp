@@ -42,6 +42,14 @@ GGML_API GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, si
 GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_API void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback, void * user_data);
+
+// Synchronize all streams on the specified CUDA device.
+// This is a full device barrier (cudaDeviceSynchronize) — all pending
+// kernels on ALL streams will complete before this call returns.
+// Used by the blurry-sharp overlay system to ensure async kernels have
+// finished before evicting cached GPU buffers.
+GGML_API void ggml_backend_cuda_device_synchronize(int device);
+
 #ifdef  __cplusplus
 }
 #endif
