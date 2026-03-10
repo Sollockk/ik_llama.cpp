@@ -2219,6 +2219,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.bs_lazy_swap = true;
         return true;
     }
+    if (arg == "--bs-retain-mmap" || arg == "--retain-mmap") {
+        params.bs_retain_mmap = true;
+        return true;
+    }
     if (arg == "--bs-compare" || arg == "--compare") {
         params.bs_compare = true;
         return true;

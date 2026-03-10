@@ -1561,6 +1561,15 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
                                                 // Eliminates the 30-minute startup cost of
                                                 // --bs-stage-swap by spreading disk->RAM->swap
                                                 // migration across the first inference pass.
+
+        bool     retain_mmap_pages;             // keep mmap pages in page cache after reading
+                                                // instead of calling MADV_DONTNEED.  When you
+                                                // have plenty of free RAM this dramatically
+                                                // speeds up repeated sharpen/restore cycles by
+                                                // keeping sharp data in the OS page cache.
+                                                // Without this, each apply reads from disk.
+                                                // With this, only the first apply touches disk;
+                                                // subsequent cycles hit the page cache (RAM).
     };
 
     struct llama_blurry_sharp_state {

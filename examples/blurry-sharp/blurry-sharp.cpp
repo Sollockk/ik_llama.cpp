@@ -20,6 +20,7 @@
 //   --bs-precache-ram           Pre-read sharp data into anonymous heap (swap-backed)
 //   --bs-stage-swap             After precache, move pages to swap (free RAM)
 //   --bs-lazy-swap              Lazy per-layer swap staging (instant startup, no precache)
+//   --bs-retain-mmap            Keep mmap pages cached in RAM (fast repeat sharpening)
 //   --bs-compare               Run blurry-only then blurry+sharp and compare
 //   --bs-dynamic               Per-token entropy-based dynamic sharpening
 //   --bs-entropy-threshold F   Logit entropy above this triggers sharpening (default: 3.0)
@@ -1057,28 +1058,25 @@ static generation_result run_moe_combination_generation(
             work_items.push_back(std::move(w));
         }
 
-        // ---- Phase 2b: Apply with selective lookahead prefetch ----
-        // Only prefetch layers that will actually be sharpened.  The
-        // prefetch pipeline gives the kernel lead time to bring mmap
-        // pages into the page cache (from disk, swap, or RAM cache)
-        // before we need them.  Works for all memory tiers: mmap (disk),
-        // RAM cache (swap-backed), and GPU (source data comes from
-        // mmap/cache before PCIe DMA to VRAM).
-        constexpr int PREFETCH_LOOKAHEAD = 4;
+        // ---- Phase 2b: Apply with bulk prefetch ----
+        // Issue madvise(WILLNEED) for ALL layers that need sharpening
+        // before starting any apply calls.  This gives the kernel
+        // maximum lead time to bring mmap pages into the page cache
+        // from disk/swap while we process earlier layers.  Works for
+        // all memory tiers: mmap (disk), RAM cache (swap-backed), and
+        // GPU (source data comes from mmap/cache before PCIe DMA).
+        //
+        // This is safe because madvise is non-blocking and advisory —
+        // the kernel will only use available RAM for readahead, it
+        // won't evict critical pages under memory pressure.
         const int n_work = (int)work_items.size();
 
-        // Seed the prefetch pipeline
-        for (int i = 0; i < std::min(PREFETCH_LOOKAHEAD, n_work); ++i) {
+        for (int i = 0; i < n_work; ++i) {
             llama_blurry_sharp_prefetch_layer(bsctx, work_items[i].layer_idx);
         }
 
         int n_sharpened = 0;
         for (int i = 0; i < n_work; ++i) {
-            // Prefetch the next layer in the pipeline (non-blocking)
-            if (i + PREFETCH_LOOKAHEAD < n_work) {
-                llama_blurry_sharp_prefetch_layer(bsctx, work_items[i + PREFETCH_LOOKAHEAD].layer_idx);
-            }
-
             const auto & w = work_items[i];
 
             if (w.n_experts > 0) {
@@ -1932,6 +1930,7 @@ int main(int argc, char ** argv) {
         bs_params.verbose               = params.bs_verbose;
         bs_params.use_mmap              = params.bs_use_mmap;
         bs_params.lazy_swap             = params.bs_lazy_swap;
+        bs_params.retain_mmap_pages     = params.bs_retain_mmap;
 
         // Auto-enable retain_device_buffers for modes that do repeated
         // sharpen/restore cycles — this eliminates cudaMalloc/Free churn

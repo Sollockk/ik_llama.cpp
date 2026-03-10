@@ -486,6 +486,9 @@ struct gpt_params {
                                                       // on first layer access, MADV_PAGEOUT on restore.
                                                       // Instant startup (no 30-min precache), subsequent
                                                       // accesses swap-in from SSD.
+    bool        bs_retain_mmap         = false;       // keep mmap pages in page cache after reading.
+                                                      // When RAM is plentiful, avoids re-reading from
+                                                      // disk on each sharpen/restore cycle.
     bool        bs_compare             = false;       // run blurry-only then blurry+sharp and compare
     bool        bs_dynamic             = false;       // per-token entropy-based dynamic sharpening
     float       bs_entropy_threshold   = 3.0f;        // logit entropy above this triggers sharpening

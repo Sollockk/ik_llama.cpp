@@ -208,7 +208,13 @@ static void bs_prefetch_layer_mmap(
 // page cache — no swap I/O, no data loss.  Next access re-faults from the
 // backing file.  Safe to call on any address; silently ignored if the range
 // isn't a valid mapping.
-static void bs_release_mmap_pages(const void * addr, size_t len) {
+// When bsctx->params.retain_mmap_pages is true, skip the DONTNEED — keep
+// pages in the page cache so repeated sharpen/restore cycles hit RAM
+// instead of disk.  Pass NULL for bsctx when the context is unavailable
+// (always releases in that case).
+static void bs_release_mmap_pages(const llama_blurry_sharp_context * bsctx,
+                                  const void * addr, size_t len) {
+    if (bsctx && bsctx->params.retain_mmap_pages) return;
 #ifdef __linux__
     if (!addr || len == 0) return;
     static const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
@@ -330,7 +336,7 @@ static bool bs_read_sharp_tensor(
         std::memcpy(dest.data(), base + info.file_offset, info.nbytes);
         // Data is now in `dest` — release the mmap pages so they don't
         // accumulate in the page cache and push other data into swap.
-        bs_release_mmap_pages(base + info.file_offset, info.nbytes);
+        bs_release_mmap_pages(bsctx, base + info.file_offset, info.nbytes);
     } else {
         bsctx->sharp_files[si]->seek(info.file_offset, SEEK_SET);
         bsctx->sharp_files[si]->read_raw(dest.data(), info.nbytes);
@@ -381,7 +387,7 @@ static const void * bs_read_to_staging(
             const uint8_t * base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
             if (info.file_offset + info.nbytes <= bsctx->sharp_mmaps[si]->size()) {
                 std::memcpy(buf.data(), base + info.file_offset, info.nbytes);
-                bs_release_mmap_pages(base + info.file_offset, info.nbytes);
+                bs_release_mmap_pages(bsctx, base + info.file_offset, info.nbytes);
                 ok = true;
             }
         }
@@ -424,7 +430,7 @@ static const void * bs_read_to_staging(
                 memcpy(bsctx->pinned_staging_ptr, base + info.file_offset, info.nbytes);
                 // Data is now in pinned staging — release mmap pages immediately
                 // to avoid accumulating the entire sharp model in the page cache.
-                bs_release_mmap_pages(base + info.file_offset, info.nbytes);
+                bs_release_mmap_pages(bsctx, base + info.file_offset, info.nbytes);
                 return bsctx->pinned_staging_ptr;
             }
         }
@@ -1310,7 +1316,7 @@ static int64_t bs_overlay_single_tensor(
                     if (sharp_info.file_offset + sharp_info.nbytes <= bsctx->sharp_mmaps[si]->size()) {
                         std::memcpy(buf.data(), mmap_base + sharp_info.file_offset, sharp_info.nbytes);
                         // Release the mmap pages — data is now in anonymous heap memory.
-                        bs_release_mmap_pages(mmap_base + sharp_info.file_offset, sharp_info.nbytes);
+                        bs_release_mmap_pages(bsctx, mmap_base + sharp_info.file_offset, sharp_info.nbytes);
                         ok = true;
                     }
                 }
@@ -1350,7 +1356,7 @@ static int64_t bs_overlay_single_tensor(
                 // dropped from the page cache.
                 if (backup_out.original_data) {
                     size_t old_nbytes = bs_tensor_nbytes(backup_out.original_type, backup_out.ne);
-                    bs_release_mmap_pages(backup_out.original_data, old_nbytes);
+                    bs_release_mmap_pages(bsctx, backup_out.original_data, old_nbytes);
                 }
             }
         }
@@ -1375,7 +1381,7 @@ static int64_t bs_overlay_single_tensor(
             // models from both being resident in RAM simultaneously.
             if (backup_out.original_data) {
                 size_t old_nbytes = bs_tensor_nbytes(backup_out.original_type, backup_out.ne);
-                bs_release_mmap_pages(backup_out.original_data, old_nbytes);
+                bs_release_mmap_pages(bsctx, backup_out.original_data, old_nbytes);
             }
         } else if (!used_ram_cache) {
             // ---- BUFFERED: read into an owned heap buffer ----
@@ -1832,7 +1838,7 @@ static int64_t bs_overlay_single_tensor_permanent(
                 int64_t ne_arr[GGML_MAX_DIMS];
                 for (int d = 0; d < GGML_MAX_DIMS; ++d) ne_arr[d] = base_tensor->ne[d];
                 size_t old_nbytes = bs_tensor_nbytes(base_tensor->type, ne_arr);
-                bs_release_mmap_pages(base_tensor->data, old_nbytes);
+                bs_release_mmap_pages(bsctx, base_tensor->data, old_nbytes);
             }
 
             base_tensor->data = const_cast<uint8_t *>(mmap_base + sharp_info.file_offset);
@@ -2141,7 +2147,7 @@ static bool bs_restore_single_tensor(
             }
             if (!is_ram_cache_ptr) {
                 size_t sharp_nbytes = bs_tensor_nbytes(base_tensor->type, backup.ne);
-                bs_release_mmap_pages(base_tensor->data, sharp_nbytes);
+                bs_release_mmap_pages(bsctx, base_tensor->data, sharp_nbytes);
             }
         }
 
@@ -3041,7 +3047,7 @@ int32_t llama_blurry_sharp_precache_ram(
                 std::memcpy(buf.data(), base + info.file_offset, info.nbytes);
                 // Release the mmap pages — data is now in anonymous heap memory.
                 // The mmap pages are file-backed and would just waste page cache.
-                bs_release_mmap_pages(base + info.file_offset, info.nbytes);
+                bs_release_mmap_pages(bsctx, base + info.file_offset, info.nbytes);
                 ok = true;
             }
         }
@@ -3500,7 +3506,7 @@ static int64_t bs_overlay_expert_tensor(
                 // Release old blurry mmap pages
                 if (backup_out.original_data) {
                     size_t old_nbytes = bs_tensor_nbytes(backup_out.original_type, backup_out.ne);
-                    bs_release_mmap_pages(backup_out.original_data, old_nbytes);
+                    bs_release_mmap_pages(bsctx, backup_out.original_data, old_nbytes);
                 }
             }
         }
@@ -3532,7 +3538,7 @@ static int64_t bs_overlay_expert_tensor(
             // sharp mmap, so blurry file-backed pages can be dropped.
             if (backup_out.original_data) {
                 size_t old_nbytes = bs_tensor_nbytes(backup_out.original_type, backup_out.ne);
-                bs_release_mmap_pages(backup_out.original_data, old_nbytes);
+                bs_release_mmap_pages(bsctx, backup_out.original_data, old_nbytes);
             }
 
             base_tensor->data = const_cast<uint8_t *>(mmap_base + sharp_info.file_offset);
@@ -3798,7 +3804,7 @@ static int64_t bs_overlay_expert_tensor(
                             // Use mmap pointer directly (pageable copy — slower but works)
                             src_data = mmap_base + slice_file_offset;
                         }
-                        bs_release_mmap_pages(mmap_base + slice_file_offset, sharp_expert_slice);
+                        bs_release_mmap_pages(bsctx, mmap_base + slice_file_offset, sharp_expert_slice);
                     } else {
                         LLAMA_LOG_ERROR("%s: mmap OOB for expert %d of device tensor '%s'\n",
                                        __func__, eidx, sharp_info.name.c_str());
@@ -3928,7 +3934,7 @@ static int64_t bs_overlay_expert_tensor(
                             } else {
                                 src_data = mm_base + slice_file_offset;
                             }
-                            bs_release_mmap_pages(mm_base + slice_file_offset, sharp_expert_slice);
+                            bs_release_mmap_pages(bsctx, mm_base + slice_file_offset, sharp_expert_slice);
                         }
 
                         if (!src_data && si_idx >= 0 && si_idx < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si_idx]) {
@@ -4099,7 +4105,7 @@ static int64_t bs_overlay_expert_tensor(
                         } else {
                             src_data = mmap_base + slice_file_offset;
                         }
-                        bs_release_mmap_pages(mmap_base + slice_file_offset, sharp_expert_slice);
+                        bs_release_mmap_pages(bsctx, mmap_base + slice_file_offset, sharp_expert_slice);
                     } else {
                         LLAMA_LOG_ERROR("%s: mmap OOB for expert %d of device tensor '%s'\n",
                                        __func__, eidx, sharp_info.name.c_str());

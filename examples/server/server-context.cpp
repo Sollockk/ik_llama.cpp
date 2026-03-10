@@ -196,6 +196,7 @@ bool server_context::load_model(const gpt_params& params_) {
         bs_params.verbose               = params_base.bs_verbose;
         bs_params.use_mmap              = params_base.bs_use_mmap;
         bs_params.lazy_swap             = params_base.bs_lazy_swap;
+        bs_params.retain_mmap_pages     = params_base.bs_retain_mmap;
 
         // For MoE combination mode: enable device buffer caching so that
         // repeated sharpen/restore cycles reuse GPU allocations (skip

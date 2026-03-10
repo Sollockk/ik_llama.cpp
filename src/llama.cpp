@@ -4518,6 +4518,7 @@ struct llama_blurry_sharp_params llama_blurry_sharp_default_params() {
     params.retain_device_buffers = false;
     params.permanent             = false;
     params.lazy_swap             = false;
+    params.retain_mmap_pages     = false;
     return params;
 }
 
