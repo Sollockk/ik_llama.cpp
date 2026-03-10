@@ -206,8 +206,15 @@ struct llama_context {
     // -----------------------------------------------------------------------
     bool router_recording = false;
 
-    // key = model layer index, value = set of unique expert IDs seen
+    // key = model layer index, value = set of unique expert IDs seen (union across all tokens)
     std::unordered_map<int32_t, std::unordered_set<int32_t>> router_expert_sets;
+
+    // Per-token expert recording — preserves per-token granularity so that
+    // callers can query a subset of draft positions instead of the full union.
+    // key = model layer index, value = vector of per-token expert selections.
+    // Each inner vector holds the top-k expert IDs selected for one token.
+    // Entries are appended in decode order (token 0 first, then 1, ...).
+    std::unordered_map<int32_t, std::vector<std::vector<int32_t>>> router_per_token_experts;
 
     // -----------------------------------------------------------------------
     // JIT (just-in-time) per-layer sharpening

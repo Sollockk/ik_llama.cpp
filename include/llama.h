@@ -1822,6 +1822,32 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // Clear all recorded router data without stopping recording.
     LLAMA_API void llama_router_clear(struct llama_context * ctx);
 
+    // Get the number of recorded token positions for a layer.
+    // Returns 0 if no per-token data exists for this layer.
+    LLAMA_API int32_t llama_router_n_tokens_for_layer(
+            const struct llama_context * ctx,
+            int32_t                      layer_idx);
+
+    // Get the unique expert IDs used across a range of token positions
+    // [token_start, token_end) for a specific layer.  This computes the
+    // union over only the requested token range rather than ALL tokens,
+    // allowing callers to sharpen fewer experts when verifying a subset
+    // of draft positions.
+    //
+    // out_expert_ids: buffer to receive unique expert IDs (sorted ascending).
+    //                 Pass NULL to just query the count.
+    // max_ids:        capacity of out_expert_ids (ignored when NULL).
+    //
+    // Returns the number of unique expert IDs in the requested range,
+    //         0 if no data exists, or negative on error.
+    LLAMA_API int32_t llama_router_get_token_range_experts(
+            const struct llama_context * ctx,
+            int32_t                      layer_idx,
+            int32_t                      token_start,
+            int32_t                      token_end,
+            int32_t                    * out_expert_ids,
+            int32_t                      max_ids);
+
     // -----------------------------------------------------------------------
     // JIT (Just-In-Time) Per-Layer Sharpening
     //

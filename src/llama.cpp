@@ -3206,13 +3206,22 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
             memcpy(ids.data(), t->data, n_ids * sizeof(int32_t));
         }
 
-        // insert into per-layer expert set (router recording)
+        // insert into per-layer expert set + per-token recording
         if (lctx->router_recording) {
-            auto & expert_set = lctx->router_expert_sets[layer_idx];
-            for (size_t i = 0; i < n_ids; ++i) {
-                if (ids[i] >= 0) {
-                    expert_set.insert(ids[i]);
+            auto & expert_set    = lctx->router_expert_sets[layer_idx];
+            auto & token_experts = lctx->router_per_token_experts[layer_idx];
+
+            for (int64_t tok = 0; tok < n_tokens; ++tok) {
+                std::vector<int32_t> tok_ids;
+                tok_ids.reserve(n_expert_used);
+                for (int64_t k = 0; k < n_expert_used; ++k) {
+                    int32_t eid = ids[tok * n_expert_used + k];
+                    if (eid >= 0) {
+                        expert_set.insert(eid);
+                        tok_ids.push_back(eid);
+                    }
                 }
+                token_experts.push_back(std::move(tok_ids));
             }
         }
 
@@ -3285,6 +3294,7 @@ void llama_blurry_sharp_start_jit(
     // Also enable router recording — the JIT callback needs expert IDs
     // from the topk tensor, and recording accumulates them for later query.
     ctx->router_expert_sets.clear();
+    ctx->router_per_token_experts.clear();
     ctx->router_recording = true;
 
     LLAMA_LOG_DEBUG("%s: JIT per-layer sharpening enabled\n", __func__);
@@ -7376,6 +7386,7 @@ void llama_set_mtp_op_type(llama_context * ctx, llama_mtp_op_type mtp_op_type) {
 void llama_router_start_recording(struct llama_context * ctx) {
     if (!ctx) return;
     ctx->router_expert_sets.clear();
+    ctx->router_per_token_experts.clear();
     ctx->router_recording = true;
 }
 
@@ -7424,6 +7435,54 @@ int32_t llama_router_n_recorded_layers(const struct llama_context * ctx) {
 void llama_router_clear(struct llama_context * ctx) {
     if (!ctx) return;
     ctx->router_expert_sets.clear();
+    ctx->router_per_token_experts.clear();
+}
+
+int32_t llama_router_n_tokens_for_layer(const struct llama_context * ctx, int32_t layer_idx) {
+    if (!ctx) return 0;
+    auto it = ctx->router_per_token_experts.find(layer_idx);
+    if (it == ctx->router_per_token_experts.end()) return 0;
+    return (int32_t)it->second.size();
+}
+
+int32_t llama_router_get_token_range_experts(
+        const struct llama_context * ctx,
+        int32_t                      layer_idx,
+        int32_t                      token_start,
+        int32_t                      token_end,
+        int32_t                    * out_expert_ids,
+        int32_t                      max_ids) {
+    if (!ctx) return -1;
+    if (token_start < 0 || token_end <= token_start) return -1;
+
+    auto it = ctx->router_per_token_experts.find(layer_idx);
+    if (it == ctx->router_per_token_experts.end()) return 0;
+
+    const auto & token_experts = it->second;
+    int32_t n_tokens = (int32_t)token_experts.size();
+
+    // Clamp range to available data
+    if (token_start >= n_tokens) return 0;
+    if (token_end > n_tokens) token_end = n_tokens;
+
+    // Build union of experts across the requested token range
+    std::unordered_set<int32_t> expert_union;
+    for (int32_t t = token_start; t < token_end; ++t) {
+        for (int32_t eid : token_experts[t]) {
+            expert_union.insert(eid);
+        }
+    }
+
+    int32_t count = (int32_t)expert_union.size();
+
+    if (out_expert_ids && max_ids > 0) {
+        std::vector<int32_t> sorted_ids(expert_union.begin(), expert_union.end());
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        int32_t n_copy = std::min(count, max_ids);
+        memcpy(out_expert_ids, sorted_ids.data(), n_copy * sizeof(int32_t));
+    }
+
+    return count;
 }
 
 void llama_synchronize(struct llama_context * ctx) {

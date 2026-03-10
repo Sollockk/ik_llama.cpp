@@ -900,9 +900,9 @@ static generation_result run_moe_combination_generation(
     fprintf(stderr, "    n_expert_used:  %d (per token)\n", n_expert_used);
     fprintf(stderr, "    draft_n:        %d\n", draft_n);
     fprintf(stderr, "    entropy_thresh: %.2f\n", entropy_threshold);
-    fprintf(stderr, "    router hooks:   ENABLED (exact expert tracking)\n");
-    fprintf(stderr, "    I/O reduction:  ~%.1fx (only sharpen active experts)\n",
-            (float)n_expert / n_expert_used);
+    fprintf(stderr, "    router hooks:   ENABLED (per-token expert tracking)\n");
+    fprintf(stderr, "    expert budget:  first 3 draft tokens (~%d experts vs %d total)\n",
+            std::min(3 * (int)n_expert_used, (int)n_expert), n_expert);
     fprintf(stderr, "\n");
 
     if ((int)prompt_tokens.size() + n_predict > n_ctx) {
@@ -1041,29 +1041,52 @@ static generation_result run_moe_combination_generation(
         // ================================================================
         n_verify_batches++;
 
-        // ---- Phase 2a: Batch expert query ----
-        // Collect all expert sets upfront so we know exactly which layers
-        // need sharpening and can prefetch selectively.  This avoids
-        // issuing WILLNEED for layers we'll never touch.
+        // ---- Phase 2a: Per-token expert query ----
+        // Instead of using the full expert union across ALL draft tokens
+        // (which saturates to n_expert/n_expert = 1.0 selectivity with
+        // enough tokens), use only the first few tokens' experts.
+        //
+        // Rationale: non-expert tensors (attention, norms, gate_inp) are
+        // sharpened for ALL positions regardless.  Expert tensors only
+        // matter for the positions whose experts we loaded.  For other
+        // positions, both draft and verify use blurry experts → they
+        // agree automatically.  Disagreements driven by sharp attention
+        // weights are still caught at ALL positions.
+        //
+        // Budget: first min(draft_len, 3) tokens → ~3*top_k unique
+        // experts per layer instead of the full union.
+        const int expert_token_budget = std::min((int)draft_tokens.size(), 3);
         work_items.clear();
 
         int n_layers_skipped = 0;
+        int n_full_union_experts = 0;  // for comparison logging
         for (int il = 0; il < n_layers; ++il) {
-            int32_t n_exp = llama_router_get_layer_experts(ctx, il, nullptr, 0);
-            if (n_exp <= 0) {
-                // No MoE routing recorded for this layer — the blurry
-                // weights are sufficient.  Skipping layers without router
-                // data avoids the massive I/O cost of full-layer overlays
-                // on attention/norm-only layers or unreached layers.
+            // Check if this layer has any per-token data
+            int32_t n_tokens_recorded = llama_router_n_tokens_for_layer(ctx, il);
+            if (n_tokens_recorded <= 0) {
                 n_layers_skipped++;
                 continue;
             }
+
+            // Get experts for only the first expert_token_budget tokens
+            int32_t n_exp = llama_router_get_token_range_experts(
+                ctx, il, 0, expert_token_budget, nullptr, 0);
+            if (n_exp <= 0) {
+                n_layers_skipped++;
+                continue;
+            }
+
             layer_work w;
             w.layer_idx  = il;
             w.n_experts  = n_exp;
             w.expert_ids.resize(n_exp);
-            llama_router_get_layer_experts(ctx, il, w.expert_ids.data(), n_exp);
+            llama_router_get_token_range_experts(
+                ctx, il, 0, expert_token_budget,
+                w.expert_ids.data(), n_exp);
             work_items.push_back(std::move(w));
+
+            // Track full union size for logging
+            n_full_union_experts += llama_router_get_layer_experts(ctx, il, nullptr, 0);
         }
 
         // ---- Phase 2b: Apply with bulk prefetch ----
@@ -1093,10 +1116,11 @@ static generation_result run_moe_combination_generation(
         llama_blurry_sharp_warm_live_pages(bsctx);
 
         if (verbose) {
-            fprintf(stderr, "  [verify %3d] sharpened %d/%d layers (%d skipped, no router data), "
-                    "%d recorded MoE layers, %d unique experts total\n",
+            fprintf(stderr, "  [verify %3d] sharpened %d/%d layers (%d skipped), "
+                    "experts: %d (from %d/%d draft tokens) vs %d full-union\n",
                     n_decode, n_sharpened, n_layers, n_layers_skipped,
-                    n_recorded_layers, n_unique_experts_total);
+                    n_unique_experts_total, expert_token_budget,
+                    (int)draft_tokens.size(), n_full_union_experts);
         }
 
         // Clear recorded data before the next draft iteration
