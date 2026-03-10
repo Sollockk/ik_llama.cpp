@@ -3239,6 +3239,184 @@ void llama_blurry_sharp_prefetch_layer(
 }
 
 // ---------------------------------------------------------------------------
+// Parallel prefetch: pre-read multiple layers' data concurrently.
+//
+// Spawns up to n_threads temporary worker threads.  Each worker reads a
+// subset of the requested layers from mmap/file into the prefetch_cache
+// (the same staging area the single-thread prefetch uses).  When the main
+// thread's apply loop needs a tensor, bs_consume_prefetched_tensor moves
+// data from prefetch_cache → ram_cache in O(1).
+//
+// The mmap memcpy and file reads are the bottleneck — they benefit from
+// parallelism because:
+//   - Multiple mmap fault handlers run concurrently in the kernel
+//   - NVMe/SSD controllers can serve multiple outstanding I/O requests
+//   - Readahead at different file offsets avoids head-of-line blocking
+//
+// Thread-safety: workers only write to prefetch_cache (under prefetch_mtx),
+// never to ram_cache or the tensor graph.  The main thread applies
+// (pointer-swaps) sequentially after prefetch completes.
+// ---------------------------------------------------------------------------
+
+void llama_blurry_sharp_prefetch_layers_parallel(
+        llama_blurry_sharp_context * bsctx,
+        const int32_t              * layer_indices,
+        int32_t                      n_layers,
+        int32_t                      n_threads) {
+    if (!bsctx || !bsctx->initialized || n_layers <= 0) return;
+    if (n_threads <= 0) n_threads = 4;
+    if (n_threads > n_layers) n_threads = n_layers;
+
+    // Also issue madvise(WILLNEED) for all layers upfront so the kernel
+    // starts async readahead in parallel with our worker threads.
+    for (int32_t i = 0; i < n_layers; ++i) {
+        bs_prefetch_layer_mmap(bsctx, layer_indices[i]);
+    }
+
+    // Single-thread fast path
+    if (n_threads <= 1) {
+        for (int32_t i = 0; i < n_layers; ++i) {
+            int li = layer_indices[i];
+            bs_queue_prefetch_layers(bsctx, &li, 1);
+        }
+        return;
+    }
+
+    // Worker function: process assigned layer indices
+    auto worker = [&](int32_t thread_id) {
+        for (int32_t i = thread_id; i < n_layers; i += n_threads) {
+            int layer_idx = layer_indices[i];
+
+            auto lt_it = bsctx->layer_tensor_names.find(layer_idx);
+            if (lt_it == bsctx->layer_tensor_names.end()) continue;
+
+            // Collect tensor read descriptors, sorted by file offset
+            struct read_desc {
+                std::string name;
+                int         split_idx;
+                size_t      file_offset;
+                size_t      nbytes;
+            };
+            std::vector<read_desc> reads;
+
+            for (const auto & tensor_name : lt_it->second) {
+                // Skip if already cached
+                if (bsctx->ram_cache.count(tensor_name)) continue;
+                {
+                    std::lock_guard<std::mutex> plock(bsctx->prefetch_mtx);
+                    if (bsctx->prefetch_cache.count(tensor_name)) continue;
+                }
+
+                auto info_it = bsctx->sharp_index.find(tensor_name);
+                if (info_it == bsctx->sharp_index.end()) continue;
+                const auto & si = info_it->second;
+
+                reads.push_back({tensor_name, si.split_idx, si.file_offset, si.nbytes});
+            }
+
+            std::sort(reads.begin(), reads.end(),
+                      [](const read_desc & a, const read_desc & b) {
+                          if (a.split_idx != b.split_idx) return a.split_idx < b.split_idx;
+                          return a.file_offset < b.file_offset;
+                      });
+
+            for (const auto & rd : reads) {
+                // Double-check not cached (another thread may have read it)
+                if (bsctx->ram_cache.count(rd.name)) continue;
+                {
+                    std::lock_guard<std::mutex> plock(bsctx->prefetch_mtx);
+                    if (bsctx->prefetch_cache.count(rd.name)) continue;
+                }
+
+                std::vector<uint8_t> buf(rd.nbytes);
+                bool ok = false;
+
+                // Read from mmap
+                int si = rd.split_idx;
+                if (si >= 0 && si < (int)bsctx->sharp_mmaps.size() && bsctx->sharp_mmaps[si]) {
+                    const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+                    size_t file_size = bsctx->sharp_mmaps[si]->size();
+                    if (rd.file_offset + rd.nbytes <= file_size) {
+                        std::memcpy(buf.data(), mmap_base + rd.file_offset, rd.nbytes);
+                        ok = true;
+                    }
+                }
+
+                if (ok) {
+                    std::lock_guard<std::mutex> plock(bsctx->prefetch_mtx);
+                    if (bsctx->prefetch_cache.count(rd.name) == 0) {
+                        bsctx->prefetch_cache_bytes += (int64_t)rd.nbytes;
+                        bsctx->prefetch_cache[rd.name] = std::move(buf);
+                    }
+                }
+            }
+        }
+    };
+
+    // Spawn workers
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (int32_t t = 0; t < n_threads; ++t) {
+        threads.emplace_back(worker, t);
+    }
+    for (auto & th : threads) {
+        th.join();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Readahead: aggressively pre-populate the page cache for ALL layers.
+//
+// WARNING: For large models (100+ GB), calling this is counterproductive —
+// the kernel blocks walking page tables and evicts the blurry model from
+// the page cache.  Prefer llama_blurry_sharp_prefetch_layers_parallel()
+// with specific layer indices instead.
+//
+// This function is kept for small models or when the caller explicitly
+// wants full readahead.  For models > 32 GB it logs a warning and
+// limits readahead to the first 32 GB per split to avoid thrashing.
+// ---------------------------------------------------------------------------
+
+void llama_blurry_sharp_readahead_all(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->initialized) return;
+
+    constexpr size_t MAX_READAHEAD = (size_t)32 * 1024 * 1024 * 1024ULL; // 32 GB
+
+#ifndef _WIN32
+    for (size_t si = 0; si < bsctx->sharp_mmaps.size(); ++si) {
+        if (!bsctx->sharp_mmaps[si]) continue;
+        void * addr = const_cast<void *>(bsctx->sharp_mmaps[si]->addr());
+        size_t size = bsctx->sharp_mmaps[si]->size();
+        if (!addr || size == 0) continue;
+
+        if (size > MAX_READAHEAD) {
+            LLAMA_LOG_WARN("%s: split %zu is %.1f GB — capping readahead at 32 GB "
+                          "to avoid page cache thrashing.  Use "
+                          "prefetch_layers_parallel() for targeted I/O.\n",
+                          __func__, si, size / (1024.0 * 1024.0 * 1024.0));
+            size = MAX_READAHEAD;
+        }
+
+#ifdef __linux__
+        madvise(addr, size, MADV_WILLNEED);
+#else
+        posix_madvise(addr, size, POSIX_MADV_WILLNEED);
+#endif
+    }
+
+    // Readahead ram_cache pages that may have been paged out to swap
+    for (auto & kv : bsctx->ram_cache) {
+        if (!kv.second.empty()) {
+            madvise(kv.second.data(), kv.second.size(), MADV_WILLNEED);
+        }
+    }
+#else
+    GGML_UNUSED(bsctx);
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // RAM cache: pre-read sharp tensor data into anonymous heap buffers
 // ---------------------------------------------------------------------------
 

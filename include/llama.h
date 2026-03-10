@@ -1665,6 +1665,25 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             struct llama_blurry_sharp_context * bsctx,
             int32_t                             layer_idx);
 
+    // Prefetch multiple layers in parallel using n_threads worker threads.
+    // Each worker reads its assigned layers' tensor data from mmap/file
+    // into a staging cache concurrently.  The subsequent sequential apply
+    // loop finds data already cached, avoiding I/O stalls.
+    // n_threads <= 0 defaults to 4.
+    LLAMA_API void llama_blurry_sharp_prefetch_layers_parallel(
+            struct llama_blurry_sharp_context * bsctx,
+            const int32_t                     * layer_indices,
+            int32_t                             n_layers,
+            int32_t                             n_threads);
+
+    // Issue aggressive readahead for ALL sharp model data.
+    // Tells the kernel to populate the page cache for the entire sharp
+    // model.  Call at the START of a draft phase to give the kernel
+    // maximum lead time before apply_experts needs the data.
+    // Non-blocking — returns immediately, kernel reads asynchronously.
+    LLAMA_API void llama_blurry_sharp_readahead_all(
+            struct llama_blurry_sharp_context * bsctx);
+
     // Pre-allocate device (GPU) buffers for all eligible tensors.
     // Moves cudaMalloc out of the apply hot-path so that subsequent
     // apply_layer / apply_all calls only need the PCIe data copy.

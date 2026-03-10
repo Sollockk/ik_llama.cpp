@@ -949,9 +949,29 @@ static generation_result run_moe_combination_generation(
     std::vector<layer_work> work_items;
     work_items.reserve(n_layers);
 
+    // Previous iteration's layer indices — used for early prefetch.
+    // MoE routing is highly stable across adjacent tokens: the same
+    // layers tend to be active.  By prefetching last iteration's layers
+    // at the START of drafting, the kernel has the full draft duration
+    // (~100ms+) to populate pages before Phase 2 needs them.
+    std::vector<int32_t> prev_layer_ids;
+
     const auto t_start = ggml_time_us();
 
     while (n_cur < (int)prompt_tokens.size() + n_predict) {
+        // ================================================================
+        // PHASE 0: EARLY TARGETED READAHEAD
+        // Prefetch layers that were needed in the PREVIOUS iteration.
+        // This is speculative but cheap: only issues madvise(WILLNEED)
+        // for ~60 layers (~6 GB) instead of the full 200 GB model.
+        // Pages are read asynchronously while the draft phase runs.
+        // ================================================================
+        if (!prev_layer_ids.empty()) {
+            llama_blurry_sharp_prefetch_layers_parallel(
+                bsctx, prev_layer_ids.data(),
+                (int32_t)prev_layer_ids.size(), 4);
+        }
+
         // ================================================================
         // PHASE 1: DRAFT with blurry model, monitoring entropy.
         // Router recording captures which experts the MoE gate selects
@@ -1089,15 +1109,22 @@ static generation_result run_moe_combination_generation(
             n_full_union_experts += llama_router_get_layer_experts(ctx, il, nullptr, 0);
         }
 
-        // ---- Phase 2b: Apply with bulk prefetch ----
-        // Issue madvise(WILLNEED) only for layers that actually need
-        // sharpening (those with router data).  This gives the kernel
-        // maximum lead time to bring mmap pages into the page cache
-        // from disk/swap while we process earlier layers.
+        // ---- Phase 2b: Parallel prefetch + sequential apply ----
+        // Use multiple threads to read tensor data into the staging
+        // cache concurrently.  The mmap memcpy / page fault is the
+        // bottleneck — running N threads overlaps kernel I/O across
+        // different file regions.  After prefetch completes, the
+        // sequential apply loop finds data already cached (fast
+        // pointer swaps, no I/O stalls).
         const int n_work = (int)work_items.size();
 
-        for (int i = 0; i < n_work; ++i) {
-            llama_blurry_sharp_prefetch_layer(bsctx, work_items[i].layer_idx);
+        {
+            std::vector<int32_t> layer_ids(n_work);
+            for (int i = 0; i < n_work; ++i) {
+                layer_ids[i] = work_items[i].layer_idx;
+            }
+            llama_blurry_sharp_prefetch_layers_parallel(
+                bsctx, layer_ids.data(), n_work, 4);
         }
 
         int n_sharpened = 0;
@@ -1114,6 +1141,12 @@ static generation_result run_moe_combination_generation(
         }
 
         llama_blurry_sharp_warm_live_pages(bsctx);
+
+        // Save this iteration's layer set for early prefetch next iteration
+        prev_layer_ids.resize(n_work);
+        for (int i = 0; i < n_work; ++i) {
+            prev_layer_ids[i] = work_items[i].layer_idx;
+        }
 
         if (verbose) {
             fprintf(stderr, "  [verify %3d] sharpened %d/%d layers (%d skipped), "
