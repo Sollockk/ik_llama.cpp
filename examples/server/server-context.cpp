@@ -301,6 +301,36 @@ bool server_context::load_model(const gpt_params& params_) {
                 }
 
                 llama_blurry_sharp_state st = llama_blurry_sharp_get_state(bsctx);
+
+                // ---- JIT layer budget ----
+                // Only sharpen the most impactful layers instead of all ~90.
+                // Uses the same first-half + last-half strategy as the
+                // blurry-sharp example: early layers set representations,
+                // final layers drive output logits.
+                int top_k = params_base.bs_dynamic_top_k; // default 8
+                if (top_k > 0 && st.n_layers_total > top_k) {
+                    int n_layers_total = st.n_layers_total;
+                    int half = std::max(1, top_k / 2);
+                    std::vector<int32_t> priority;
+                    // First `half` layers
+                    for (int i = 0; i < half && i < n_layers_total; ++i) {
+                        priority.push_back(i);
+                    }
+                    // Last `half` layers
+                    for (int i = std::max(0, n_layers_total - half); i < n_layers_total; ++i) {
+                        bool dup = false;
+                        for (int32_t p : priority) { if (p == i) { dup = true; break; } }
+                        if (!dup) priority.push_back(i);
+                    }
+                    llama_blurry_sharp_set_jit_layers(
+                        ctx, priority.data(), (int32_t)priority.size());
+                    LOG_INFO("JIT layer budget set", {
+                        {"top_k_layers", top_k},
+                        {"n_priority", (int)priority.size()},
+                        {"n_total", n_layers_total},
+                    });
+                }
+
                 LOG_INFO("Blurry-sharp MoE combination mode ready (JIT per-layer hotswap)", {
                     {"n_layers", st.n_layers_total},
                     {"n_expert", n_expert},

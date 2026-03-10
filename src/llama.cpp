@@ -3235,28 +3235,40 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                 lctx->jit_current_layer = -1;
             }
 
-            // 2) Collect unique expert IDs for this layer
-            std::unordered_set<int32_t> unique_ids;
-            for (size_t i = 0; i < n_ids; ++i) {
-                if (ids[i] >= 0) {
-                    unique_ids.insert(ids[i]);
+            // 2) Layer budget check: skip layers not in the priority set.
+            //    When the set is empty, all layers are eligible (no filtering).
+            if (!lctx->jit_priority_layers.empty() &&
+                lctx->jit_priority_layers.find(layer_idx) == lctx->jit_priority_layers.end()) {
+                // Not a priority layer — use blurry weights, skip sharpening.
+                goto jit_done;
+            }
+
+            // 3) Collect unique expert IDs for this layer
+            {
+                std::unordered_set<int32_t> unique_ids;
+                for (size_t i = 0; i < n_ids; ++i) {
+                    if (ids[i] >= 0) {
+                        unique_ids.insert(ids[i]);
+                    }
+                }
+
+                if (!unique_ids.empty()) {
+                    std::vector<int32_t> expert_vec(unique_ids.begin(), unique_ids.end());
+
+                    // 4) Sharpen this layer's expert weights
+                    int32_t ret = llama_blurry_sharp_apply_experts(
+                        lctx->jit_bsctx, layer_idx,
+                        expert_vec.data(), (int32_t)expert_vec.size());
+
+                    if (ret == 0) {
+                        lctx->jit_current_layer = layer_idx;
+                    }
+                    // If sharpening fails, we just continue with blurry weights
+                    // for this layer — degraded quality but no crash.
                 }
             }
 
-            if (!unique_ids.empty()) {
-                std::vector<int32_t> expert_vec(unique_ids.begin(), unique_ids.end());
-
-                // 3) Sharpen this layer's expert weights
-                int32_t ret = llama_blurry_sharp_apply_experts(
-                    lctx->jit_bsctx, layer_idx,
-                    expert_vec.data(), (int32_t)expert_vec.size());
-
-                if (ret == 0) {
-                    lctx->jit_current_layer = layer_idx;
-                }
-                // If sharpening fails, we just continue with blurry weights
-                // for this layer — degraded quality but no crash.
-            }
+            jit_done:;
         }
     }
 
@@ -3330,6 +3342,25 @@ void llama_blurry_sharp_stop_jit(
     }
 
     LLAMA_LOG_DEBUG("%s: JIT per-layer sharpening stopped\n", __func__);
+}
+
+void llama_blurry_sharp_set_jit_layers(
+        struct llama_context * ctx,
+        const int32_t        * layer_indices,
+        int32_t                n_layers) {
+    if (!ctx) return;
+
+    ctx->jit_priority_layers.clear();
+    if (layer_indices && n_layers > 0) {
+        for (int32_t i = 0; i < n_layers; ++i) {
+            ctx->jit_priority_layers.insert(layer_indices[i]);
+        }
+        LLAMA_LOG_INFO("%s: JIT layer filter set — %d priority layers\n",
+                      __func__, n_layers);
+    } else {
+        LLAMA_LOG_INFO("%s: JIT layer filter cleared — all layers eligible\n",
+                      __func__);
+    }
 }
 
 //   - lctx:      llama context

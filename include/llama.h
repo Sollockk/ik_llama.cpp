@@ -1907,6 +1907,18 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             struct llama_blurry_sharp_context * bsctx,
             struct llama_context              * ctx);
 
+    // Set which layers the JIT callback should sharpen.
+    // When set, layers NOT in this list are skipped (blurry weights used).
+    // Pass n_layers=0 to clear the filter (sharpen all layers).
+    //
+    // Use this to limit JIT sharpening to the most impactful layers
+    // (e.g., first half + last half) instead of all ~90 MoE layers.
+    // Dramatically reduces I/O: 8 layers × ~98 MB vs 90 layers × ~98 MB.
+    LLAMA_API void llama_blurry_sharp_set_jit_layers(
+            struct llama_context * ctx,
+            const int32_t        * layer_indices,
+            int32_t                n_layers);
+
     //
     // MTP
     //

@@ -235,6 +235,11 @@ struct llama_context {
     struct llama_blurry_sharp_context * jit_bsctx   = nullptr;
     int                              jit_current_layer = -1;  // layer currently sharpened (-1 = none)
 
+    // JIT layer budget: when non-empty, only sharpen layers in this set.
+    // Layers not in the set are skipped (use blurry weights).
+    // Set via llama_blurry_sharp_set_jit_layers().
+    std::unordered_set<int32_t>      jit_priority_layers;
+
     // input tensors
     struct ggml_tensor * inp_tokens;      // I32 [n_batch]
     struct ggml_tensor * inp_embd;        // F32 [n_embd, n_batch]
