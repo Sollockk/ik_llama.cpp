@@ -33,11 +33,14 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstddef>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -317,6 +320,26 @@ struct llama_blurry_sharp_context {
     // This eliminates the 30-minute startup cost of --bs-stage-swap by
     // spreading the disk→RAM→swap migration across the first inference pass.
     bool    lazy_swap_enabled   = false; // true when --bs-lazy-swap is active
+
+    // -- async prefetch thread --
+    // Background thread that pre-reads tensor data into a staging area
+    // ahead of the main apply loop.  On first pass (no ram_cache yet),
+    // this reads from mmap/file into prefetch_cache.  The main thread
+    // moves data from prefetch_cache → ram_cache when it needs it.
+    //
+    // Thread-safety: prefetch_cache is protected by prefetch_mtx (NOT
+    // the main bsctx->mtx).  The main thread briefly locks prefetch_mtx
+    // to move data out, avoiding contention with the main mutex.
+    std::thread                prefetch_thread;
+    std::mutex                 prefetch_mtx;
+    std::condition_variable    prefetch_cv;
+    std::atomic<bool>          prefetch_stop{false};
+    // Layers queued for prefetch (sorted ascending).
+    std::vector<int>           prefetch_queue;
+    // Pre-read tensor data: tensor_name → heap buffer.
+    std::unordered_map<std::string, std::vector<uint8_t>> prefetch_cache;
+    int64_t                    prefetch_cache_bytes = 0;
+    bool                       prefetch_thread_started = false;
 
     // -- metrics --
     blurry_sharp_metrics metrics = {};

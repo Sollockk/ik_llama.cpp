@@ -154,6 +154,22 @@ static void bs_prefetch_layer_mmap(
     if (lt_it == bsctx->layer_tensor_names.end()) return;
 
     for (const auto & tensor_name : lt_it->second) {
+        // --- RAM cache swap-in prefetch ---
+        // If this tensor's data is in the ram_cache (lazy swap or precache),
+        // it may have been paged out to swap via MADV_PAGEOUT.  Issue
+        // MADV_WILLNEED on the anonymous heap pages to trigger async swap-in.
+        // This is the key optimisation for subsequent passes with lazy swap:
+        // the kernel starts swapping pages in while we're still processing
+        // earlier layers.
+        if (bsctx->lazy_swap_enabled || bsctx->ram_cache_populated) {
+            auto cache_it = bsctx->ram_cache.find(tensor_name);
+            if (cache_it != bsctx->ram_cache.end() && !cache_it->second.empty()) {
+                madvise(cache_it->second.data(), cache_it->second.size(), MADV_WILLNEED);
+                continue;  // data is in ram_cache, no need for mmap prefetch
+            }
+        }
+
+        // --- mmap page prefetch (first pass or no ram_cache) ---
         auto info_it = bsctx->sharp_index.find(tensor_name);
         if (info_it == bsctx->sharp_index.end()) continue;
         const auto & si = info_it->second;
@@ -175,6 +191,190 @@ static void bs_prefetch_layer_mmap(
     GGML_UNUSED(bsctx);
     GGML_UNUSED(layer_idx);
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Async prefetch thread: pre-reads tensor data for upcoming layers
+//
+// On the first pass with lazy swap, ram_cache is empty.  Each tensor read
+// blocks on disk I/O.  The prefetch thread reads ahead by several layers,
+// populating prefetch_cache (separate from ram_cache to avoid main mutex
+// contention).  When apply_layer/apply_experts needs a tensor, it checks
+// prefetch_cache first and moves the data to ram_cache (O(1) move).
+//
+// On subsequent passes, the prefetch is handled by MADV_WILLNEED on
+// ram_cache pages (see bs_prefetch_layer_mmap above).
+// ---------------------------------------------------------------------------
+
+static void bs_prefetch_thread_func(llama_blurry_sharp_context * bsctx) {
+    while (!bsctx->prefetch_stop.load(std::memory_order_relaxed)) {
+        std::vector<int> layers_to_prefetch;
+
+        {
+            std::unique_lock<std::mutex> lock(bsctx->prefetch_mtx);
+            bsctx->prefetch_cv.wait(lock, [&] {
+                return bsctx->prefetch_stop.load(std::memory_order_relaxed)
+                    || !bsctx->prefetch_queue.empty();
+            });
+            if (bsctx->prefetch_stop.load(std::memory_order_relaxed)) break;
+            layers_to_prefetch = std::move(bsctx->prefetch_queue);
+            bsctx->prefetch_queue.clear();
+        }
+
+        for (int layer_idx : layers_to_prefetch) {
+            if (bsctx->prefetch_stop.load(std::memory_order_relaxed)) break;
+
+            auto lt_it = bsctx->layer_tensor_names.find(layer_idx);
+            if (lt_it == bsctx->layer_tensor_names.end()) continue;
+
+            // Sort tensors by file offset for sequential I/O
+            struct tensor_read_info {
+                std::string name;
+                int         split_idx;
+                size_t      file_offset;
+                size_t      nbytes;
+            };
+            std::vector<tensor_read_info> reads;
+
+            for (const auto & tensor_name : lt_it->second) {
+                // Skip if already in ram_cache or prefetch_cache
+                {
+                    std::lock_guard<std::mutex> plock(bsctx->prefetch_mtx);
+                    if (bsctx->prefetch_cache.count(tensor_name)) continue;
+                }
+                // Check ram_cache (read-only check, safe without main mutex
+                // since we only INSERT new keys and never delete during prefetch)
+                if (bsctx->ram_cache.count(tensor_name)) continue;
+
+                auto info_it = bsctx->sharp_index.find(tensor_name);
+                if (info_it == bsctx->sharp_index.end()) continue;
+                const auto & si = info_it->second;
+
+                reads.push_back({tensor_name, si.split_idx, si.file_offset, si.nbytes});
+            }
+
+            // Sort by (split_idx, file_offset) for sequential disk I/O
+            std::sort(reads.begin(), reads.end(), [](const tensor_read_info & a, const tensor_read_info & b) {
+                if (a.split_idx != b.split_idx) return a.split_idx < b.split_idx;
+                return a.file_offset < b.file_offset;
+            });
+
+            for (const auto & ri : reads) {
+                if (bsctx->prefetch_stop.load(std::memory_order_relaxed)) break;
+
+                // Double-check not already cached (may have been populated by main thread)
+                {
+                    std::lock_guard<std::mutex> plock(bsctx->prefetch_mtx);
+                    if (bsctx->prefetch_cache.count(ri.name)) continue;
+                }
+                if (bsctx->ram_cache.count(ri.name)) continue;
+
+                std::vector<uint8_t> buf(ri.nbytes);
+                bool ok = false;
+
+                // Read from mmap if available (sequential thanks to sorting)
+                int si = ri.split_idx;
+                if (si >= 0 && si < (int)bsctx->sharp_mmaps.size() && bsctx->sharp_mmaps[si]) {
+                    const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+                    size_t file_size = bsctx->sharp_mmaps[si]->size();
+                    if (ri.file_offset + ri.nbytes <= file_size) {
+                        std::memcpy(buf.data(), mmap_base + ri.file_offset, ri.nbytes);
+                        ok = true;
+                    }
+                }
+
+                // Fallback: file read
+                if (!ok && si >= 0 && si < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si]) {
+                    // File reads need serialization — only the prefetch thread
+                    // reads from these file handles during prefetch, so no
+                    // additional locking needed (apply path uses mmap when available).
+                    bsctx->sharp_files[si]->seek(ri.file_offset, SEEK_SET);
+                    bsctx->sharp_files[si]->read_raw(buf.data(), ri.nbytes);
+                    ok = true;
+                }
+
+                if (ok) {
+                    std::lock_guard<std::mutex> plock(bsctx->prefetch_mtx);
+                    bsctx->prefetch_cache[ri.name] = std::move(buf);
+                    bsctx->prefetch_cache_bytes += (int64_t)ri.nbytes;
+                }
+            }
+        }
+    }
+}
+
+// Start the prefetch thread if lazy swap is enabled and not already started.
+static void bs_ensure_prefetch_thread(llama_blurry_sharp_context * bsctx) {
+    if (!bsctx->lazy_swap_enabled) return;
+    if (bsctx->prefetch_thread_started) return;
+
+    bsctx->prefetch_stop.store(false, std::memory_order_relaxed);
+    bsctx->prefetch_thread = std::thread(bs_prefetch_thread_func, bsctx);
+    bsctx->prefetch_thread_started = true;
+
+    LLAMA_LOG_INFO("%s: async prefetch thread started\n", __func__);
+}
+
+// Stop the prefetch thread gracefully.
+static void bs_stop_prefetch_thread(llama_blurry_sharp_context * bsctx) {
+    if (!bsctx->prefetch_thread_started) return;
+
+    bsctx->prefetch_stop.store(true, std::memory_order_relaxed);
+    bsctx->prefetch_cv.notify_all();
+    if (bsctx->prefetch_thread.joinable()) {
+        bsctx->prefetch_thread.join();
+    }
+    bsctx->prefetch_thread_started = false;
+
+    // Move any remaining prefetch_cache entries into ram_cache
+    std::lock_guard<std::mutex> plock(bsctx->prefetch_mtx);
+    for (auto & kv : bsctx->prefetch_cache) {
+        if (bsctx->ram_cache.count(kv.first) == 0) {
+            bsctx->ram_cache_bytes += (int64_t)kv.second.size();
+            bsctx->ram_cache[kv.first] = std::move(kv.second);
+        }
+    }
+    bsctx->prefetch_cache.clear();
+    bsctx->prefetch_cache_bytes = 0;
+}
+
+// Queue layers for async prefetch.  Called from the public prefetch API
+// or internally before apply loops.  The thread will process them in order.
+static void bs_queue_prefetch_layers(
+        llama_blurry_sharp_context * bsctx,
+        const int                  * layer_indices,
+        int                          n_layers) {
+    if (!bsctx->prefetch_thread_started) return;
+    if (n_layers <= 0) return;
+
+    {
+        std::lock_guard<std::mutex> plock(bsctx->prefetch_mtx);
+        for (int i = 0; i < n_layers; ++i) {
+            bsctx->prefetch_queue.push_back(layer_indices[i]);
+        }
+    }
+    bsctx->prefetch_cv.notify_one();
+}
+
+// Check prefetch_cache for a tensor and move it to ram_cache if found.
+// Called from the lazy swap population path in bs_overlay_single_tensor.
+// Returns true if data was moved to ram_cache.
+static bool bs_consume_prefetched_tensor(
+        llama_blurry_sharp_context * bsctx,
+        const std::string          & tensor_name,
+        size_t                       expected_nbytes) {
+    std::lock_guard<std::mutex> plock(bsctx->prefetch_mtx);
+    auto it = bsctx->prefetch_cache.find(tensor_name);
+    if (it == bsctx->prefetch_cache.end()) return false;
+    if (it->second.size() < expected_nbytes) return false;
+
+    // Move to ram_cache (O(1) vector move)
+    bsctx->ram_cache[tensor_name] = std::move(it->second);
+    bsctx->ram_cache_bytes += (int64_t)expected_nbytes;
+    bsctx->prefetch_cache_bytes -= (int64_t)expected_nbytes;
+    bsctx->prefetch_cache.erase(it);
+
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -378,28 +578,35 @@ static const void * bs_read_to_staging(
     // GGUF file (slow).  The data is read once from disk into anonymous heap
     // memory, then staged to swap on restore via MADV_PAGEOUT.
     if (bsctx->lazy_swap_enabled) {
-        std::vector<uint8_t> buf(info.nbytes);
-        bool ok = false;
+        // Fast path: check if the async prefetch thread already has it
+        bool ok = bs_consume_prefetched_tensor(bsctx, info.name, info.nbytes);
 
-        bool have_mmap = (si >= 0 && si < (int)bsctx->sharp_mmaps.size()
-                          && bsctx->sharp_mmaps[si]);
-        if (have_mmap) {
-            const uint8_t * base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
-            if (info.file_offset + info.nbytes <= bsctx->sharp_mmaps[si]->size()) {
-                std::memcpy(buf.data(), base + info.file_offset, info.nbytes);
-                bs_release_mmap_pages(bsctx, base + info.file_offset, info.nbytes);
+        if (!ok) {
+            std::vector<uint8_t> buf(info.nbytes);
+
+            bool have_mmap = (si >= 0 && si < (int)bsctx->sharp_mmaps.size()
+                              && bsctx->sharp_mmaps[si]);
+            if (have_mmap) {
+                const uint8_t * base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+                if (info.file_offset + info.nbytes <= bsctx->sharp_mmaps[si]->size()) {
+                    std::memcpy(buf.data(), base + info.file_offset, info.nbytes);
+                    bs_release_mmap_pages(bsctx, base + info.file_offset, info.nbytes);
+                    ok = true;
+                }
+            }
+            if (!ok && si >= 0 && si < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si]) {
+                bsctx->sharp_files[si]->seek(info.file_offset, SEEK_SET);
+                bsctx->sharp_files[si]->read_raw(buf.data(), info.nbytes);
                 ok = true;
             }
-        }
-        if (!ok && si >= 0 && si < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si]) {
-            bsctx->sharp_files[si]->seek(info.file_offset, SEEK_SET);
-            bsctx->sharp_files[si]->read_raw(buf.data(), info.nbytes);
-            ok = true;
+
+            if (ok) {
+                bsctx->ram_cache[info.name] = std::move(buf);
+                bsctx->ram_cache_bytes += (int64_t)info.nbytes;
+            }
         }
 
         if (ok) {
-            bsctx->ram_cache[info.name] = std::move(buf);
-            bsctx->ram_cache_bytes += (int64_t)info.nbytes;
 
             if (bsctx->params.verbose) {
                 LLAMA_LOG_INFO("%s: lazy-swap: cached device tensor '%s' (%zu bytes, "
@@ -1171,6 +1378,9 @@ void llama_blurry_sharp_free(llama_blurry_sharp_context * bsctx) {
         bsctx->pinned_staging_size = 0;
     }
 
+    // Stop async prefetch thread before freeing any data it may reference
+    bs_stop_prefetch_thread(bsctx);
+
     // Free RAM cache (anonymous heap buffers for swap-backed sharp data)
     if (!bsctx->ram_cache.empty()) {
         LLAMA_LOG_INFO("%s: freeing RAM cache: %d tensors, %.2f MiB\n",
@@ -1307,30 +1517,38 @@ static int64_t bs_overlay_single_tensor(
             // buffer.  This spreads the disk I/O across the first inference
             // pass instead of a 30-minute upfront precache.
             if (cache_it == bsctx->ram_cache.end() && bsctx->lazy_swap_enabled) {
-                std::vector<uint8_t> buf(sharp_info.nbytes);
-                bool ok = false;
+                // Fast path: check if the async prefetch thread already has it
+                bool ok = bs_consume_prefetched_tensor(bsctx, sharp_info.name, sharp_info.nbytes);
 
-                // Read from mmap if available
-                if (have_mmap) {
-                    const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
-                    if (sharp_info.file_offset + sharp_info.nbytes <= bsctx->sharp_mmaps[si]->size()) {
-                        std::memcpy(buf.data(), mmap_base + sharp_info.file_offset, sharp_info.nbytes);
-                        // Release the mmap pages — data is now in anonymous heap memory.
-                        bs_release_mmap_pages(bsctx, mmap_base + sharp_info.file_offset, sharp_info.nbytes);
+                if (!ok) {
+                    // Prefetch miss — read synchronously (original path)
+                    std::vector<uint8_t> buf(sharp_info.nbytes);
+
+                    // Read from mmap if available
+                    if (have_mmap) {
+                        const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+                        if (sharp_info.file_offset + sharp_info.nbytes <= bsctx->sharp_mmaps[si]->size()) {
+                            std::memcpy(buf.data(), mmap_base + sharp_info.file_offset, sharp_info.nbytes);
+                            // Release the mmap pages — data is now in anonymous heap memory.
+                            bs_release_mmap_pages(bsctx, mmap_base + sharp_info.file_offset, sharp_info.nbytes);
+                            ok = true;
+                        }
+                    }
+
+                    // Fallback: file read
+                    if (!ok && si >= 0 && si < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si]) {
+                        bsctx->sharp_files[si]->seek(sharp_info.file_offset, SEEK_SET);
+                        bsctx->sharp_files[si]->read_raw(buf.data(), sharp_info.nbytes);
                         ok = true;
+                    }
+
+                    if (ok) {
+                        bsctx->ram_cache[sharp_info.name] = std::move(buf);
+                        bsctx->ram_cache_bytes += (int64_t)sharp_info.nbytes;
                     }
                 }
 
-                // Fallback: file read
-                if (!ok && si >= 0 && si < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si]) {
-                    bsctx->sharp_files[si]->seek(sharp_info.file_offset, SEEK_SET);
-                    bsctx->sharp_files[si]->read_raw(buf.data(), sharp_info.nbytes);
-                    ok = true;
-                }
-
                 if (ok) {
-                    bsctx->ram_cache[sharp_info.name] = std::move(buf);
-                    bsctx->ram_cache_bytes += (int64_t)sharp_info.nbytes;
                     cache_it = bsctx->ram_cache.find(sharp_info.name);
 
                     if (bsctx->params.verbose) {
@@ -2419,7 +2637,20 @@ int32_t llama_blurry_sharp_apply_layer(
     // than ~one layer's worth of sharp data.
     bs_prefetch_layer_mmap(bsctx, layer_idx);
 
-    for (const auto & tensor_name : layer_it->second) {
+    // Sort tensor names by (split_idx, file_offset) for sequential disk I/O.
+    // This ensures reads within a layer are issued in file order, maximizing
+    // throughput on HDDs and improving prefetch locality on SSDs.
+    std::vector<std::string> sorted_tensors(layer_it->second.begin(), layer_it->second.end());
+    std::sort(sorted_tensors.begin(), sorted_tensors.end(), [&](const std::string & a, const std::string & b) {
+        auto ia = bsctx->sharp_index.find(a);
+        auto ib = bsctx->sharp_index.find(b);
+        if (ia == bsctx->sharp_index.end()) return false;
+        if (ib == bsctx->sharp_index.end()) return true;
+        if (ia->second.split_idx != ib->second.split_idx) return ia->second.split_idx < ib->second.split_idx;
+        return ia->second.file_offset < ib->second.file_offset;
+    });
+
+    for (const auto & tensor_name : sorted_tensors) {
         auto info_it = bsctx->sharp_index.find(tensor_name);
         if (info_it == bsctx->sharp_index.end()) continue;
 
@@ -2990,9 +3221,20 @@ void llama_blurry_sharp_prefetch_layer(
         llama_blurry_sharp_context * bsctx,
         int32_t                      layer_idx) {
     if (!bsctx || !bsctx->initialized) return;
-    // bs_prefetch_layer_mmap only reads immutable init-time data
-    // (layer_tensor_names, sharp_index, sharp_mmaps) and issues
-    // non-blocking madvise(WILLNEED) syscalls, so no lock needed.
+
+    // Start the async prefetch thread on first call (lazy init).
+    // This avoids starting it during init when we don't yet know
+    // which layers will be needed.
+    bs_ensure_prefetch_thread(bsctx);
+
+    // Queue this layer for async prefetch (first-pass ram_cache population).
+    // The thread reads tensors from mmap/file into prefetch_cache in the
+    // background, sorted by file offset for sequential I/O.
+    int li = (int)layer_idx;
+    bs_queue_prefetch_layers(bsctx, &li, 1);
+
+    // Issue madvise(WILLNEED) for mmap pages (first pass) and
+    // ram_cache pages (subsequent passes — triggers async swap-in).
     bs_prefetch_layer_mmap(bsctx, layer_idx);
 }
 
@@ -4278,7 +4520,18 @@ int32_t llama_blurry_sharp_apply_experts(
     // Prefetch this layer's sharp data
     bs_prefetch_layer_mmap(bsctx, layer_idx);
 
-    for (const auto & tensor_name : layer_it->second) {
+    // Sort tensor names by (split_idx, file_offset) for sequential disk I/O.
+    std::vector<std::string> sorted_tensors(layer_it->second.begin(), layer_it->second.end());
+    std::sort(sorted_tensors.begin(), sorted_tensors.end(), [&](const std::string & a, const std::string & b) {
+        auto ia = bsctx->sharp_index.find(a);
+        auto ib = bsctx->sharp_index.find(b);
+        if (ia == bsctx->sharp_index.end()) return false;
+        if (ib == bsctx->sharp_index.end()) return true;
+        if (ia->second.split_idx != ib->second.split_idx) return ia->second.split_idx < ib->second.split_idx;
+        return ia->second.file_offset < ib->second.file_offset;
+    });
+
+    for (const auto & tensor_name : sorted_tensors) {
         auto info_it = bsctx->sharp_index.find(tensor_name);
         if (info_it == bsctx->sharp_index.end()) continue;
 
