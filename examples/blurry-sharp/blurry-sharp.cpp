@@ -1047,28 +1047,30 @@ static generation_result run_moe_combination_generation(
         // issuing WILLNEED for layers we'll never touch.
         work_items.clear();
 
+        int n_layers_skipped = 0;
         for (int il = 0; il < n_layers; ++il) {
-            layer_work w;
-            w.layer_idx = il;
-            w.n_experts = llama_router_get_layer_experts(ctx, il, nullptr, 0);
-            if (w.n_experts > 0) {
-                w.expert_ids.resize(w.n_experts);
-                llama_router_get_layer_experts(ctx, il, w.expert_ids.data(), w.n_experts);
+            int32_t n_exp = llama_router_get_layer_experts(ctx, il, nullptr, 0);
+            if (n_exp <= 0) {
+                // No MoE routing recorded for this layer — the blurry
+                // weights are sufficient.  Skipping layers without router
+                // data avoids the massive I/O cost of full-layer overlays
+                // on attention/norm-only layers or unreached layers.
+                n_layers_skipped++;
+                continue;
             }
+            layer_work w;
+            w.layer_idx  = il;
+            w.n_experts  = n_exp;
+            w.expert_ids.resize(n_exp);
+            llama_router_get_layer_experts(ctx, il, w.expert_ids.data(), n_exp);
             work_items.push_back(std::move(w));
         }
 
         // ---- Phase 2b: Apply with bulk prefetch ----
-        // Issue madvise(WILLNEED) for ALL layers that need sharpening
-        // before starting any apply calls.  This gives the kernel
+        // Issue madvise(WILLNEED) only for layers that actually need
+        // sharpening (those with router data).  This gives the kernel
         // maximum lead time to bring mmap pages into the page cache
-        // from disk/swap while we process earlier layers.  Works for
-        // all memory tiers: mmap (disk), RAM cache (swap-backed), and
-        // GPU (source data comes from mmap/cache before PCIe DMA).
-        //
-        // This is safe because madvise is non-blocking and advisory —
-        // the kernel will only use available RAM for readahead, it
-        // won't evict critical pages under memory pressure.
+        // from disk/swap while we process earlier layers.
         const int n_work = (int)work_items.size();
 
         for (int i = 0; i < n_work; ++i) {
@@ -1079,30 +1081,22 @@ static generation_result run_moe_combination_generation(
         for (int i = 0; i < n_work; ++i) {
             const auto & w = work_items[i];
 
-            if (w.n_experts > 0) {
-                int32_t ret = llama_blurry_sharp_apply_experts(
-                    bsctx, w.layer_idx, w.expert_ids.data(), w.n_experts);
-                if (ret == 0) {
-                    ++n_sharpened;
-                }
-                n_unique_experts_total += w.n_experts;
-            } else {
-                // Dense layer (no MoE routing) or layer not reached during draft.
-                // Sharpen the full layer.
-                if (llama_blurry_sharp_apply_layer(bsctx, w.layer_idx) == 0) {
-                    ++n_sharpened;
-                }
-                n_unique_experts_total += n_expert;
+            int32_t ret = llama_blurry_sharp_apply_experts(
+                bsctx, w.layer_idx, w.expert_ids.data(), w.n_experts);
+            if (ret == 0) {
+                ++n_sharpened;
             }
+            n_unique_experts_total += w.n_experts;
             n_expert_slots_total += n_expert;
         }
 
         llama_blurry_sharp_warm_live_pages(bsctx);
 
         if (verbose) {
-            fprintf(stderr, "  [verify %3d] sharpened %d layers using router hooks "
-                    "(%d recorded MoE layers, %d unique experts total)\n",
-                    n_decode, n_sharpened, n_recorded_layers, n_unique_experts_total);
+            fprintf(stderr, "  [verify %3d] sharpened %d/%d layers (%d skipped, no router data), "
+                    "%d recorded MoE layers, %d unique experts total\n",
+                    n_decode, n_sharpened, n_layers, n_layers_skipped,
+                    n_recorded_layers, n_unique_experts_total);
         }
 
         // Clear recorded data before the next draft iteration
