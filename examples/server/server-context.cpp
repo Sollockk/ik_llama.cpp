@@ -3593,26 +3593,39 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         };
 
         // ---------------------------------------------------------------
-        // Blurry-sharp MoE combination: JIT per-layer hotswapping.
+        // Blurry-sharp MoE combination modes:
         //
-        // Instead of sharpening ALL layers at once (which requires the
-        // entire sharp model resident in memory), JIT sharpening hooks
-        // into the eval callback and sharpens ONE layer at a time:
+        // MODE 1 (JIT, default): Per-layer hotswapping during decode.
+        //   layer N starts -> sharpen layer N (swap expert weights)
+        //   layer N ends   -> restore layer N
+        //   Only one layer's sharp data is ever resident.
         //
-        //   layer N starts → sharpen layer N (swap expert weights)
-        //   layer N ends   → restore layer N
-        //   layer N+1 starts → sharpen layer N+1 ...
-        //
-        // Only one layer's worth of sharp data is ever resident.
-        // Memory usage ≈ one layer's expert slices, not the full model.
+        // MODE 2 (Speculative verify, --bs-speculative): Two-pass decode.
+        //   Pass 1: decode with blurry, record router expert selections.
+        //   Sharpen selected layers/experts based on routing data.
+        //   Pass 2: re-decode same batch with sharp weights.
+        //   Compare blurry vs sharp predictions, log disagreements.
+        //   Sampling uses sharp logits for best quality output.
         // ---------------------------------------------------------------
         const bool bs_moe_active = bs_moe_dynamic && bsctx;
-        if (bs_moe_active) {
+        const bool bs_spec_verify = bs_moe_active && params_base.bs_speculative;
+
+        // JIT mode: sharpen during decode (only when NOT doing speculative verify)
+        if (bs_moe_active && !bs_spec_verify) {
             llama_blurry_sharp_start_jit(bsctx, ctx);
+        }
+
+        // Speculative verify: record router data during blurry pass
+        if (bs_spec_verify) {
+            llama_router_start_recording(ctx);
         }
 
         const int ret = llama_decode(ctx, batch_view);
         if (ret != 0) {
+            if (bs_spec_verify) {
+                llama_router_stop_recording(ctx);
+                llama_router_clear(ctx);
+            }
             if (n_batch == 1 || ret < 0) {
                 int user_cancel = -3;
                 if (ret == user_cancel) {
@@ -3651,18 +3664,197 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             continue; // continue loop of n_batch
         }
 
-        // ---------------------------------------------------------------
-        // Blurry-sharp MoE combination: stop JIT sharpening.
-        //
-        // The JIT callback already sharpened/restored each layer during
-        // the decode above.  stop_jit restores the last layer (if any)
-        // and clears the callback.  The decode produced sharp-quality
-        // logits with only one layer ever sharpened at a time.
-        //
-        // No re-decode needed — sharpening happened DURING the decode.
-        // ---------------------------------------------------------------
-        if (bs_moe_active) {
+        // JIT mode: stop and restore
+        if (bs_moe_active && !bs_spec_verify) {
             llama_blurry_sharp_stop_jit(bsctx, ctx);
+            llama_router_clear(ctx);
+        }
+
+        // ---------------------------------------------------------------
+        // Speculative verification: two-pass blurry vs sharp comparison.
+        //
+        // Pass 1 (above) decoded with blurry weights while recording
+        // which experts the MoE router selected.  Now we:
+        //   1. Save blurry top-1 predictions
+        //   2. Sharpen only the needed layers/experts
+        //   3. Clear KV entries and re-decode with sharp weights
+        //   4. Compare predictions, log disagreements
+        //   5. Restore blurry weights
+        //
+        // After this block, logits in context are from the sharp model.
+        // Normal slot processing below will sample from sharp logits.
+        // ---------------------------------------------------------------
+        if (bs_spec_verify) {
+            llama_router_stop_recording(ctx);
+
+            const int n_vocab = llama_n_vocab(model);
+            const int top_k_layers = params_base.bs_dynamic_top_k;
+
+            // 1. Save blurry greedy predictions for comparison
+            struct blurry_pred {
+                int slot_id;
+                int tok_idx;
+                llama_token blurry_best;
+            };
+            std::vector<blurry_pred> blurry_preds;
+
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_PROCESSING ||
+                    slot.i_batch < (int)i ||
+                    slot.i_batch >= (int)(i + n_tokens)) {
+                    continue;
+                }
+                if (slot.command == SLOT_COMMAND_LOAD_PROMPT) {
+                    continue; // skip prompt processing slots
+                }
+
+                const int tok_idx = slot.i_batch - i;
+                float * logits = llama_get_logits_ith(ctx, tok_idx);
+
+                llama_token best = 0;
+                float best_logit = logits[0];
+                for (int v = 1; v < n_vocab; ++v) {
+                    if (logits[v] > best_logit) {
+                        best_logit = logits[v];
+                        best = v;
+                    }
+                }
+                blurry_preds.push_back({ slot.id, tok_idx, best });
+            }
+
+            // 2. Sharpen selected layers based on recorded routing
+            llama_blurry_sharp_state st = llama_blurry_sharp_get_state(bsctx);
+            const int n_layers_total = st.n_layers_total;
+            const int expert_token_budget = 3; // first 3 draft tokens' experts
+
+            // Collect eligible layers (those with router data)
+            std::vector<int> eligible_layers;
+            for (int il = 0; il < n_layers_total; ++il) {
+                if (llama_router_n_tokens_for_layer(ctx, il) > 0) {
+                    eligible_layers.push_back(il);
+                }
+            }
+
+            // Apply layer budget: first half + last half
+            std::vector<int> selected_layers;
+            const int n_eligible = (int)eligible_layers.size();
+            if (top_k_layers > 0 && n_eligible > top_k_layers) {
+                int half = std::max(1, top_k_layers / 2);
+                for (int li = 0; li < half && li < n_eligible; ++li) {
+                    selected_layers.push_back(eligible_layers[li]);
+                }
+                for (int li = std::max(0, n_eligible - half); li < n_eligible; ++li) {
+                    bool dup = false;
+                    for (int s : selected_layers) {
+                        if (s == eligible_layers[li]) { dup = true; break; }
+                    }
+                    if (!dup) selected_layers.push_back(eligible_layers[li]);
+                }
+            } else {
+                selected_layers = eligible_layers;
+            }
+
+            // Query per-token experts and apply sharpening
+            struct layer_work {
+                int layer_idx;
+                int32_t n_experts;
+                std::vector<int32_t> expert_ids;
+            };
+            std::vector<layer_work> work_items;
+
+            for (int il : selected_layers) {
+                int32_t n_exp = llama_router_get_token_range_experts(
+                    ctx, il, 0, expert_token_budget, nullptr, 0);
+                if (n_exp <= 0) continue;
+
+                layer_work w;
+                w.layer_idx = il;
+                w.n_experts = n_exp;
+                w.expert_ids.resize(n_exp);
+                llama_router_get_token_range_experts(
+                    ctx, il, 0, expert_token_budget,
+                    w.expert_ids.data(), n_exp);
+                work_items.push_back(std::move(w));
+            }
+
+            // Parallel prefetch + apply
+            const int n_work = (int)work_items.size();
+            if (n_work > 0) {
+                std::vector<int32_t> layer_ids(n_work);
+                for (int wi = 0; wi < n_work; ++wi) {
+                    layer_ids[wi] = work_items[wi].layer_idx;
+                }
+                llama_blurry_sharp_prefetch_layers_parallel(
+                    bsctx, layer_ids.data(), n_work, 4);
+            }
+
+            int n_sharpened = 0;
+            for (const auto & w : work_items) {
+                if (llama_blurry_sharp_apply_experts(
+                        bsctx, w.layer_idx,
+                        w.expert_ids.data(), w.n_experts) == 0) {
+                    ++n_sharpened;
+                }
+            }
+            if (n_sharpened > 0) {
+                llama_blurry_sharp_warm_live_pages(bsctx);
+            }
+
+            // 3. Clear KV entries for this batch and re-decode with sharp
+            for (int j = 0; j < batch_view.n_tokens; ++j) {
+                for (int s = 0; s < batch_view.n_seq_id[j]; ++s) {
+                    llama_kv_cache_seq_rm(ctx, batch_view.seq_id[j][s],
+                                          batch_view.pos[j], batch_view.pos[j] + 1);
+                }
+            }
+
+            const int ret2 = llama_decode(ctx, batch_view);
+            if (ret2 != 0) {
+                LOG_WARNING("BS speculative verify: sharp re-decode failed, using blurry logits", {
+                    {"ret", ret2},
+                });
+            }
+
+            // 4. Compare blurry vs sharp predictions
+            if (ret2 == 0 && !blurry_preds.empty()) {
+                int n_agree = 0;
+                int n_disagree = 0;
+                for (const auto & bp : blurry_preds) {
+                    float * sharp_logits = llama_get_logits_ith(ctx, bp.tok_idx);
+                    llama_token sharp_best = 0;
+                    float sharp_best_logit = sharp_logits[0];
+                    for (int v = 1; v < n_vocab; ++v) {
+                        if (sharp_logits[v] > sharp_best_logit) {
+                            sharp_best_logit = sharp_logits[v];
+                            sharp_best = v;
+                        }
+                    }
+
+                    if (sharp_best == bp.blurry_best) {
+                        n_agree++;
+                    } else {
+                        n_disagree++;
+                        LOG_VERBOSE("BS verify DISAGREE", {
+                            {"slot_id",  bp.slot_id},
+                            {"blurry",   common_token_to_piece(ctx, bp.blurry_best)},
+                            {"sharp",    common_token_to_piece(ctx, sharp_best)},
+                            {"blurry_id", bp.blurry_best},
+                            {"sharp_id",  sharp_best},
+                        });
+                    }
+                }
+                if (n_agree + n_disagree > 0) {
+                    LOG_VERBOSE("BS verify batch", {
+                        {"agree", n_agree},
+                        {"disagree", n_disagree},
+                        {"n_sharpened_layers", n_sharpened},
+                        {"n_eligible_layers", n_eligible},
+                    });
+                }
+            }
+
+            // 5. Restore blurry weights
+            llama_blurry_sharp_restore_all(bsctx);
             llama_router_clear(ctx);
         }
 
