@@ -900,7 +900,7 @@ static generation_result run_moe_combination_generation(
     fprintf(stderr, "    n_expert_used:  %d (per token)\n", n_expert_used);
     fprintf(stderr, "    draft_n:        %d\n", draft_n);
     fprintf(stderr, "    entropy_thresh: %.2f\n", entropy_threshold);
-    fprintf(stderr, "    router hooks:   ENABLED (per-token expert tracking)\n");
+    fprintf(stderr, "    layer budget:   %d (first+last half of MoE layers)\n", top_k_layers);
     fprintf(stderr, "    expert budget:  first 3 draft tokens (~%d experts vs %d total)\n",
             std::min(3 * (int)n_expert_used, (int)n_expert), n_expert);
     fprintf(stderr, "\n");
@@ -1061,34 +1061,60 @@ static generation_result run_moe_combination_generation(
         // ================================================================
         n_verify_batches++;
 
-        // ---- Phase 2a: Per-token expert query ----
-        // Instead of using the full expert union across ALL draft tokens
-        // (which saturates to n_expert/n_expert = 1.0 selectivity with
-        // enough tokens), use only the first few tokens' experts.
+        // ---- Phase 2a: Per-token expert query with layer budget ----
         //
-        // Rationale: non-expert tensors (attention, norms, gate_inp) are
-        // sharpened for ALL positions regardless.  Expert tensors only
-        // matter for the positions whose experts we loaded.  For other
-        // positions, both draft and verify use blurry experts → they
-        // agree automatically.  Disagreements driven by sharp attention
-        // weights are still caught at ALL positions.
+        // Two levels of selectivity to minimize I/O:
         //
-        // Budget: first min(draft_len, 3) tokens → ~3*top_k unique
-        // experts per layer instead of the full union.
+        // 1) LAYER BUDGET (top_k_layers): In a fully-MoE model, all ~90
+        //    layers have router data.  We only sharpen the most impactful
+        //    subset — first half + last half of eligible layers (research
+        //    shows early and final layers contribute most to output quality).
+        //    Default top_k_layers=8 → sharpen ~8 layers instead of ~90.
+        //
+        // 2) EXPERT BUDGET (expert_token_budget): Instead of the full expert
+        //    union across all draft tokens (which saturates to 160/160),
+        //    only use experts from the first few draft tokens.  Non-expert
+        //    tensors (attention, norms, gate_inp) are still sharp for all
+        //    positions.  Expert tensors only matter for the positions whose
+        //    experts we loaded — other positions use blurry experts for both
+        //    draft and verify, so they agree automatically.
+        //
         const int expert_token_budget = std::min((int)draft_tokens.size(), 3);
         work_items.clear();
 
-        int n_layers_skipped = 0;
-        int n_full_union_experts = 0;  // for comparison logging
+        // First pass: collect ALL eligible layers (those with router data)
+        std::vector<int> eligible_layers;
+        eligible_layers.reserve(n_layers);
         for (int il = 0; il < n_layers; ++il) {
-            // Check if this layer has any per-token data
-            int32_t n_tokens_recorded = llama_router_n_tokens_for_layer(ctx, il);
-            if (n_tokens_recorded <= 0) {
-                n_layers_skipped++;
-                continue;
+            if (llama_router_n_tokens_for_layer(ctx, il) > 0) {
+                eligible_layers.push_back(il);
             }
+        }
 
-            // Get experts for only the first expert_token_budget tokens
+        // Apply layer budget: select first half + last half of eligible layers
+        std::vector<int> selected_layers;
+        const int n_eligible = (int)eligible_layers.size();
+        if (top_k_layers > 0 && n_eligible > top_k_layers) {
+            int half = std::max(1, top_k_layers / 2);
+            // First `half` eligible layers (early layers)
+            for (int i = 0; i < half && i < n_eligible; ++i) {
+                selected_layers.push_back(eligible_layers[i]);
+            }
+            // Last `half` eligible layers (final layers, closest to output)
+            for (int i = std::max(0, n_eligible - half); i < n_eligible; ++i) {
+                bool dup = false;
+                for (int s : selected_layers) { if (s == eligible_layers[i]) { dup = true; break; } }
+                if (!dup) selected_layers.push_back(eligible_layers[i]);
+            }
+        } else {
+            selected_layers = eligible_layers;
+        }
+
+        int n_layers_skipped = n_layers - (int)selected_layers.size();
+        int n_full_union_experts = 0;
+
+        // Build work items for selected layers only
+        for (int il : selected_layers) {
             int32_t n_exp = llama_router_get_token_range_experts(
                 ctx, il, 0, expert_token_budget, nullptr, 0);
             if (n_exp <= 0) {
@@ -1105,7 +1131,6 @@ static generation_result run_moe_combination_generation(
                 w.expert_ids.data(), n_exp);
             work_items.push_back(std::move(w));
 
-            // Track full union size for logging
             n_full_union_experts += llama_router_get_layer_experts(ctx, il, nullptr, 0);
         }
 
@@ -1149,9 +1174,9 @@ static generation_result run_moe_combination_generation(
         }
 
         if (verbose) {
-            fprintf(stderr, "  [verify %3d] sharpened %d/%d layers (%d skipped), "
+            fprintf(stderr, "  [verify %3d] sharpened %d/%d layers (%d eligible, %d skipped), "
                     "experts: %d (from %d/%d draft tokens) vs %d full-union\n",
-                    n_decode, n_sharpened, n_layers, n_layers_skipped,
+                    n_decode, n_sharpened, n_layers, n_eligible, n_layers_skipped,
                     n_unique_experts_total, expert_token_budget,
                     (int)draft_tokens.size(), n_full_union_experts);
         }
