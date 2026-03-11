@@ -3627,98 +3627,156 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // ---------------------------------------------------------------
         // Three-tier inference pipeline:
         //
-        //   Tier 1 (turbo):  layer-skip decode — fast rough logits
-        //   Tier 2 (blurry): full-layer re-decode — verify turbo output
-        //   Tier 3 (sharp):  selective overlay re-decode — highest quality
+        //   Tier 1 (turbo): layer-skip decode on the blurry model.
+        //     Fast, rough output.  Records MoE routing data for the
+        //     non-skipped layers.  This tells us which experts/layers
+        //     are likely relevant, and lets us PREFETCH sharp tensor
+        //     data from disk/swap into RAM before the real decode.
         //
-        // Each tier only runs when enabled:
-        //   turbo_active:   --bs-layer-skip N  or  --bs-layer-skip-list
-        //   bs_moe_active:  --bs-moe-combination  (JIT per-layer hotswap)
-        //   bs_spec_verify: --bs-moe-combination --bs-speculative
+        //   Tier 2 (blurry + JIT sharp): full-layer decode with JIT
+        //     sharpening.  The JIT callback hot-loads sharp weights
+        //     one layer at a time during the forward pass.  Turbo's
+        //     routing data has already primed the I/O pipeline, so
+        //     JIT reads hit warm pages instead of cold disk.
         //
-        // Without turbo, Tier 2 is the primary decode.
-        // Without sharp, sampling uses blurry (or turbo) logits.
+        //   Tier 3 (speculative verify, optional): if --bs-speculative,
+        //     a separate sharp re-decode compares blurry vs sharp
+        //     predictions for diagnostic/quality purposes.
         //
-        // MoE JIT mode runs during the blurry pass (Tier 2), not the
-        // turbo pass, since JIT needs all layers to be evaluated.
+        // When turbo is active but no sharp model exists, turbo is just
+        // the fast blurry path with no re-decode (original behavior).
         // ---------------------------------------------------------------
         const bool bs_moe_active = bs_moe_dynamic && bsctx;
         const bool bs_spec_verify = bs_moe_active && params_base.bs_speculative;
         const bool turbo_active = !turbo_skip_layers.empty();
+        // Turbo is only useful as a scout when there's a sharp model
+        // to inform.  Without MoE/sharp, just use turbo logits directly.
+        const bool turbo_scout = turbo_active && bs_moe_active;
 
-        // ---- Tier 1: Turbo decode (layer-skip) ----
-        // Run a fast decode with layers skipped to get rough predictions.
-        // These are compared against the blurry re-decode to measure
-        // agreement and inform which layers need sharp verification.
-        bool turbo_did_run = false;
-
-        struct turbo_pred {
-            int slot_id;
-            int tok_idx;
-            llama_token turbo_best;
-        };
-        std::vector<turbo_pred> turbo_preds;
-
-        if (turbo_active) {
+        // ---- Tier 1: Turbo scout pass (layer-skip + router recording) ----
+        // Run a fast decode with layers skipped.  The routing data from
+        // non-skipped MoE layers lets us prefetch sharp tensor data and
+        // update JIT layer selection before the real blurry+JIT decode.
+        if (turbo_scout) {
             llama_set_skip_layers(ctx, turbo_skip_layers.data(), (int32_t)turbo_skip_layers.size());
+            llama_router_start_recording(ctx);
 
             const int ret_turbo = llama_decode(ctx, batch_view);
+
+            llama_router_stop_recording(ctx);
+            llama_set_skip_layers(ctx, nullptr, 0);
+
             if (ret_turbo != 0) {
-                // Turbo decode failed — fall through to blurry without turbo
-                llama_set_skip_layers(ctx, nullptr, 0);
-                LOG_WARNING("Turbo (layer-skip) decode failed, falling back to blurry-only", {
+                LOG_WARNING("Turbo scout decode failed, proceeding without prefetch", {
                     {"ret", ret_turbo},
                 });
+                llama_router_clear(ctx);
             } else {
-                turbo_did_run = true;
+                // Use turbo's routing data to prefetch sharp layers.
+                // Non-skipped layers that fired MoE routing give us the
+                // expert IDs likely needed in the full decode.  Prefetching
+                // their sharp data now means JIT reads hit warm pages.
+                llama_blurry_sharp_state st = llama_blurry_sharp_get_state(bsctx);
+                const int n_layers_total = st.n_layers_total;
 
-                // Save turbo predictions for later comparison
-                const int n_vocab = llama_n_vocab(model);
-                for (auto & slot : slots) {
-                    if (slot.state != SLOT_STATE_PROCESSING ||
-                        slot.i_batch < (int)i ||
-                        slot.i_batch >= (int)(i + n_tokens)) {
-                        continue;
+                std::vector<int32_t> prefetch_layers;
+                for (int il = 0; il < n_layers_total; ++il) {
+                    if (llama_router_n_tokens_for_layer(ctx, il) > 0) {
+                        prefetch_layers.push_back(il);
                     }
-                    if (slot.command == SLOT_COMMAND_LOAD_PROMPT) {
-                        continue;
-                    }
-
-                    const int tok_idx = slot.i_batch - i;
-                    float * logits = llama_get_logits_ith(ctx, tok_idx);
-
-                    llama_token best = 0;
-                    float best_logit = logits[0];
-                    for (int v = 1; v < n_vocab; ++v) {
-                        if (logits[v] > best_logit) {
-                            best_logit = logits[v];
-                            best = v;
-                        }
-                    }
-                    turbo_preds.push_back({ slot.id, tok_idx, best });
                 }
 
-                // Disable layer skipping and clear turbo KV entries so
-                // the blurry pass re-evaluates with all layers.
-                llama_set_skip_layers(ctx, nullptr, 0);
+                if (!prefetch_layers.empty()) {
+                    llama_blurry_sharp_prefetch_layers_parallel(
+                        bsctx, prefetch_layers.data(),
+                        (int32_t)prefetch_layers.size(), 4);
 
-                for (int j = 0; j < batch_view.n_tokens; ++j) {
-                    for (int s = 0; s < batch_view.n_seq_id[j]; ++s) {
-                        llama_kv_cache_seq_rm(ctx, batch_view.seq_id[j][s],
-                                              batch_view.pos[j], batch_view.pos[j] + 1);
+                    LOG_VERBOSE("Turbo scout: prefetched sharp data", {
+                        {"n_layers_prefetched", (int)prefetch_layers.size()},
+                        {"n_layers_total", n_layers_total},
+                    });
+                }
+
+                // Update JIT layer selection based on turbo's routing.
+                // Layers that turbo's router activated are most likely to
+                // matter.  Add neighboring skipped layers too since their
+                // expert patterns tend to correlate with adjacent layers.
+                const int top_k = params_base.bs_dynamic_top_k;
+                if (top_k > 0) {
+                    std::vector<int32_t> jit_layers;
+
+                    // Start with layers turbo actually evaluated
+                    for (int32_t il : prefetch_layers) {
+                        jit_layers.push_back(il);
                     }
+
+                    // Add skipped neighbors (±1) that turbo missed
+                    for (int32_t il : prefetch_layers) {
+                        if (il > 0) {
+                            bool found = false;
+                            for (int32_t j : jit_layers) { if (j == il - 1) { found = true; break; } }
+                            if (!found) jit_layers.push_back(il - 1);
+                        }
+                        if (il + 1 < n_layers_total) {
+                            bool found = false;
+                            for (int32_t j : jit_layers) { if (j == il + 1) { found = true; break; } }
+                            if (!found) jit_layers.push_back(il + 1);
+                        }
+                    }
+
+                    // Budget: keep at most top_k layers
+                    if ((int)jit_layers.size() > top_k) {
+                        // Prioritize first half + last half (early and final layers)
+                        std::sort(jit_layers.begin(), jit_layers.end());
+                        std::vector<int32_t> trimmed;
+                        int half = std::max(1, top_k / 2);
+                        for (int li = 0; li < half && li < (int)jit_layers.size(); ++li) {
+                            trimmed.push_back(jit_layers[li]);
+                        }
+                        for (int li = std::max(0, (int)jit_layers.size() - half);
+                             li < (int)jit_layers.size(); ++li) {
+                            bool dup = false;
+                            for (int32_t t : trimmed) { if (t == jit_layers[li]) { dup = true; break; } }
+                            if (!dup) trimmed.push_back(jit_layers[li]);
+                        }
+                        jit_layers = std::move(trimmed);
+                    }
+
+                    llama_blurry_sharp_set_jit_layers(
+                        ctx, jit_layers.data(), (int32_t)jit_layers.size());
+
+                    LOG_VERBOSE("Turbo scout: updated JIT layers", {
+                        {"n_jit_layers", (int)jit_layers.size()},
+                    });
+                }
+
+                llama_router_clear(ctx);
+            }
+
+            // Clear turbo KV entries so blurry+JIT re-evaluates cleanly.
+            for (int j = 0; j < batch_view.n_tokens; ++j) {
+                for (int s = 0; s < batch_view.n_seq_id[j]; ++s) {
+                    llama_kv_cache_seq_rm(ctx, batch_view.seq_id[j][s],
+                                          batch_view.pos[j], batch_view.pos[j] + 1);
                 }
             }
         }
 
-        // ---- Tier 2: Blurry decode (all layers) ----
-        // Full forward pass with blurry weights.  If speculative verify
-        // is active, record router data for the sharp pass.
-        // JIT mode sharpens during this decode (not during turbo).
+        // ---- Turbo-only fast path (no sharp model) ----
+        // When layer-skip is active but there's no sharp model to inform,
+        // just run with layer-skip for speed.  No re-decode needed.
+        if (turbo_active && !turbo_scout) {
+            llama_set_skip_layers(ctx, turbo_skip_layers.data(), (int32_t)turbo_skip_layers.size());
+        }
+
+        // ---- Tier 2: Blurry decode (all layers, with JIT sharp) ----
+        // Full forward pass.  JIT mode hot-loads sharp layers during the
+        // decode.  Turbo's prefetch primes the I/O so JIT reads are fast.
         if (bs_moe_active && !bs_spec_verify) {
             llama_blurry_sharp_start_jit(bsctx, ctx);
         }
 
+        // Speculative verify: record router data during blurry pass
         if (bs_spec_verify) {
             llama_router_start_recording(ctx);
         }
@@ -3773,47 +3831,16 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             llama_router_clear(ctx);
         }
 
-        // Log turbo vs blurry agreement when both ran
-        if (turbo_did_run && !turbo_preds.empty()) {
-            const int n_vocab = llama_n_vocab(model);
-            int n_turbo_agree = 0;
-            int n_turbo_disagree = 0;
-            for (const auto & tp : turbo_preds) {
-                float * blurry_logits = llama_get_logits_ith(ctx, tp.tok_idx);
-                llama_token blurry_best = 0;
-                float blurry_best_logit = blurry_logits[0];
-                for (int v = 1; v < n_vocab; ++v) {
-                    if (blurry_logits[v] > blurry_best_logit) {
-                        blurry_best_logit = blurry_logits[v];
-                        blurry_best = v;
-                    }
-                }
-                if (blurry_best == tp.turbo_best) {
-                    n_turbo_agree++;
-                } else {
-                    n_turbo_disagree++;
-                    LOG_VERBOSE("Turbo vs Blurry DISAGREE", {
-                        {"slot_id",  tp.slot_id},
-                        {"turbo",    common_token_to_piece(ctx, tp.turbo_best)},
-                        {"blurry",   common_token_to_piece(ctx, blurry_best)},
-                        {"turbo_id", tp.turbo_best},
-                        {"blurry_id", blurry_best},
-                    });
-                }
-            }
-            if (n_turbo_agree + n_turbo_disagree > 0) {
-                LOG_VERBOSE("Turbo vs Blurry batch", {
-                    {"agree", n_turbo_agree},
-                    {"disagree", n_turbo_disagree},
-                });
-            }
+        // Turbo-only: disable layer skipping after decode
+        if (turbo_active && !turbo_scout) {
+            llama_set_skip_layers(ctx, nullptr, 0);
         }
 
         // ---------------------------------------------------------------
-        // Tier 3: Sharp verification (speculative two-pass).
+        // Tier 3 (optional): Speculative sharp verification.
         //
-        // The blurry pass (Tier 2) decoded while recording which experts
-        // the MoE router selected.  Now we:
+        // The blurry pass decoded while recording which experts the MoE
+        // router selected.  Now we:
         //   1. Save blurry top-1 predictions
         //   2. Sharpen only the needed layers/experts
         //   3. Clear KV entries and re-decode with sharp weights
