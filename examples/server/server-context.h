@@ -240,6 +240,10 @@ struct server_context {
     llama_blurry_sharp_context * bsctx = nullptr;
     bool bs_moe_dynamic = false;  // true when MoE combination mode is active
 
+    // Layer skipping for "turbo" draft tier in 3-tier blurry-sharp.
+    // When non-empty, these layers are skipped during draft decodes for speed.
+    std::vector<int32_t> turbo_skip_layers;
+
     int32_t n_ctx; // total context for all clients / slots
 
     // system prompt

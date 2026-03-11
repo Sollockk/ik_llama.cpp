@@ -527,6 +527,17 @@ struct gpt_params {
 
     std::vector<int> bs_layer_allowlist;               // only sharpen these layers (empty=all)
     std::vector<int> bs_layer_denylist;                // never sharpen these layers (empty=none)
+
+    // --- Layer skipping ("turbo" draft tier) ---
+    // Skips specified layers entirely during graph building for fast drafting.
+    // Used as the fastest tier in 3-tier blurry-sharp:
+    //   turbo (layer-skip) → blurry (all layers) → sharp (overlay)
+    //
+    // --bs-layer-skip N         skip every other layer except first/last N
+    //                           (e.g., N=4 keeps layers 0-3 and last 4, skips alternate middle layers)
+    // --bs-layer-skip-list L    explicit comma-separated list of layers to skip
+    int         bs_layer_skip          = 0;            // auto layer-skip count (0=disabled)
+    std::vector<int> bs_layer_skip_list;               // explicit list of layers to skip
 };
 
 

@@ -2041,6 +2041,14 @@ ggml_cgraph * llm_build_context::build_llama() {
     //const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : 1.f;
     for (int il = 0; il < n_layer; ++il) {
+        // Layer skipping: when this layer is in the skip set, pass input
+        // straight through without attention or FFN.  Used for "turbo" draft
+        // mode in 3-tier blurry-sharp inference.
+        if (!lctx.skip_layers.empty() && lctx.skip_layers.count(il)) {
+            cb(inpL, "l_out", il);
+            continue;
+        }
+
         struct ggml_tensor * inpSA = inpL;
 
         bool use_rope = model.arch == LLM_ARCH_LLAMA4 ? (il + 1) % hparams.n_no_rope_layer_step != 0 : true;
@@ -2250,6 +2258,12 @@ ggml_cgraph * llm_build_context::build_mistral3() {
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : 1.f;
 
     for (int il = 0; il < n_layer; ++il) {
+        // Layer skipping for turbo draft mode
+        if (!lctx.skip_layers.empty() && lctx.skip_layers.count(il)) {
+            cb(inpL, "l_out", il);
+            continue;
+        }
+
         ggml_tensor * inpSA = inpL;
 
         auto rope_factors = build_rope_factors(il);
@@ -3927,6 +3941,8 @@ ggml_cgraph * llm_build_context::build_qwen() {
 ggml_cgraph * llm_build_context::build_qwen2() {
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model, n_tokens), false);
 
+    // Note: layer skipping for turbo draft mode is supported here.
+    // When lctx.skip_layers is non-empty, layers in the set are skipped.
     const int64_t n_embd_head = hparams.n_embd_head_v;
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
     GGML_ASSERT(n_embd_head == hparams.n_rot);
@@ -3943,6 +3959,12 @@ ggml_cgraph * llm_build_context::build_qwen2() {
     struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
     for (int il = 0; il < n_layer; ++il) {
+        // Layer skipping for turbo draft mode
+        if (!lctx.skip_layers.empty() && lctx.skip_layers.count(il)) {
+            cb(inpL, "l_out", il);
+            continue;
+        }
+
         struct ggml_tensor * inpSA = inpL;
 
         // norm
@@ -4138,6 +4160,12 @@ ggml_cgraph * llm_build_context::build_qwen2moe() {
     struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
     for (int il = 0; il < n_layer; ++il) {
+        // Layer skipping for turbo draft mode
+        if (!lctx.skip_layers.empty() && lctx.skip_layers.count(il)) {
+            cb(inpL, "l_out", il);
+            continue;
+        }
+
         struct ggml_tensor * inpSA = inpL;
 
         // norm
@@ -6920,6 +6948,12 @@ ggml_cgraph * llm_build_context::build_deepseek2() {
 
     int n_active_layers = hparams.n_layer - hparams.nextn_predict_layers;
     for (int il = 0; il < n_active_layers; ++il) {
+        // Layer skipping for turbo draft mode
+        if (!lctx.skip_layers.empty() && lctx.skip_layers.count(il)) {
+            cb(inpL, "l_out", il);
+            continue;
+        }
+
         struct ggml_tensor * inpSA = inpL;
 
         // norm

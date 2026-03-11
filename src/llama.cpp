@@ -549,6 +549,7 @@ struct llama_context::Prev {
     int n_kv;
     llama_mtp_op_type mtp_op_type;
     ggml_cgraph * graph;
+    uint64_t skip_layers_epoch = 0;
 };
 
 void llama_context::reset_scheduler() {
@@ -566,6 +567,7 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch) {
            kv_self.n == prev->n_kv &&
            n_outputs == prev->n_outputs &&
            cparams.mtp_op_type == prev->mtp_op_type &&
+           skip_layers_epoch == prev->skip_layers_epoch &&
            update_cache_copies();
 }
 
@@ -3642,8 +3644,8 @@ static int llama_decode_internal(
 #endif
             if (u_batch.n_tokens == 1 && u_batch.embd == nullptr && lctx.cparams.graph_reuse) {
                 lctx.prev = std::make_unique<llama_context::Prev>(llama_context::Prev{
-                        (int)u_batch.all_seq_id, (int)lctx.n_outputs, (int)lctx.kv_self.n, 
-                        cparams.mtp_op_type, gf});
+                        (int)u_batch.all_seq_id, (int)lctx.n_outputs, (int)lctx.kv_self.n,
+                        cparams.mtp_op_type, gf, lctx.skip_layers_epoch});
             }
         } else {
             //printf("Reusing graph\n");
@@ -7327,6 +7329,19 @@ void llama_set_embeddings(struct llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn) {
     ctx->cparams.causal_attn = causal_attn;
+}
+
+void llama_set_skip_layers(
+        struct llama_context * ctx,
+        const int32_t        * layer_indices,
+        int32_t                n_layers) {
+    ctx->skip_layers.clear();
+    if (layer_indices && n_layers > 0) {
+        for (int32_t i = 0; i < n_layers; ++i) {
+            ctx->skip_layers.insert(layer_indices[i]);
+        }
+    }
+    ++ctx->skip_layers_epoch;
 }
 
 struct llama_batch llama_batch_get_one(

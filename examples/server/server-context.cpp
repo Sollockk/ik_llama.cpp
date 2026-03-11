@@ -373,6 +373,38 @@ bool server_context::load_model(const gpt_params& params_) {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Layer-skip "turbo" draft tier initialization
+    //
+    // When --bs-layer-skip N is set, compute which layers to skip for the
+    // fast draft tier.  Strategy: keep first N and last N layers (they
+    // contribute most to quality), skip every other layer in between.
+    // This gives roughly 2x speedup on the blurry model for drafting.
+    // -----------------------------------------------------------------------
+    if (!params_base.bs_layer_skip_list.empty()) {
+        // Explicit list provided
+        turbo_skip_layers.assign(
+            params_base.bs_layer_skip_list.begin(),
+            params_base.bs_layer_skip_list.end());
+        LOG_INFO("Turbo draft tier: explicit layer-skip list", {
+            {"n_skip", (int)turbo_skip_layers.size()},
+        });
+    } else if (params_base.bs_layer_skip > 0) {
+        // Auto-generate: keep first/last N, skip every other middle layer
+        const int n_layers_total = llama_n_layer(model);
+        const int keep = params_base.bs_layer_skip;
+        for (int il = keep; il < n_layers_total - keep; ++il) {
+            if (il % 2 == 1) {  // skip odd-indexed middle layers
+                turbo_skip_layers.push_back(il);
+            }
+        }
+        LOG_INFO("Turbo draft tier: auto layer-skip", {
+            {"n_layers_total", n_layers_total},
+            {"keep_first_last", keep},
+            {"n_skip", (int)turbo_skip_layers.size()},
+        });
+    }
+
     return true;
 }
 
@@ -3609,6 +3641,15 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // ---------------------------------------------------------------
         const bool bs_moe_active = bs_moe_dynamic && bsctx;
         const bool bs_spec_verify = bs_moe_active && params_base.bs_speculative;
+        const bool turbo_active = !turbo_skip_layers.empty();
+
+        // Turbo draft tier: enable layer skipping for fast blurry pass.
+        // This is the fastest tier in 3-tier inference:
+        //   turbo (layer-skip) → blurry (all layers) → sharp (overlay)
+        // Layer skipping is only active for the primary decode, not verification.
+        if (turbo_active && !bs_spec_verify) {
+            llama_set_skip_layers(ctx, turbo_skip_layers.data(), (int32_t)turbo_skip_layers.size());
+        }
 
         // JIT mode: sharpen during decode (only when NOT doing speculative verify)
         if (bs_moe_active && !bs_spec_verify) {
@@ -3668,6 +3709,13 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         if (bs_moe_active && !bs_spec_verify) {
             llama_blurry_sharp_stop_jit(bsctx, ctx);
             llama_router_clear(ctx);
+        }
+
+        // Turbo draft tier: disable layer skipping after the blurry pass.
+        // The verification pass (if any) and subsequent sampling need
+        // full-quality decode output.
+        if (turbo_active && !bs_spec_verify) {
+            llama_set_skip_layers(ctx, nullptr, 0);
         }
 
         // ---------------------------------------------------------------

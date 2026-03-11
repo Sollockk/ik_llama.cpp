@@ -240,6 +240,18 @@ struct llama_context {
     // Set via llama_blurry_sharp_set_jit_layers().
     std::unordered_set<int32_t>      jit_priority_layers;
 
+    // Layer skipping: when non-empty, layers in this set are completely
+    // skipped during graph building (no attention, no FFN — input passes
+    // straight through).  This allows a "turbo" draft mode that runs a
+    // subset of layers for fast token generation, used as the fastest tier
+    // in a 3-tier blurry-sharp pipeline:
+    //   ultra-blurry (layer-skip) → blurry (all layers) → sharp (overlay)
+    // Set via llama_set_skip_layers().
+    std::unordered_set<int32_t>      skip_layers;
+    // Monotonic counter bumped whenever skip_layers changes, so that
+    // can_reuse_graph() can detect the change and rebuild the graph.
+    uint64_t                         skip_layers_epoch = 0;
+
     // input tensors
     struct ggml_tensor * inp_tokens;      // I32 [n_batch]
     struct ggml_tensor * inp_embd;        // F32 [n_embd, n_batch]

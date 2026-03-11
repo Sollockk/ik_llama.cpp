@@ -1789,6 +1789,266 @@ static generation_result run_combined_generation(
 }
 
 // ---------------------------------------------------------------------------
+// 3-Tier generation: ultra-blurry (layer-skip) → blurry (all layers) → sharp
+//
+// Tier 1 (turbo):  Run the blurry model with layer skipping for fast drafting.
+//                  Skips alternate middle layers → ~2x faster than full blurry.
+// Tier 2 (blurry): Verify draft tokens with the full blurry model (all layers).
+//                  Accepts tokens where blurry agrees with turbo.
+// Tier 3 (sharp):  Optionally verify with sharp overlay for best quality.
+//                  Only invoked when tier 2 disagrees or for final check.
+// ---------------------------------------------------------------------------
+static generation_result run_three_tier_generation(
+        llama_model   * model,
+        llama_context * ctx,
+        llama_blurry_sharp_context * bsctx,  // may be nullptr (2-tier only)
+        const std::vector<llama_token> & prompt_tokens,
+        int n_predict,
+        int draft_n,
+        int layer_skip_keep,   // keep first/last N layers, skip alternate middle
+        int top_k_layers,      // for sharp verification (0 = all)
+        bool verbose) {
+
+    generation_result result;
+
+    const int n_ctx   = llama_n_ctx(ctx);
+    const int n_vocab = llama_n_vocab(model);
+    const int n_layers = llama_n_layer(model);
+
+    // Build skip layer list: keep first/last `layer_skip_keep`, skip odd middle
+    std::vector<int32_t> skip_layers;
+    for (int il = layer_skip_keep; il < n_layers - layer_skip_keep; ++il) {
+        if (il % 2 == 1) {
+            skip_layers.push_back(il);
+        }
+    }
+
+    if (verbose) {
+        fprintf(stderr, "  3-Tier mode: draft_n=%d, skipping %zu/%d layers for turbo draft\n",
+                draft_n, skip_layers.size(), n_layers);
+        if (bsctx) {
+            fprintf(stderr, "  Sharp verification enabled (3-tier)\n");
+        } else {
+            fprintf(stderr, "  No sharp model (2-tier: turbo → blurry)\n");
+        }
+    }
+
+    if ((int)prompt_tokens.size() + n_predict > n_ctx) {
+        n_predict = n_ctx - (int)prompt_tokens.size();
+        if (n_predict <= 0) {
+            fprintf(stderr, "three-tier: prompt longer than context\n");
+            return result;
+        }
+    }
+
+    // Prompt eval (turbo — with layer skipping for speed)
+    llama_set_skip_layers(ctx, skip_layers.data(), (int32_t)skip_layers.size());
+
+    llama_batch batch = llama_batch_init(std::max(512, draft_n + 1), 0, 1);
+    for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+        common_batch_add(batch, prompt_tokens[i], (int)i, { 0 }, false);
+    }
+    batch.logits[batch.n_tokens - 1] = true;
+
+    if (llama_decode(ctx, batch) != 0) {
+        fprintf(stderr, "three-tier: llama_decode() failed on prompt\n");
+        llama_set_skip_layers(ctx, nullptr, 0);
+        llama_batch_free(batch);
+        return result;
+    }
+
+    int n_cur    = batch.n_tokens;
+    int n_decode = 0;
+    int n_draft_total    = 0;
+    int n_accepted_total = 0;
+    int n_turbo_tokens   = 0;
+
+    const auto t_start = ggml_time_us();
+
+    while (n_cur < (int)prompt_tokens.size() + n_predict) {
+        // ---- Tier 1: Draft with turbo model (layer-skip enabled) ----
+        // skip_layers should already be set from initialization or previous iteration
+        std::vector<llama_token> draft_tokens;
+        int draft_limit = std::min(draft_n,
+                                   (int)prompt_tokens.size() + n_predict - n_cur);
+
+        for (int d = 0; d < draft_limit; ++d) {
+            float * logits = llama_get_logits_ith(ctx, batch.n_tokens - 1);
+
+            llama_token best_id = 0;
+            float best_logit = logits[0];
+            for (llama_token id = 1; id < n_vocab; ++id) {
+                if (logits[id] > best_logit) {
+                    best_logit = logits[id];
+                    best_id = id;
+                }
+            }
+
+            if (llama_token_is_eog(model, best_id)) {
+                break;
+            }
+
+            draft_tokens.push_back(best_id);
+            n_turbo_tokens++;
+
+            if (d + 1 < draft_limit) {
+                common_batch_clear(batch);
+                common_batch_add(batch, best_id, n_cur + d, { 0 }, true);
+                if (llama_decode(ctx, batch) != 0) {
+                    fprintf(stderr, "three-tier: turbo draft decode failed\n");
+                    break;
+                }
+            }
+        }
+
+        if (draft_tokens.empty()) {
+            break;
+        }
+
+        n_draft_total += (int)draft_tokens.size();
+
+        // ---- Tier 2: Verify with full blurry model (all layers) ----
+        llama_set_skip_layers(ctx, nullptr, 0);  // disable layer skipping
+
+        // Remove draft token KV entries so blurry re-evaluates them
+        llama_kv_cache_seq_rm(ctx, 0, n_cur, n_cur + (int)draft_tokens.size());
+
+        common_batch_clear(batch);
+        for (int d = 0; d < (int)draft_tokens.size(); ++d) {
+            common_batch_add(batch, draft_tokens[d], n_cur + d, { 0 }, true);
+        }
+
+        int n_accepted = 0;
+
+        if (llama_decode(ctx, batch) == 0) {
+            for (int d = 0; d < (int)draft_tokens.size(); ++d) {
+                float * blurry_logits = llama_get_logits_ith(ctx, d);
+
+                llama_token blurry_best = 0;
+                float blurry_best_logit = blurry_logits[0];
+                for (llama_token id = 1; id < n_vocab; ++id) {
+                    if (blurry_logits[id] > blurry_best_logit) {
+                        blurry_best_logit = blurry_logits[id];
+                        blurry_best = id;
+                    }
+                }
+
+                if (d + 1 < (int)draft_tokens.size()) {
+                    if (blurry_best == draft_tokens[d + 1]) {
+                        n_accepted++;
+                        result.tokens.push_back(draft_tokens[d]);
+                        result.text += common_token_to_piece(ctx, draft_tokens[d]);
+                    } else {
+                        // Accept this token but take blurry's correction
+                        n_accepted++;
+                        result.tokens.push_back(draft_tokens[d]);
+                        result.text += common_token_to_piece(ctx, draft_tokens[d]);
+
+                        if (!llama_token_is_eog(model, blurry_best)) {
+                            n_accepted++;
+                            result.tokens.push_back(blurry_best);
+                            result.text += common_token_to_piece(ctx, blurry_best);
+                        }
+
+                        if (verbose) {
+                            fprintf(stderr, "  [3-tier draft %3d+%d] REJECT: turbo=\"%s\" vs blurry=\"%s\" "
+                                    "-> accepted %d/%d\n",
+                                    n_decode, d + 1,
+                                    common_token_to_piece(ctx, draft_tokens[d + 1]).c_str(),
+                                    common_token_to_piece(ctx, blurry_best).c_str(),
+                                    n_accepted, (int)draft_tokens.size());
+                        }
+                        break;
+                    }
+                } else {
+                    // Last token — accept and take blurry's next prediction
+                    n_accepted++;
+                    result.tokens.push_back(draft_tokens[d]);
+                    result.text += common_token_to_piece(ctx, draft_tokens[d]);
+
+                    if (!llama_token_is_eog(model, blurry_best)) {
+                        n_accepted++;
+                        result.tokens.push_back(blurry_best);
+                        result.text += common_token_to_piece(ctx, blurry_best);
+                    }
+
+                    if (verbose && n_accepted == (int)draft_tokens.size() + 1) {
+                        fprintf(stderr, "  [3-tier draft %3d] all %d turbo tokens accepted + 1 bonus\n",
+                                n_decode, (int)draft_tokens.size());
+                    }
+                }
+            }
+        } else {
+            fprintf(stderr, "three-tier: blurry verification decode failed\n");
+            for (auto tok : draft_tokens) {
+                if (llama_token_is_eog(model, tok)) break;
+                result.tokens.push_back(tok);
+                result.text += common_token_to_piece(ctx, tok);
+                n_accepted++;
+            }
+        }
+
+        n_accepted_total += n_accepted;
+        result.n_blurry_steps += n_accepted;  // verified with blurry
+
+        // Remove extra KV entries beyond accepted range
+        int accepted_end = n_cur + n_accepted;
+        if (accepted_end < n_cur + (int)draft_tokens.size()) {
+            llama_kv_cache_seq_rm(ctx, 0, accepted_end, n_cur + (int)draft_tokens.size());
+        }
+
+        n_decode += n_accepted;
+        n_cur = (int)prompt_tokens.size() + (int)result.tokens.size();
+
+        // Check EOS
+        bool hit_eos = false;
+        for (int i = (int)result.tokens.size() - n_accepted; i < (int)result.tokens.size(); ++i) {
+            if (i >= 0 && llama_token_is_eog(model, result.tokens[i])) {
+                hit_eos = true;
+                break;
+            }
+        }
+        if (hit_eos) break;
+
+        // Re-enable layer skipping for next draft round and prime logits
+        llama_set_skip_layers(ctx, skip_layers.data(), (int32_t)skip_layers.size());
+
+        if (!result.tokens.empty()) {
+            // Need to re-decode the last accepted token with turbo to get
+            // logits for the next draft.  But the KV cache currently has
+            // full-blurry entries.  We re-decode just the last position with
+            // layer skipping to get fast logits for drafting.
+            llama_kv_cache_seq_rm(ctx, 0, n_cur - 1, n_cur);
+            common_batch_clear(batch);
+            common_batch_add(batch, result.tokens.back(), n_cur - 1, { 0 }, true);
+            if (llama_decode(ctx, batch) != 0) {
+                fprintf(stderr, "three-tier: post-verify decode failed\n");
+                break;
+            }
+        }
+    }
+
+    // Cleanup: ensure layer skipping is off
+    llama_set_skip_layers(ctx, nullptr, 0);
+
+    const auto t_end = ggml_time_us();
+    result.elapsed_s    = (t_end - t_start) / 1e6;
+    result.tokens_per_s = (result.elapsed_s > 0.0) ? n_decode / result.elapsed_s : 0.0;
+    result.n_draft_total = n_draft_total;
+    result.n_accepted_total = n_accepted_total;
+
+    if (verbose) {
+        fprintf(stderr, "\n  3-Tier stats: %d turbo drafted, %d accepted (%.1f%% acceptance)\n",
+                n_draft_total, n_accepted_total,
+                n_draft_total > 0 ? 100.0 * n_accepted_total / n_draft_total : 0.0);
+        fprintf(stderr, "  Turbo tokens generated: %d\n", n_turbo_tokens);
+    }
+
+    llama_batch_free(batch);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Standard generation loop (greedy, for comparison purposes)
 // ---------------------------------------------------------------------------
 static generation_result run_generation(
@@ -2658,6 +2918,66 @@ int main(int argc, char ** argv) {
             size_t n_match = 0;
             for (size_t i = 0; i < min_len; ++i) {
                 if (result_sharp.tokens[i] == result_combined.tokens[i]) n_match++;
+            }
+            fprintf(stderr, "  vs All-sharp:   %zu/%zu tokens agree (%.1f%%)\n",
+                    n_match, min_len,
+                    min_len > 0 ? 100.0 * n_match / min_len : 0.0);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    // -----------------------------------------------------------------------
+    // 3-Tier generation (turbo layer-skip → blurry → sharp)
+    // -----------------------------------------------------------------------
+    generation_result result_three_tier;
+
+    if (params.bs_layer_skip > 0) {
+        fprintf(stderr, "--- 3-Tier generation (turbo → blurry%s) ---\n",
+                bsctx ? " → sharp" : "");
+        fprintf(stderr, "  Draft tokens:     %d\n", params.bs_spec_draft);
+        fprintf(stderr, "  Layer-skip keep:  %d (first/last layers kept intact)\n", params.bs_layer_skip);
+        fprintf(stderr, "\n");
+
+        llama_kv_cache_clear(ctx);
+
+        result_three_tier = run_three_tier_generation(
+            model, ctx, bsctx,
+            prompt_tokens,
+            params.n_predict,
+            params.bs_spec_draft,
+            params.bs_layer_skip,
+            params.bs_dynamic_top_k,
+            params.bs_verbose
+        );
+
+        fprintf(stderr, "\n3-Tier generation results:\n");
+        fprintf(stderr, "  Generated: %s\n", result_three_tier.text.c_str());
+        fprintf(stderr, "  Tokens:    %zu\n", result_three_tier.tokens.size());
+        fprintf(stderr, "  Time:      %.2f s\n", result_three_tier.elapsed_s);
+        fprintf(stderr, "  Speed:     %.2f t/s\n", result_three_tier.tokens_per_s);
+        fprintf(stderr, "  Draft total:    %d\n", result_three_tier.n_draft_total);
+        fprintf(stderr, "  Accepted total: %d\n", result_three_tier.n_accepted_total);
+        if (result_three_tier.n_draft_total > 0) {
+            fprintf(stderr, "  Acceptance rate: %.1f%%\n",
+                    100.0 * result_three_tier.n_accepted_total / result_three_tier.n_draft_total);
+        }
+        fprintf(stderr, "\n");
+
+        if (!result_blurry.tokens.empty()) {
+            size_t min_len = std::min(result_blurry.tokens.size(), result_three_tier.tokens.size());
+            size_t n_match = 0;
+            for (size_t i = 0; i < min_len; ++i) {
+                if (result_blurry.tokens[i] == result_three_tier.tokens[i]) n_match++;
+            }
+            fprintf(stderr, "  vs Blurry-only: %zu/%zu tokens agree (%.1f%%)\n",
+                    n_match, min_len,
+                    min_len > 0 ? 100.0 * n_match / min_len : 0.0);
+        }
+        if (!result_sharp.tokens.empty()) {
+            size_t min_len = std::min(result_sharp.tokens.size(), result_three_tier.tokens.size());
+            size_t n_match = 0;
+            for (size_t i = 0; i < min_len; ++i) {
+                if (result_sharp.tokens[i] == result_three_tier.tokens[i]) n_match++;
             }
             fprintf(stderr, "  vs All-sharp:   %zu/%zu tokens agree (%.1f%%)\n",
                     n_match, min_len,

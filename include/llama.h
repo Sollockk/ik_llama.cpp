@@ -1002,6 +1002,18 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // Layer skipping for "turbo" draft mode.
+    // When set, the specified layers are completely skipped during graph
+    // building (no attention, no FFN — the layer input passes straight
+    // through).  This allows a fast "ultra-blurry" draft tier that runs
+    // only a subset of layers:
+    //   ultra-blurry (layer-skip) → blurry (all layers) → sharp (overlay)
+    // Pass NULL/0 to clear (run all layers).
+    LLAMA_API void llama_set_skip_layers(
+            struct llama_context * ctx,
+            const int32_t        * layer_indices,
+            int32_t                n_layers);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

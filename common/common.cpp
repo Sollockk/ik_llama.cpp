@@ -2316,6 +2316,28 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--bs-layer-skip") {
+        CHECK_ARG
+        params.bs_layer_skip = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-layer-skip-list") {
+        CHECK_ARG
+        // parse comma-separated int list of layers to skip
+        params.bs_layer_skip_list.clear();
+        std::string s(argv[i]);
+        size_t pos = 0;
+        while (pos < s.size()) {
+            size_t next = s.find(',', pos);
+            if (next == std::string::npos) next = s.size();
+            std::string tok = s.substr(pos, next - pos);
+            if (!tok.empty()) {
+                params.bs_layer_skip_list.push_back(std::stoi(tok));
+            }
+            pos = next + 1;
+        }
+        return true;
+    }
 
 #ifndef LOG_DISABLE_LOGS
     // Parse args for logging parameters
@@ -2726,6 +2748,13 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "expert slices replaced by sharp data. Reduces I/O by n_expert/n_used" });
     options.push_back({ "*",           "       --bs-moe-top-k N",       "override the number of active experts per token for MoE combination\n"
                                                                         "mode (default: 0 = use model's n_expert_used)" });
+    options.push_back({ "*",           "       --bs-layer-skip N",      "turbo draft mode: skip alternate middle layers, keeping first/last N\n"
+                                                                        "layers intact. Creates fast 'ultra-blurry' tier for 3-tier inference:\n"
+                                                                        "  turbo (layer-skip) -> blurry (all layers) -> sharp (overlay)\n"
+                                                                        "(default: 0 = disabled)" });
+    options.push_back({ "*",           "       --bs-layer-skip-list L1,L2,...",
+                                                                        "explicit comma-separated list of layer indices to skip\n"
+                                                                        "overrides --bs-layer-skip auto-generation" });
 
     options.push_back({ "retrieval" });
     options.push_back({ "retrieval",   "       --context-file FNAME",   "file to load context from (repeat to specify multiple files)" });
