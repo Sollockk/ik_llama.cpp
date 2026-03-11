@@ -3330,6 +3330,74 @@ std::string fs_get_cache_file(const std::string & filename) {
 //
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
+
+    // -----------------------------------------------------------------------
+    // Selective layer offloading for layer-skip mode.
+    //
+    // When --bs-layer-skip is active, skipped layers are never evaluated
+    // during the forward pass.  Keeping them on GPU wastes VRAM.  We peek
+    // at the GGUF metadata to learn n_layers, compute the skip pattern,
+    // and add tensor_buft_overrides to place skipped layers on CPU.
+    // This frees VRAM for sharp overlay caching and other uses.
+    // -----------------------------------------------------------------------
+    if ((params.bs_layer_skip > 0 || !params.bs_layer_skip_list.empty())
+        && params.n_gpu_layers > 0) {
+
+        // Peek at GGUF to get the layer count
+        struct gguf_init_params gguf_params = { /*.no_alloc =*/ true, /*.ctx =*/ NULL };
+        auto * ctx_gguf = gguf_init_from_file(params.model.c_str(), gguf_params);
+        if (ctx_gguf) {
+            // Get architecture name for the block_count key
+            int arch_key = gguf_find_key(ctx_gguf, "general.architecture");
+            std::string arch = "llama";
+            if (arch_key >= 0) {
+                arch = gguf_get_val_str(ctx_gguf, arch_key);
+            }
+            std::string bc_key_name = arch + ".block_count";
+            int bc_idx = gguf_find_key(ctx_gguf, bc_key_name.c_str());
+
+            if (bc_idx >= 0) {
+                int n_layers_total = (int)gguf_get_val_u32(ctx_gguf, bc_idx);
+
+                // Compute which layers to skip
+                std::vector<int> skip_layers;
+                if (!params.bs_layer_skip_list.empty()) {
+                    skip_layers = params.bs_layer_skip_list;
+                } else {
+                    int keep = params.bs_layer_skip;
+                    for (int il = keep; il < n_layers_total - keep; ++il) {
+                        if (il % 2 == 1) {
+                            skip_layers.push_back(il);
+                        }
+                    }
+                }
+
+                if (!skip_layers.empty()) {
+                    // Remove null terminator if present (added during arg parsing)
+                    if (!params.tensor_buft_overrides.empty()
+                        && params.tensor_buft_overrides.back().pattern == nullptr) {
+                        params.tensor_buft_overrides.pop_back();
+                    }
+
+                    // Add CPU override for ALL tensors in each skipped layer
+                    for (int il : skip_layers) {
+                        std::string pattern = "blk\\." + std::to_string(il) + "\\.";
+                        params.tensor_buft_overrides.push_back(
+                            {strdup(pattern.c_str()), ggml_backend_cpu_buffer_type()});
+                    }
+
+                    // Re-add null terminator
+                    params.tensor_buft_overrides.push_back({nullptr, nullptr});
+
+                    fprintf(stderr, "%s: layer-skip offload: %zu skipped layers will stay on CPU "
+                            "(freeing VRAM for sharp data)\n",
+                            __func__, skip_layers.size());
+                }
+            }
+            gguf_free(ctx_gguf);
+        }
+    }
+
     auto mparams = common_model_params_to_llama(params);
 
     llama_model * model = nullptr;
