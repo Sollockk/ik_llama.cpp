@@ -3657,7 +3657,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // Run a fast decode with layers skipped.  The routing data from
         // non-skipped MoE layers lets us prefetch sharp tensor data and
         // update JIT layer selection before the real blurry+JIT decode.
-        if (turbo_scout) {
+        // Only useful for generation batches — during prompt processing,
+        // all experts activate anyway, so scout provides no selectivity.
+        if (turbo_scout && batch_view.n_tokens <= 4) {
             llama_set_skip_layers(ctx, turbo_skip_layers.data(), (int32_t)turbo_skip_layers.size());
             llama_router_start_recording(ctx);
 
@@ -3774,7 +3776,18 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // ---- Tier 2: Blurry decode (all layers, with JIT sharp) ----
         // Full forward pass.  JIT mode hot-loads sharp layers during the
         // decode.  Turbo's prefetch primes the I/O so JIT reads are fast.
-        if (bs_moe_active && !bs_spec_verify) {
+        //
+        // IMPORTANT: JIT is only enabled for small batches (token generation).
+        // During prompt processing (large batches), the unique expert set
+        // across all tokens covers nearly all experts (e.g. 1782 tokens ×
+        // 8 experts/token → ~160 unique experts out of 160).  This means
+        // "selective" expert overlay reads the FULL layer data (~2 GiB),
+        // completely negating the expert-selectivity optimization.
+        // For prompt eval, just use blurry weights (fast, already in VRAM).
+        const bool jit_this_batch = bs_moe_active && !bs_spec_verify
+            && batch_view.n_tokens <= 4;  // only JIT for generation batches
+
+        if (jit_this_batch) {
             llama_blurry_sharp_start_jit(bsctx, ctx);
         }
 
@@ -3828,7 +3841,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         }
 
         // JIT mode: stop and restore
-        if (bs_moe_active && !bs_spec_verify) {
+        if (jit_this_batch) {
             llama_blurry_sharp_stop_jit(bsctx, ctx);
             llama_router_clear(ctx);
         }
