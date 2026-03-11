@@ -3655,9 +3655,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // Decode strategy:
         //
         //   Prompt processing (large batch):
-        //     Plain blurry decode, all layers, no JIT, no layer-skip.
-        //     All experts activate across many tokens, so selective I/O
-        //     gives no benefit.  Blurry weights are already in VRAM.
+        //     Layer-skip blurry decode, no JIT.  Layer-skip cuts compute
+        //     roughly in half.  JIT is disabled because all experts
+        //     activate across many tokens, negating selective I/O.
         //
         //   Token generation (small batch, ≤4 tokens):
         //     Layer-skip + JIT in a SINGLE decode pass.
@@ -3675,8 +3675,10 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         //     re-decode for comparison (handled in Tier 3 below).
         // ---------------------------------------------------------------
 
-        // Enable layer-skip for generation (with or without sharp model)
-        if (turbo_active && is_generation && !bs_spec_verify) {
+        // Enable layer-skip for all decodes (prompt + generation).
+        // Layer-skip is pure compute savings — skipped layers are not
+        // evaluated at all, cutting forward pass time roughly in half.
+        if (turbo_active && !bs_spec_verify) {
             llama_set_skip_layers(ctx, turbo_skip_layers.data(), (int32_t)turbo_skip_layers.size());
         }
 
@@ -3742,7 +3744,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         }
 
         // Disable layer skipping after decode
-        if (turbo_active && is_generation && !bs_spec_verify) {
+        if (turbo_active && !bs_spec_verify) {
             llama_set_skip_layers(ctx, nullptr, 0);
         }
 
