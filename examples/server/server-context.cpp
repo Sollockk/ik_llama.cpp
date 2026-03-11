@@ -3686,13 +3686,15 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                     }
                 }
 
+                // NOTE: we intentionally do NOT call prefetch_layers_parallel
+                // here.  That function issues MADV_WILLNEED on ALL tensors in
+                // each layer (all 160 experts), reading ~3 GiB per layer from
+                // disk.  The JIT apply_experts path now does expert-aware
+                // prefetch, reading only the ~50 MiB of expert slices actually
+                // needed.  Blanket prefetch here would defeat that optimization.
                 if (!prefetch_layers.empty()) {
-                    llama_blurry_sharp_prefetch_layers_parallel(
-                        bsctx, prefetch_layers.data(),
-                        (int32_t)prefetch_layers.size(), 4);
-
-                    LOG_VERBOSE("Turbo scout: prefetched sharp data", {
-                        {"n_layers_prefetched", (int)prefetch_layers.size()},
+                    LOG_VERBOSE("Turbo scout: identified active layers from routing", {
+                        {"n_layers_with_routing", (int)prefetch_layers.size()},
                         {"n_layers_total", n_layers_total},
                     });
                 }

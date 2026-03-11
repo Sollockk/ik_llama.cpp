@@ -4695,8 +4695,77 @@ int32_t llama_blurry_sharp_apply_experts(
     // compute kernel runs.
     bsctx->building_layer_idx = layer_idx;
 
-    // Prefetch this layer's sharp data
-    bs_prefetch_layer_mmap(bsctx, layer_idx);
+    // Prefetch only the expert slices we need, not the whole layer.
+    // For MoE models, each expert tensor (ffn_gate_exps, ffn_up_exps,
+    // ffn_down_exps) stores all N experts contiguously (e.g. 160 × 6 MiB).
+    // Issuing MADV_WILLNEED on the full tensor reads ~1 GiB per tensor,
+    // but we only need 8/160 = 5%.  Targeted prefetch reads ~50 MiB total
+    // instead of ~3 GiB — a 60× reduction in I/O.
+#ifndef _WIN32
+    for (const auto & tensor_name : layer_it->second) {
+        // RAM cache swap-in: always prefetch the full cached buffer
+        // (it's already in swap, not on disk)
+        if (bsctx->lazy_swap_enabled || bsctx->ram_cache_populated) {
+            auto cache_it = bsctx->ram_cache.find(tensor_name);
+            if (cache_it != bsctx->ram_cache.end() && !cache_it->second.empty()) {
+                if (has_expert_tensors && bs_is_expert_tensor(tensor_name)) {
+                    // Only prefetch the needed expert slices from ram_cache
+                    auto info_it = bsctx->sharp_index.find(tensor_name);
+                    if (info_it != bsctx->sharp_index.end() && info_it->second.ne[2] > 1) {
+                        size_t slice_bytes = cache_it->second.size() / (size_t)info_it->second.ne[2];
+                        for (int32_t ei = 0; ei < n_experts_req; ++ei) {
+                            size_t off = (size_t)expert_ids[ei] * slice_bytes;
+                            if (off + slice_bytes <= cache_it->second.size()) {
+                                madvise(cache_it->second.data() + off, slice_bytes, MADV_WILLNEED);
+                            }
+                        }
+                    } else {
+                        madvise(cache_it->second.data(), cache_it->second.size(), MADV_WILLNEED);
+                    }
+                } else {
+                    // Non-expert tensors (attention, norms): prefetch fully
+                    madvise(cache_it->second.data(), cache_it->second.size(), MADV_WILLNEED);
+                }
+                continue;
+            }
+        }
+
+        // mmap page prefetch: only touch expert slices we need
+        auto info_it = bsctx->sharp_index.find(tensor_name);
+        if (info_it == bsctx->sharp_index.end()) continue;
+        const auto & si = info_it->second;
+
+        int split = si.split_idx;
+        if (split < 0 || split >= (int)bsctx->sharp_mmaps.size()) continue;
+        if (!bsctx->sharp_mmaps[split]) continue;
+
+        const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[split]->addr();
+        size_t file_size = bsctx->sharp_mmaps[split]->size();
+
+        if (has_expert_tensors && bs_is_expert_tensor(tensor_name) && si.ne[2] > 1) {
+            // Targeted expert-slice prefetch: only MADV_WILLNEED the slices
+            // for the requested experts, leaving the other 152 experts on disk.
+            size_t slice_bytes = si.nbytes / (size_t)si.ne[2];
+            for (int32_t ei = 0; ei < n_experts_req; ++ei) {
+                size_t slice_off = si.file_offset + (size_t)expert_ids[ei] * slice_bytes;
+                size_t end = slice_off + slice_bytes;
+                if (end > file_size) end = file_size;
+                if (slice_off < end) {
+                    posix_madvise((void *)(mmap_base + slice_off), end - slice_off,
+                                  POSIX_MADV_WILLNEED);
+                }
+            }
+        } else {
+            // Non-expert tensors: prefetch fully (they're small)
+            size_t end = si.file_offset + si.nbytes;
+            if (end > file_size) end = file_size;
+            if (si.file_offset < end) {
+                posix_madvise((void *)(mmap_base + si.file_offset), end - si.file_offset,
+                              POSIX_MADV_WILLNEED);
+            }
+        }
+    }
+#endif
 
     // Sort tensor names by (split_idx, file_offset) for sequential disk I/O.
     std::vector<std::string> sorted_tensors(layer_it->second.begin(), layer_it->second.end());
