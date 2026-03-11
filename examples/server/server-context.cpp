@@ -3625,38 +3625,100 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         };
 
         // ---------------------------------------------------------------
-        // Blurry-sharp MoE combination modes:
+        // Three-tier inference pipeline:
         //
-        // MODE 1 (JIT, default): Per-layer hotswapping during decode.
-        //   layer N starts -> sharpen layer N (swap expert weights)
-        //   layer N ends   -> restore layer N
-        //   Only one layer's sharp data is ever resident.
+        //   Tier 1 (turbo):  layer-skip decode — fast rough logits
+        //   Tier 2 (blurry): full-layer re-decode — verify turbo output
+        //   Tier 3 (sharp):  selective overlay re-decode — highest quality
         //
-        // MODE 2 (Speculative verify, --bs-speculative): Two-pass decode.
-        //   Pass 1: decode with blurry, record router expert selections.
-        //   Sharpen selected layers/experts based on routing data.
-        //   Pass 2: re-decode same batch with sharp weights.
-        //   Compare blurry vs sharp predictions, log disagreements.
-        //   Sampling uses sharp logits for best quality output.
+        // Each tier only runs when enabled:
+        //   turbo_active:   --bs-layer-skip N  or  --bs-layer-skip-list
+        //   bs_moe_active:  --bs-moe-combination  (JIT per-layer hotswap)
+        //   bs_spec_verify: --bs-moe-combination --bs-speculative
+        //
+        // Without turbo, Tier 2 is the primary decode.
+        // Without sharp, sampling uses blurry (or turbo) logits.
+        //
+        // MoE JIT mode runs during the blurry pass (Tier 2), not the
+        // turbo pass, since JIT needs all layers to be evaluated.
         // ---------------------------------------------------------------
         const bool bs_moe_active = bs_moe_dynamic && bsctx;
         const bool bs_spec_verify = bs_moe_active && params_base.bs_speculative;
         const bool turbo_active = !turbo_skip_layers.empty();
 
-        // Turbo draft tier: enable layer skipping for fast blurry pass.
-        // This is the fastest tier in 3-tier inference:
-        //   turbo (layer-skip) → blurry (all layers) → sharp (overlay)
-        // Layer skipping is only active for the primary decode, not verification.
-        if (turbo_active && !bs_spec_verify) {
+        // ---- Tier 1: Turbo decode (layer-skip) ----
+        // Run a fast decode with layers skipped to get rough predictions.
+        // These are compared against the blurry re-decode to measure
+        // agreement and inform which layers need sharp verification.
+        bool turbo_did_run = false;
+
+        struct turbo_pred {
+            int slot_id;
+            int tok_idx;
+            llama_token turbo_best;
+        };
+        std::vector<turbo_pred> turbo_preds;
+
+        if (turbo_active) {
             llama_set_skip_layers(ctx, turbo_skip_layers.data(), (int32_t)turbo_skip_layers.size());
+
+            const int ret_turbo = llama_decode(ctx, batch_view);
+            if (ret_turbo != 0) {
+                // Turbo decode failed — fall through to blurry without turbo
+                llama_set_skip_layers(ctx, nullptr, 0);
+                LOG_WARNING("Turbo (layer-skip) decode failed, falling back to blurry-only", {
+                    {"ret", ret_turbo},
+                });
+            } else {
+                turbo_did_run = true;
+
+                // Save turbo predictions for later comparison
+                const int n_vocab = llama_n_vocab(model);
+                for (auto & slot : slots) {
+                    if (slot.state != SLOT_STATE_PROCESSING ||
+                        slot.i_batch < (int)i ||
+                        slot.i_batch >= (int)(i + n_tokens)) {
+                        continue;
+                    }
+                    if (slot.command == SLOT_COMMAND_LOAD_PROMPT) {
+                        continue;
+                    }
+
+                    const int tok_idx = slot.i_batch - i;
+                    float * logits = llama_get_logits_ith(ctx, tok_idx);
+
+                    llama_token best = 0;
+                    float best_logit = logits[0];
+                    for (int v = 1; v < n_vocab; ++v) {
+                        if (logits[v] > best_logit) {
+                            best_logit = logits[v];
+                            best = v;
+                        }
+                    }
+                    turbo_preds.push_back({ slot.id, tok_idx, best });
+                }
+
+                // Disable layer skipping and clear turbo KV entries so
+                // the blurry pass re-evaluates with all layers.
+                llama_set_skip_layers(ctx, nullptr, 0);
+
+                for (int j = 0; j < batch_view.n_tokens; ++j) {
+                    for (int s = 0; s < batch_view.n_seq_id[j]; ++s) {
+                        llama_kv_cache_seq_rm(ctx, batch_view.seq_id[j][s],
+                                              batch_view.pos[j], batch_view.pos[j] + 1);
+                    }
+                }
+            }
         }
 
-        // JIT mode: sharpen during decode (only when NOT doing speculative verify)
+        // ---- Tier 2: Blurry decode (all layers) ----
+        // Full forward pass with blurry weights.  If speculative verify
+        // is active, record router data for the sharp pass.
+        // JIT mode sharpens during this decode (not during turbo).
         if (bs_moe_active && !bs_spec_verify) {
             llama_blurry_sharp_start_jit(bsctx, ctx);
         }
 
-        // Speculative verify: record router data during blurry pass
         if (bs_spec_verify) {
             llama_router_start_recording(ctx);
         }
@@ -3711,18 +3773,47 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             llama_router_clear(ctx);
         }
 
-        // Turbo draft tier: disable layer skipping after the blurry pass.
-        // The verification pass (if any) and subsequent sampling need
-        // full-quality decode output.
-        if (turbo_active && !bs_spec_verify) {
-            llama_set_skip_layers(ctx, nullptr, 0);
+        // Log turbo vs blurry agreement when both ran
+        if (turbo_did_run && !turbo_preds.empty()) {
+            const int n_vocab = llama_n_vocab(model);
+            int n_turbo_agree = 0;
+            int n_turbo_disagree = 0;
+            for (const auto & tp : turbo_preds) {
+                float * blurry_logits = llama_get_logits_ith(ctx, tp.tok_idx);
+                llama_token blurry_best = 0;
+                float blurry_best_logit = blurry_logits[0];
+                for (int v = 1; v < n_vocab; ++v) {
+                    if (blurry_logits[v] > blurry_best_logit) {
+                        blurry_best_logit = blurry_logits[v];
+                        blurry_best = v;
+                    }
+                }
+                if (blurry_best == tp.turbo_best) {
+                    n_turbo_agree++;
+                } else {
+                    n_turbo_disagree++;
+                    LOG_VERBOSE("Turbo vs Blurry DISAGREE", {
+                        {"slot_id",  tp.slot_id},
+                        {"turbo",    common_token_to_piece(ctx, tp.turbo_best)},
+                        {"blurry",   common_token_to_piece(ctx, blurry_best)},
+                        {"turbo_id", tp.turbo_best},
+                        {"blurry_id", blurry_best},
+                    });
+                }
+            }
+            if (n_turbo_agree + n_turbo_disagree > 0) {
+                LOG_VERBOSE("Turbo vs Blurry batch", {
+                    {"agree", n_turbo_agree},
+                    {"disagree", n_turbo_disagree},
+                });
+            }
         }
 
         // ---------------------------------------------------------------
-        // Speculative verification: two-pass blurry vs sharp comparison.
+        // Tier 3: Sharp verification (speculative two-pass).
         //
-        // Pass 1 (above) decoded with blurry weights while recording
-        // which experts the MoE router selected.  Now we:
+        // The blurry pass (Tier 2) decoded while recording which experts
+        // the MoE router selected.  Now we:
         //   1. Save blurry top-1 predictions
         //   2. Sharpen only the needed layers/experts
         //   3. Clear KV entries and re-decode with sharp weights
