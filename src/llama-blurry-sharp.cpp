@@ -1481,18 +1481,28 @@ static int64_t bs_overlay_single_tensor(
     // Same-type overlays are safe (only data pointer changes, sizes match).
     // Device tensor overlays are safe (we swap the buffer directly, no
     // scheduler copy involved).
+    //
+    // EXCEPTION: tensors in plain CPU buffers (e.g. from --n-cpu-moe) are
+    // computed entirely on the CPU backend — no device copies exist for them.
+    // Cross-type overlay is safe because the CPU backend reads directly from
+    // tensor->data with the updated type/strides.
     if (tensor_is_host && bsctx->jit_active && base_tensor->type != sharp_info.type) {
-        bsctx->n_jit_host_crosstype_skipped++;
-        if (bsctx->params.verbose || bsctx->n_jit_host_crosstype_skipped <= 3) {
-            LLAMA_LOG_WARN("%s: JIT mode: skipping cross-type host tensor '%s' "
-                          "(%s -> %s, %zu -> %zu bytes). "
-                          "Increase -ngl to move this layer to GPU.\n",
-                          __func__, sharp_info.name.c_str(),
-                          ggml_type_name(base_tensor->type),
-                          ggml_type_name(sharp_info.type),
-                          ggml_nbytes(base_tensor), sharp_info.nbytes);
+        bool is_plain_cpu = base_tensor->buffer &&
+            ggml_backend_buffer_get_type(base_tensor->buffer) == ggml_backend_cpu_buffer_type();
+        if (!is_plain_cpu) {
+            bsctx->n_jit_host_crosstype_skipped++;
+            if (bsctx->params.verbose || bsctx->n_jit_host_crosstype_skipped <= 3) {
+                LLAMA_LOG_WARN("%s: JIT mode: skipping cross-type host tensor '%s' "
+                              "(%s -> %s, %zu -> %zu bytes). "
+                              "Increase -ngl to move this layer to GPU.\n",
+                              __func__, sharp_info.name.c_str(),
+                              ggml_type_name(base_tensor->type),
+                              ggml_type_name(sharp_info.type),
+                              ggml_nbytes(base_tensor), sharp_info.nbytes);
+            }
+            return -1;
         }
-        return -1;
+        // Plain CPU buffer — safe to overlay, proceeding with cross-type swap
     }
 
     if (tensor_is_host) {
@@ -4795,18 +4805,22 @@ int32_t llama_blurry_sharp_apply_experts(
         }
 
         // In JIT mode, check if this tensor would be a cross-type host
-        // overlay BEFORE doing any work.  These are expected skips (not
-        // errors) because the backend scheduler's device copies are
-        // pre-allocated at the blurry size.  Count them separately so we
-        // don't roll back the tensors that DID succeed.
+        // overlay BEFORE doing any work.  Cross-type overlays on pinned/host
+        // buffers are unsafe (scheduler device copies are pre-allocated at
+        // blurry size).  But plain CPU buffers (from --n-cpu-moe) have no
+        // device copies and are safe for cross-type overlay.
         if (bsctx->jit_active) {
             bool tih = true;
             if (base_tensor->buffer) {
                 tih = ggml_backend_buffer_is_host(base_tensor->buffer);
             }
             if (tih && base_tensor->type != sharp_info.type) {
-                n_jit_skipped++;
-                continue;  // silently skip — the overlay functions already logged
+                bool is_plain_cpu = base_tensor->buffer &&
+                    ggml_backend_buffer_get_type(base_tensor->buffer) == ggml_backend_cpu_buffer_type();
+                if (!is_plain_cpu) {
+                    n_jit_skipped++;
+                    continue;  // pinned buffer — skip to avoid device copy overflow
+                }
             }
         }
 
