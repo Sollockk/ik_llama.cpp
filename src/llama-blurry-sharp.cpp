@@ -3826,34 +3826,31 @@ static int64_t bs_overlay_expert_tensor(
         }
     }
 
-    // JIT SAFETY CHECK: when overlays are applied mid-graph-execution (JIT
-    // mode), the backend scheduler has already allocated device copy tensors
-    // at the ORIGINAL (blurry) type/size.  Cross-type overlays on host
-    // tensors would change nb[]/type, causing copy_inputs to write
-    // sharp-sized data into blurry-sized device copies → assertion failure:
-    //   "ggml_backend_tensor_set_async: tensor write out of bounds"
-    //
-    // Same-type expert overlays are safe (in-place slice overwrite, no type
-    // change).  Device tensor overlays are safe (we allocate a new device
-    // buffer directly, no scheduler copy involved).
+    // JIT SAFETY CHECK: cross-type overlays on pinned/host buffers are unsafe
+    // (scheduler device copies pre-allocated at blurry size).  But plain CPU
+    // buffers (from --n-cpu-moe) have no device copies — safe to overlay.
     {
         bool tensor_is_host = true;
         if (base_tensor->buffer) {
             tensor_is_host = ggml_backend_buffer_is_host(base_tensor->buffer);
         }
         if (tensor_is_host && bsctx->jit_active && base_tensor->type != sharp_info.type) {
-            bsctx->n_jit_host_crosstype_skipped++;
-            if (bsctx->params.verbose || bsctx->n_jit_host_crosstype_skipped <= 3) {
-                LLAMA_LOG_WARN("%s: JIT mode: skipping cross-type host expert tensor '%s' "
-                              "(%s -> %s, %zu -> %zu bytes, %d experts requested). "
-                              "Increase -ngl to move this layer to GPU.\n",
-                              __func__, sharp_info.name.c_str(),
-                              ggml_type_name(base_tensor->type),
-                              ggml_type_name(sharp_info.type),
-                              ggml_nbytes(base_tensor), sharp_info.nbytes,
-                              n_experts_req);
+            bool is_plain_cpu = base_tensor->buffer &&
+                ggml_backend_buffer_get_type(base_tensor->buffer) == ggml_backend_cpu_buffer_type();
+            if (!is_plain_cpu) {
+                bsctx->n_jit_host_crosstype_skipped++;
+                if (bsctx->params.verbose || bsctx->n_jit_host_crosstype_skipped <= 3) {
+                    LLAMA_LOG_WARN("%s: JIT mode: skipping cross-type host expert tensor '%s' "
+                                  "(%s -> %s, %zu -> %zu bytes, %d experts requested). "
+                                  "Increase -ngl to move this layer to GPU.\n",
+                                  __func__, sharp_info.name.c_str(),
+                                  ggml_type_name(base_tensor->type),
+                                  ggml_type_name(sharp_info.type),
+                                  ggml_nbytes(base_tensor), sharp_info.nbytes,
+                                  n_experts_req);
+                }
+                return -1;
             }
-            return -1;
         }
     }
 
