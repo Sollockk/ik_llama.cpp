@@ -2,7 +2,7 @@
 
 An experimental fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) that adds a **blurry-sharp overlay system** for running massive MoE models (e.g. GLM-4 253B, 160 experts) on a Nvidia 3090 24gb vram + 64gb of ram.
 
-Disclaimer: Written hacky and fast with Claude Opus. Needs some reworking before any attempts at a PR. Description also written by Claude, it may not be 100% accurate.
+Disclaimer: Written hacky and fast with Claude Opus. Needs some reworking before any attempts at a PR. The description was also written by Claude, it may not be 100% accurate.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
