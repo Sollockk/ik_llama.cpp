@@ -590,6 +590,10 @@ extern "C" {
 
     LLAMA_API int32_t llama_n_layer    (const struct llama_model * model);
 
+    // Override the number of experts used per token for MoE models.
+    // 0 = use model default.  Reduces compute by n_expert_used_old/n_expert_used_new.
+    LLAMA_API void llama_model_set_n_expert_used(struct llama_model * model, int32_t n_expert_used);
+
     // Compat
     LLAMA_API bool        llama_vocab_get_add_bos(const struct llama_vocab * vocab);
     LLAMA_API bool        llama_vocab_get_add_eos(const struct llama_vocab * vocab);

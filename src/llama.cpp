@@ -5660,6 +5660,18 @@ int32_t llama_n_layer(const struct llama_model * model) {
     return model->hparams.n_layer;
 }
 
+void llama_model_set_n_expert_used(struct llama_model * model, int32_t n_expert_used) {
+    if (n_expert_used <= 0) return;
+    if ((uint32_t)n_expert_used > model->hparams.n_expert) {
+        LLAMA_LOG_WARN("%s: n_expert_used %d exceeds n_expert %u, clamping\n",
+                      __func__, n_expert_used, model->hparams.n_expert);
+        n_expert_used = (int32_t)model->hparams.n_expert;
+    }
+    LLAMA_LOG_INFO("%s: overriding n_expert_used: %u -> %d\n",
+                  __func__, model->hparams.n_expert_used, n_expert_used);
+    model->hparams.n_expert_used = (uint32_t)n_expert_used;
+}
+
 float llama_rope_freq_scale_train(const struct llama_model * model) {
     return model->hparams.rope_freq_scale_train;
 }

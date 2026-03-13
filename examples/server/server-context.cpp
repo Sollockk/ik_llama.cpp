@@ -73,6 +73,11 @@ bool server_context::load_model(const gpt_params& params_) {
 
     n_ctx = llama_n_ctx(ctx);
 
+    // Apply MoE top-k override if requested (reduces experts per token)
+    if (params_base.bs_moe_top_k_override > 0) {
+        llama_model_set_n_expert_used(model, params_base.bs_moe_top_k_override);
+    }
+
     add_bos_token = llama_should_add_bos_token(model);
     has_eos_token = llama_add_eos_token(model) != 1;
 
