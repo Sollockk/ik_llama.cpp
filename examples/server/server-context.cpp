@@ -382,26 +382,42 @@ bool server_context::load_model(const gpt_params& params_) {
     // This gives roughly 2x speedup on the blurry model for drafting.
     // -----------------------------------------------------------------------
     if (!params_base.bs_layer_skip_list.empty()) {
-        // Explicit list provided
+        // Explicit list provided — use same pattern for both prompt and generation
         turbo_skip_layers.assign(
             params_base.bs_layer_skip_list.begin(),
             params_base.bs_layer_skip_list.end());
+        turbo_skip_layers_prompt = turbo_skip_layers;
         LOG_INFO("Turbo draft tier: explicit layer-skip list", {
             {"n_skip", (int)turbo_skip_layers.size()},
         });
     } else if (params_base.bs_layer_skip > 0) {
-        // Auto-generate: keep first/last N, skip every other middle layer
         const int n_layers_total = llama_n_layer(model);
         const int keep = params_base.bs_layer_skip;
+
+        // Generation pattern: skip every other middle layer (~50% skip)
         for (int il = keep; il < n_layers_total - keep; ++il) {
-            if (il % 2 == 1) {  // skip odd-indexed middle layers
+            if (il % 2 == 1) {
                 turbo_skip_layers.push_back(il);
             }
         }
+
+        // Prompt pattern: keep only every 4th middle layer (~75% skip)
+        // Prompt eval just builds the KV cache — quality matters less.
+        // JIT layer selection happens at generation time via the router,
+        // so aggressive prompt skipping doesn't affect sharp overlay.
+        for (int il = keep; il < n_layers_total - keep; ++il) {
+            if (il % 4 != 0) {  // keep layers 0,4,8,12,... in the middle
+                turbo_skip_layers_prompt.push_back(il);
+            }
+        }
+
         LOG_INFO("Turbo draft tier: auto layer-skip", {
             {"n_layers_total", n_layers_total},
             {"keep_first_last", keep},
-            {"n_skip", (int)turbo_skip_layers.size()},
+            {"n_skip_generation", (int)turbo_skip_layers.size()},
+            {"n_skip_prompt", (int)turbo_skip_layers_prompt.size()},
+            {"n_eval_generation", n_layers_total - (int)turbo_skip_layers.size()},
+            {"n_eval_prompt", n_layers_total - (int)turbo_skip_layers_prompt.size()},
         });
     }
 
@@ -3676,10 +3692,12 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // ---------------------------------------------------------------
 
         // Enable layer-skip for all decodes (prompt + generation).
-        // Layer-skip is pure compute savings — skipped layers are not
-        // evaluated at all, cutting forward pass time roughly in half.
+        // Prompt processing uses aggressive skip (~75% of middle layers)
+        // since it only builds KV cache.  Generation uses moderate skip
+        // (~50%) for better quality output.
         if (turbo_active && !bs_spec_verify) {
-            llama_set_skip_layers(ctx, turbo_skip_layers.data(), (int32_t)turbo_skip_layers.size());
+            const auto & skip = is_generation ? turbo_skip_layers : turbo_skip_layers_prompt;
+            llama_set_skip_layers(ctx, skip.data(), (int32_t)skip.size());
         }
 
         // Enable JIT sharp overlay for generation when sharp model exists
@@ -3693,7 +3711,26 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             llama_router_start_recording(ctx);
         }
 
+        const int64_t t_decode_start = ggml_time_us();
+        LOG_VERBOSE("decode starting", {
+            {"n_tokens", batch_view.n_tokens},
+            {"is_generation", is_generation},
+            {"turbo_active", turbo_active},
+            {"jit_active", jit_this_batch},
+            {"n_skip_layers", turbo_active ? (int)(is_generation ? turbo_skip_layers.size() : turbo_skip_layers_prompt.size()) : 0},
+        });
+
         const int ret = llama_decode(ctx, batch_view);
+        const double t_decode_ms = (ggml_time_us() - t_decode_start) / 1000.0;
+        if (ret == 0) {
+            LOG_INFO("decode complete", {
+                {"n_tokens", batch_view.n_tokens},
+                {"t_ms", t_decode_ms},
+                {"t_per_token_ms", t_decode_ms / std::max(1, batch_view.n_tokens)},
+                {"is_generation", is_generation},
+                {"jit_active", jit_this_batch},
+            });
+        }
         if (ret != 0) {
             if (bs_spec_verify) {
                 llama_router_stop_recording(ctx);

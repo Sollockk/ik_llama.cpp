@@ -28,7 +28,7 @@
 // TODO: fix this include
 #include "iqk/iqk_quantize.h"
 
-#define IK_PRINT_TIMING 0
+#define IK_PRINT_TIMING 1
 
 #ifdef GGML_USE_RPC
 #  include "ggml-rpc.h"

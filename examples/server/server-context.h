@@ -241,8 +241,10 @@ struct server_context {
     bool bs_moe_dynamic = false;  // true when MoE combination mode is active
 
     // Layer skipping for "turbo" draft tier in 3-tier blurry-sharp.
-    // When non-empty, these layers are skipped during draft decodes for speed.
-    std::vector<int32_t> turbo_skip_layers;
+    // Generation skip: moderate (every other middle layer skipped).
+    // Prompt skip: aggressive (keep every 4th middle layer) for fast prompt eval.
+    std::vector<int32_t> turbo_skip_layers;        // generation pattern
+    std::vector<int32_t> turbo_skip_layers_prompt;  // aggressive prompt pattern
 
     int32_t n_ctx; // total context for all clients / slots
 
