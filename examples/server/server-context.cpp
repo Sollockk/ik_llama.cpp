@@ -3681,12 +3681,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         //     activate across many tokens, negating selective I/O.
         //
         //   Token generation (small batch, ≤4 tokens):
-        //     Layer-skip + JIT in a SINGLE decode pass.
-        //     - Skipped layers are not evaluated at all (fast).
-        //     - Non-skipped layers get JIT sharp overlay (high quality).
-        //     - Only 8/160 expert slices read per layer (~50 MiB vs 3 GiB).
-        //     This gives turbo-level speed with sharp-level quality on
-        //     the layers that matter.
+        //     ALL layers evaluated (no skip) + JIT sharp overlay.
+        //     Every layer gets sharp expert weights for maximum quality.
+        //     Only 8/160 expert slices read per layer (~150 MiB vs 2.3 GiB).
         //
         //   Turbo-only (layer-skip, no sharp model):
         //     Layer-skip decode for speed, no JIT overlay.
@@ -3696,13 +3693,10 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         //     re-decode for comparison (handled in Tier 3 below).
         // ---------------------------------------------------------------
 
-        // Enable layer-skip for all decodes (prompt + generation).
-        // Prompt processing uses aggressive skip (~75% of middle layers)
-        // since it only builds KV cache.  Generation uses moderate skip
-        // (~50%) for better quality output.
-        if (turbo_active && !bs_spec_verify) {
-            const auto & skip = is_generation ? turbo_skip_layers : turbo_skip_layers_prompt;
-            llama_set_skip_layers(ctx, skip.data(), (int32_t)skip.size());
+        // Layer-skip only during prompt processing (not generation).
+        // Generation runs all layers with JIT sharp for maximum quality.
+        if (turbo_active && !bs_spec_verify && !is_generation) {
+            llama_set_skip_layers(ctx, turbo_skip_layers_prompt.data(), (int32_t)turbo_skip_layers_prompt.size());
         }
 
         // Enable JIT sharp overlay for generation when sharp model exists
@@ -3722,7 +3716,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             {"is_generation", is_generation},
             {"turbo_active", turbo_active},
             {"jit_active", jit_this_batch},
-            {"n_skip_layers", turbo_active ? (int)(is_generation ? turbo_skip_layers.size() : turbo_skip_layers_prompt.size()) : 0},
+            {"n_skip_layers", (turbo_active && !is_generation) ? (int)turbo_skip_layers_prompt.size() : 0},
         });
 
         const int ret = llama_decode(ctx, batch_view);
@@ -3785,8 +3779,8 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             llama_router_clear(ctx);
         }
 
-        // Disable layer skipping after decode
-        if (turbo_active && !bs_spec_verify) {
+        // Disable layer skipping after decode (only set for prompt)
+        if (turbo_active && !bs_spec_verify && !is_generation) {
             llama_set_skip_layers(ctx, nullptr, 0);
         }
 
