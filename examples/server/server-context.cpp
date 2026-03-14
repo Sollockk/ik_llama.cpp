@@ -3699,8 +3699,10 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             llama_set_skip_layers(ctx, turbo_skip_layers_prompt.data(), (int32_t)turbo_skip_layers_prompt.size());
         }
 
-        // Enable JIT sharp overlay for generation when sharp model exists
-        const bool jit_this_batch = bs_moe_active && !bs_spec_verify && is_generation;
+        // Enable JIT sharp overlay for all decodes (prompt + generation)
+        // Sharp overlay during prompt processing improves KV cache quality,
+        // which is critical for longer contexts.
+        const bool jit_this_batch = bs_moe_active && !bs_spec_verify;
         if (jit_this_batch) {
             llama_blurry_sharp_start_jit(bsctx, ctx);
         }

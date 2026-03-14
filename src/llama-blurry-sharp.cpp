@@ -1492,9 +1492,10 @@ static int64_t bs_overlay_single_tensor(
         if (!is_plain_cpu) {
             bsctx->n_jit_host_crosstype_skipped++;
             if (bsctx->params.verbose || bsctx->n_jit_host_crosstype_skipped <= 3) {
-                LLAMA_LOG_WARN("%s: JIT mode: skipping cross-type host tensor '%s' "
-                              "(%s -> %s, %zu -> %zu bytes). "
-                              "Increase -ngl to move this layer to GPU.\n",
+                LLAMA_LOG_WARN("%s: JIT mode: CUDA host/pinned buffer — cross-type overlay skipped for '%s' "
+                              "(%s -> %s, %zu -> %zu bytes). This tensor uses BLURRY weights. "
+                              "Fix: use --n-cpu-moe to place on plain CPU (supports cross-type), "
+                              "or increase -ngl to keep on GPU.\n",
                               __func__, sharp_info.name.c_str(),
                               ggml_type_name(base_tensor->type),
                               ggml_type_name(sharp_info.type),
@@ -1868,11 +1869,27 @@ static int64_t bs_overlay_single_tensor(
         }
 
         ggml_backend_buffer_t sharp_buf = ggml_backend_buft_alloc_buffer(buft, alloc_size);
+        bool using_pinned_fallback = false;
+
         if (!sharp_buf) {
-            LLAMA_LOG_ERROR("%s: failed to allocate device buffer (%zu bytes, padded from %zu) for tensor '%s'\n",
-                           __func__, alloc_size, sharp_info.nbytes, sharp_info.name.c_str());
-            bsctx->n_device_tensors_skipped++;
-            return -1;
+            // VRAM exhausted — try pinned host memory (GPU-accessible via UVA)
+            ggml_backend_buffer_type_t pinned_buft = llama_default_buffer_type_cpu(true);
+            if (pinned_buft && pinned_buft != ggml_backend_cpu_buffer_type()) {
+                sharp_buf = ggml_backend_buft_alloc_buffer(pinned_buft, sharp_info.nbytes);
+            }
+            if (!sharp_buf) {
+                sharp_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), sharp_info.nbytes);
+            }
+            if (!sharp_buf) {
+                LLAMA_LOG_ERROR("%s: failed to allocate device or pinned buffer (%zu bytes) for tensor '%s'\n",
+                               __func__, alloc_size, sharp_info.name.c_str());
+                bsctx->n_device_tensors_skipped++;
+                return -1;
+            }
+            using_pinned_fallback = true;
+            LLAMA_LOG_WARN("%s: VRAM exhausted for tensor '%s' (%zu bytes), "
+                          "using pinned host memory (sharp quality, PCIe speed)\n",
+                          __func__, sharp_info.name.c_str(), alloc_size);
         }
 
         // Mark the buffer as holding weight data so the backend scheduler
@@ -1882,9 +1899,14 @@ static int64_t bs_overlay_single_tensor(
         // which can mis-assign operations or fail to create graph splits.
         ggml_backend_buffer_set_usage(sharp_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-        // Zero the entire device buffer so that padding bytes beyond the
+        // Zero the entire buffer so that padding bytes beyond the
         // tensor data are 0, not uninitialised garbage / NaN.
-        ggml_backend_buffer_clear(sharp_buf, 0);
+        if (!using_pinned_fallback) {
+            ggml_backend_buffer_clear(sharp_buf, 0);
+        } else {
+            void * buf_base = ggml_backend_buffer_get_base(sharp_buf);
+            memset(buf_base, 0, sharp_info.nbytes);
+        }
 
         // b) Read sharp data into staging buffer for GPU upload.
         //    Uses optimized path: mmap → pinned directly when possible,
@@ -1946,17 +1968,20 @@ static int64_t bs_overlay_single_tensor(
         // points at the original device allocation.
         base_tensor->extra = nullptr;
 
-        // Copy CPU staging data → device via the backend's set_tensor
-        ggml_backend_tensor_set(base_tensor, staging_src, 0, sharp_info.nbytes);
+        // Copy sharp data into the buffer
+        if (using_pinned_fallback) {
+            // Pinned/CPU buffer — direct memcpy (GPU reads via UVA/PCIe)
+            void * buf_base = ggml_backend_buffer_get_base(sharp_buf);
+            memcpy(buf_base, staging_src, sharp_info.nbytes);
+        } else {
+            // Device buffer — upload via backend's set_tensor (H2D copy)
+            ggml_backend_tensor_set(base_tensor, staging_src, 0, sharp_info.nbytes);
+        }
 
-        // --- Post-copy device readback verification (verbose only) ---
-        // Read back a small chunk from the device and compare against the
-        // source staging buffer to confirm the H2D copy was correct.
-        // This catches silent DMA failures, wrong-pointer copies, and
-        // pinned-staging corruption issues.
-        if (bsctx->params.verbose) {
+        // --- Post-copy device readback verification (verbose only, device path) ---
+        if (bsctx->params.verbose && !using_pinned_fallback) {
             const size_t verify_bytes = std::min<size_t>(64, sharp_info.nbytes);
-            std::vector<uint8_t> readback(verify_bytes, 0xAA);  // sentinel fill
+            std::vector<uint8_t> readback(verify_bytes, 0xAA);
             ggml_backend_tensor_get(base_tensor, readback.data(), 0, verify_bytes);
 
             bool mismatch = false;
@@ -1992,8 +2017,10 @@ static int64_t bs_overlay_single_tensor(
                           mismatch ? "FAIL" : "ok");
         }
 
-        // Track GPU memory usage (track the actual allocation, not just data)
-        bsctx->current_device_sharp_bytes += (int64_t)alloc_size;
+        // Track GPU memory usage (only for actual device buffers)
+        if (!using_pinned_fallback) {
+            bsctx->current_device_sharp_bytes += (int64_t)alloc_size;
+        }
 
         // If retaining, store this buffer in the cache for future reuse
         if (bsctx->retain_device_buffers) {
@@ -2163,14 +2190,36 @@ static int64_t bs_overlay_single_tensor_permanent(
             if (alloc_size < sharp_info.nbytes) alloc_size = sharp_info.nbytes;
 
             ggml_backend_buffer_t sharp_buf = ggml_backend_buft_alloc_buffer(device_buft, alloc_size);
+            bool perm_using_pinned = false;
+
             if (!sharp_buf) {
-                LLAMA_LOG_ERROR("%s: failed to allocate device buffer (%zu bytes) for permanent overlay of '%s'\n",
-                               __func__, alloc_size, sharp_info.name.c_str());
-                return -1;
+                // VRAM exhausted — try pinned host memory
+                ggml_backend_buffer_type_t pinned_buft = llama_default_buffer_type_cpu(true);
+                if (pinned_buft && pinned_buft != ggml_backend_cpu_buffer_type()) {
+                    sharp_buf = ggml_backend_buft_alloc_buffer(pinned_buft, sharp_info.nbytes);
+                }
+                if (!sharp_buf) {
+                    sharp_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), sharp_info.nbytes);
+                }
+                if (!sharp_buf) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate device or pinned buffer (%zu bytes) "
+                                   "for permanent overlay of '%s'\n",
+                                   __func__, alloc_size, sharp_info.name.c_str());
+                    return -1;
+                }
+                perm_using_pinned = true;
+                LLAMA_LOG_WARN("%s: VRAM exhausted for permanent overlay '%s' (%zu bytes), "
+                              "using pinned host memory (sharp quality, PCIe speed)\n",
+                              __func__, sharp_info.name.c_str(), alloc_size);
             }
 
             ggml_backend_buffer_set_usage(sharp_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            ggml_backend_buffer_clear(sharp_buf, 0);
+            if (!perm_using_pinned) {
+                ggml_backend_buffer_clear(sharp_buf, 0);
+            } else {
+                void * buf_base = ggml_backend_buffer_get_base(sharp_buf);
+                memset(buf_base, 0, sharp_info.nbytes);
+            }
 
             // Read sharp data into staging
             const void * staging_src = bs_read_to_staging(bsctx, sharp_info);
@@ -2192,19 +2241,24 @@ static int64_t bs_overlay_single_tensor_permanent(
             base_tensor->view_src = nullptr;
             base_tensor->extra    = nullptr;
 
-            // Upload sharp data
-            ggml_backend_tensor_set(base_tensor, staging_src, 0, sharp_info.nbytes);
+            // Copy sharp data into buffer
+            if (perm_using_pinned) {
+                memcpy(sharp_base, staging_src, sharp_info.nbytes);
+            } else {
+                ggml_backend_tensor_set(base_tensor, staging_src, 0, sharp_info.nbytes);
+            }
 
             // Track the new buffer in device_cache so it gets freed on context destruction.
-            // We use the cache as an ownership list, not for restore (permanent mode).
             blurry_sharp_device_cache_entry entry;
             entry.buffer       = sharp_buf;
-            entry.nbytes       = alloc_size;
+            entry.nbytes       = perm_using_pinned ? sharp_info.nbytes : alloc_size;
             entry.populated    = true;
             entry.use_sequence = bsctx->cache_use_counter++;
             entry.layer_idx    = sharp_info.layer_idx;
             bsctx->device_cache[sharp_info.name] = entry;
-            bsctx->device_cache_bytes += (int64_t)alloc_size;
+            if (!perm_using_pinned) {
+                bsctx->device_cache_bytes += (int64_t)alloc_size;
+            }
 
             if (bsctx->params.verbose) {
                 LLAMA_LOG_INFO("%s: permanent new-buffer overlay '%s' (%s → %s, %zu bytes)\n",
@@ -2745,7 +2799,11 @@ int32_t llama_blurry_sharp_apply_layer(
     // blurry than to have it in a mixed/corrupt state.
     if (any_failed) {
         LLAMA_LOG_WARN("%s: layer %d had %d tensor failures — rolling back %d "
-                      "successful overlays to prevent mixed-quant corruption\n",
+                      "successful overlays to prevent mixed-quant corruption. "
+                      "This layer will run with BLURRY (low-quality) weights. "
+                      "To fix: increase --n-cpu-moe to cover this layer (CPU path "
+                      "uses zero-copy mmap, no extra memory needed), or free VRAM "
+                      "with lower -c, -ctk q8_0, or fewer -ngl.\n",
                       __func__, layer_idx,
                       (int)(layer_it->second.size() - layer_backup.tensor_backups.size()),
                       (int)layer_backup.tensor_backups.size());
@@ -3840,9 +3898,11 @@ static int64_t bs_overlay_expert_tensor(
             if (!is_plain_cpu) {
                 bsctx->n_jit_host_crosstype_skipped++;
                 if (bsctx->params.verbose || bsctx->n_jit_host_crosstype_skipped <= 3) {
-                    LLAMA_LOG_WARN("%s: JIT mode: skipping cross-type host expert tensor '%s' "
+                    LLAMA_LOG_WARN("%s: JIT mode: CUDA host/pinned buffer — cross-type expert overlay skipped for '%s' "
                                   "(%s -> %s, %zu -> %zu bytes, %d experts requested). "
-                                  "Increase -ngl to move this layer to GPU.\n",
+                                  "This tensor uses BLURRY weights. "
+                                  "Fix: use --n-cpu-moe to place on plain CPU (supports cross-type), "
+                                  "or increase -ngl to keep on GPU.\n",
                                   __func__, sharp_info.name.c_str(),
                                   ggml_type_name(base_tensor->type),
                                   ggml_type_name(sharp_info.type),
@@ -4453,146 +4513,293 @@ static int64_t bs_overlay_expert_tensor(
                 }
 
                 // Re-check after eviction
-                if (bsctx->params.gpu_budget_bytes > 0 &&
-                    (effective_device_bytes + (int64_t)alloc_size) > bsctx->params.gpu_budget_bytes) {
-                    if (bsctx->params.verbose) {
-                        LLAMA_LOG_WARN("%s: GPU budget exceeded, skipping device expert tensor '%s' "
-                                      "(need %zu, budget %" PRId64 ", used %" PRId64 ")\n",
-                                      __func__, sharp_info.name.c_str(),
-                                      alloc_size, bsctx->params.gpu_budget_bytes,
-                                      effective_device_bytes);
-                    }
-                    bsctx->n_device_tensors_skipped++;
-                    return -1;
+                bool budget_exceeded = bsctx->params.gpu_budget_bytes > 0 &&
+                    (effective_device_bytes + (int64_t)alloc_size) > bsctx->params.gpu_budget_bytes;
+                if (budget_exceeded && bsctx->params.verbose) {
+                    LLAMA_LOG_WARN("%s: GPU budget exceeded for device expert tensor '%s' "
+                                  "(need %zu, budget %" PRId64 ", used %" PRId64 "), "
+                                  "will try pinned host fallback\n",
+                                  __func__, sharp_info.name.c_str(),
+                                  alloc_size, bsctx->params.gpu_budget_bytes,
+                                  effective_device_bytes);
                 }
+                if (budget_exceeded) goto pinned_expert_fallback;
             }
 
-            ggml_backend_buffer_t sharp_buf = ggml_backend_buft_alloc_buffer(device_buft, alloc_size);
-            if (!sharp_buf) {
-                LLAMA_LOG_ERROR("%s: failed to allocate device buffer (%zu bytes) "
-                               "for combination expert tensor '%s'\n",
-                               __func__, alloc_size, sharp_info.name.c_str());
-                bsctx->n_device_tensors_skipped++;
-                return -1;
-            }
-
-            ggml_backend_buffer_set_usage(sharp_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            ggml_backend_buffer_clear(sharp_buf, 0);
-
-            // Pointer-swap to new buffer
-            backup_out.original_buffer     = base_tensor->buffer;
-            backup_out.device_sharp_buffer = sharp_buf;
-
-            void * sharp_base = ggml_backend_buffer_get_base(sharp_buf);
-            base_tensor->data     = sharp_base;
-            base_tensor->buffer   = sharp_buf;
-            base_tensor->type     = sharp_info.type;
-            base_tensor->nb[0]    = ggml_type_size(sharp_info.type);
-            base_tensor->nb[1]    = base_tensor->nb[0] * (base_tensor->ne[0] / ggml_blck_size(sharp_info.type));
-            base_tensor->nb[2]    = base_tensor->nb[1] * base_tensor->ne[1];
-            base_tensor->nb[3]    = base_tensor->nb[2] * base_tensor->ne[2];
-            base_tensor->view_src = nullptr;
-            base_tensor->extra    = nullptr;
-
-            // Upload only the selected expert slices (not the entire tensor)
-            int si_idx = sharp_info.split_idx;
-            int64_t total_sharp_bytes_read = 0;
-
-            for (int32_t i = 0; i < n_experts_req; ++i) {
-                int32_t eidx = expert_ids[i];
-                size_t slice_file_offset = sharp_info.file_offset + (size_t)eidx * sharp_expert_slice;
-                size_t slice_buf_offset  = (size_t)eidx * sharp_expert_slice;
-
-                bool have_mmap = (si_idx >= 0 && si_idx < (int)bsctx->sharp_mmaps.size()
-                                  && bsctx->sharp_mmaps[si_idx]);
-                const void * src_data = nullptr;
-
-                // RAM cache: fastest path (swap-backed anonymous pages)
-                if (bsctx->ram_cache_populated) {
-                    auto rc_it = bsctx->ram_cache.find(sharp_info.name);
-                    if (rc_it != bsctx->ram_cache.end() && rc_it->second.size() >= sharp_info.nbytes) {
-                        size_t slice_cache_offset = (size_t)eidx * sharp_expert_slice;
-                        if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
-                            memcpy(bsctx->pinned_staging_ptr,
-                                   rc_it->second.data() + slice_cache_offset,
-                                   sharp_expert_slice);
-                            src_data = bsctx->pinned_staging_ptr;
-                        } else {
-                            src_data = rc_it->second.data() + slice_cache_offset;
+            {
+                ggml_backend_buffer_t sharp_buf = ggml_backend_buft_alloc_buffer(device_buft, alloc_size);
+                if (!sharp_buf) {
+                    // OOM on device — try LRU eviction then retry once
+                    if (bsctx->retain_device_buffers && !bsctx->device_cache.empty()) {
+                        int64_t needed = (int64_t)alloc_size;
+                        int64_t freed = 0;
+                        bool synced = false;
+                        while (freed < needed && !bsctx->device_cache.empty()) {
+                            auto lru_it = bsctx->device_cache.end();
+                            uint64_t min_seq = UINT64_MAX;
+                            for (auto it = bsctx->device_cache.begin(); it != bsctx->device_cache.end(); ++it) {
+                                if (it->second.buffer && it->second.use_sequence < min_seq) {
+                                    bool in_use = false;
+                                    if (it->second.layer_idx >= 0) {
+                                        if (it->second.layer_idx == bsctx->building_layer_idx) in_use = true;
+                                        auto lb_it = bsctx->layer_backups.find(it->second.layer_idx);
+                                        if (lb_it != bsctx->layer_backups.end() && lb_it->second.is_sharpened) in_use = true;
+                                    }
+                                    if (!in_use) {
+                                        min_seq = it->second.use_sequence;
+                                        lru_it = it;
+                                    }
+                                }
+                            }
+                            if (lru_it == bsctx->device_cache.end()) break;
+                            if (!synced) { bs_sync_device_before_eviction(bsctx); synced = true; }
+                            freed += (int64_t)lru_it->second.nbytes;
+                            bsctx->device_cache_bytes -= (int64_t)lru_it->second.nbytes;
+                            ggml_backend_buffer_free(lru_it->second.buffer);
+                            bsctx->device_cache.erase(lru_it);
+                            bsctx->n_cache_evictions++;
                         }
+                        // Retry allocation after eviction
+                        sharp_buf = ggml_backend_buft_alloc_buffer(device_buft, alloc_size);
+                    }
+                    if (!sharp_buf) {
+                        LLAMA_LOG_WARN("%s: VRAM exhausted for expert tensor '%s' (%zu bytes), "
+                                      "falling back to pinned host memory (sharp quality, PCIe speed)\n",
+                                      __func__, sharp_info.name.c_str(), alloc_size);
+                        goto pinned_expert_fallback;
                     }
                 }
 
-                if (!src_data && have_mmap) {
-                    const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si_idx]->addr();
-                    if (slice_file_offset + sharp_expert_slice <= bsctx->sharp_mmaps[si_idx]->size()) {
+                ggml_backend_buffer_set_usage(sharp_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                ggml_backend_buffer_clear(sharp_buf, 0);
+
+                // Pointer-swap to new device buffer
+                backup_out.original_buffer     = base_tensor->buffer;
+                backup_out.device_sharp_buffer = sharp_buf;
+
+                void * sharp_base = ggml_backend_buffer_get_base(sharp_buf);
+                base_tensor->data     = sharp_base;
+                base_tensor->buffer   = sharp_buf;
+                base_tensor->type     = sharp_info.type;
+                base_tensor->nb[0]    = ggml_type_size(sharp_info.type);
+                base_tensor->nb[1]    = base_tensor->nb[0] * (base_tensor->ne[0] / ggml_blck_size(sharp_info.type));
+                base_tensor->nb[2]    = base_tensor->nb[1] * base_tensor->ne[1];
+                base_tensor->nb[3]    = base_tensor->nb[2] * base_tensor->ne[2];
+                base_tensor->view_src = nullptr;
+                base_tensor->extra    = nullptr;
+
+                // Upload only the selected expert slices (not the entire tensor)
+                int si_idx = sharp_info.split_idx;
+                int64_t total_sharp_bytes_read = 0;
+
+                for (int32_t i = 0; i < n_experts_req; ++i) {
+                    int32_t eidx = expert_ids[i];
+                    size_t slice_file_offset = sharp_info.file_offset + (size_t)eidx * sharp_expert_slice;
+                    size_t slice_buf_offset  = (size_t)eidx * sharp_expert_slice;
+
+                    bool have_mmap = (si_idx >= 0 && si_idx < (int)bsctx->sharp_mmaps.size()
+                                      && bsctx->sharp_mmaps[si_idx]);
+                    const void * src_data = nullptr;
+
+                    // RAM cache: fastest path (swap-backed anonymous pages)
+                    if (bsctx->ram_cache_populated) {
+                        auto rc_it = bsctx->ram_cache.find(sharp_info.name);
+                        if (rc_it != bsctx->ram_cache.end() && rc_it->second.size() >= sharp_info.nbytes) {
+                            size_t slice_cache_offset = (size_t)eidx * sharp_expert_slice;
+                            if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
+                                memcpy(bsctx->pinned_staging_ptr,
+                                       rc_it->second.data() + slice_cache_offset,
+                                       sharp_expert_slice);
+                                src_data = bsctx->pinned_staging_ptr;
+                            } else {
+                                src_data = rc_it->second.data() + slice_cache_offset;
+                            }
+                        }
+                    }
+
+                    if (!src_data && have_mmap) {
+                        const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si_idx]->addr();
+                        if (slice_file_offset + sharp_expert_slice <= bsctx->sharp_mmaps[si_idx]->size()) {
+                            if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
+                                memcpy(bsctx->pinned_staging_ptr, mmap_base + slice_file_offset, sharp_expert_slice);
+                                src_data = bsctx->pinned_staging_ptr;
+                            } else {
+                                src_data = mmap_base + slice_file_offset;
+                            }
+                            bs_release_mmap_pages(bsctx, mmap_base + slice_file_offset, sharp_expert_slice);
+                        } else {
+                            LLAMA_LOG_ERROR("%s: mmap OOB for expert %d of device tensor '%s'\n",
+                                           __func__, eidx, sharp_info.name.c_str());
+                            ggml_backend_buffer_free(sharp_buf);
+                            return -1;
+                        }
+                    }
+
+                    if (!src_data && si_idx >= 0 && si_idx < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si_idx]) {
+                        bsctx->read_buf.resize(sharp_expert_slice);
+                        bsctx->sharp_files[si_idx]->seek(slice_file_offset, SEEK_SET);
+                        bsctx->sharp_files[si_idx]->read_raw(bsctx->read_buf.data(), sharp_expert_slice);
                         if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
-                            memcpy(bsctx->pinned_staging_ptr, mmap_base + slice_file_offset, sharp_expert_slice);
+                            memcpy(bsctx->pinned_staging_ptr, bsctx->read_buf.data(), sharp_expert_slice);
                             src_data = bsctx->pinned_staging_ptr;
                         } else {
-                            src_data = mmap_base + slice_file_offset;
+                            src_data = bsctx->read_buf.data();
                         }
-                        bs_release_mmap_pages(bsctx, mmap_base + slice_file_offset, sharp_expert_slice);
-                    } else {
-                        LLAMA_LOG_ERROR("%s: mmap OOB for expert %d of device tensor '%s'\n",
-                                       __func__, eidx, sharp_info.name.c_str());
+                    }
+
+                    if (!src_data) {
+                        LLAMA_LOG_ERROR("%s: no data source for split %d (device tensor '%s' expert %d)\n",
+                                       __func__, si_idx, sharp_info.name.c_str(), eidx);
                         ggml_backend_buffer_free(sharp_buf);
                         return -1;
                     }
-                }
 
-                if (!src_data && si_idx >= 0 && si_idx < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si_idx]) {
-                    bsctx->read_buf.resize(sharp_expert_slice);
-                    bsctx->sharp_files[si_idx]->seek(slice_file_offset, SEEK_SET);
-                    bsctx->sharp_files[si_idx]->read_raw(bsctx->read_buf.data(), sharp_expert_slice);
-                    if (bsctx->pinned_staging_buf && sharp_expert_slice <= bsctx->pinned_staging_size) {
-                        memcpy(bsctx->pinned_staging_ptr, bsctx->read_buf.data(), sharp_expert_slice);
-                        src_data = bsctx->pinned_staging_ptr;
-                    } else {
-                        src_data = bsctx->read_buf.data();
+                    if (src_data) {
+                        ggml_backend_tensor_set(base_tensor, src_data, slice_buf_offset, sharp_expert_slice);
+                        total_sharp_bytes_read += (int64_t)sharp_expert_slice;
                     }
                 }
 
-                if (!src_data) {
-                    LLAMA_LOG_ERROR("%s: no data source for split %d (device tensor '%s' expert %d)\n",
-                                   __func__, si_idx, sharp_info.name.c_str(), eidx);
-                    ggml_backend_buffer_free(sharp_buf);
+                // Track GPU memory
+                bsctx->current_device_sharp_bytes += (int64_t)alloc_size;
+
+                if (bsctx->retain_device_buffers) {
+                    blurry_sharp_device_cache_entry entry;
+                    entry.buffer       = sharp_buf;
+                    entry.nbytes       = alloc_size;
+                    entry.populated    = true;
+                    entry.use_sequence = bsctx->cache_use_counter++;
+                    entry.layer_idx    = sharp_info.layer_idx;
+                    bsctx->device_cache[sharp_info.name] = entry;
+                    bsctx->device_cache_bytes += (int64_t)alloc_size;
+                    bsctx->n_cache_allocs++;
+                    backup_out.device_buf_cached = true;
+                }
+
+                bsctx->metrics.n_direct_copies++;
+
+                if (bsctx->params.verbose) {
+                    LLAMA_LOG_INFO("%s: device new-buffer expert '%s': %d/%d experts, "
+                                  "read %" PRId64 " bytes, alloc %zu bytes VRAM\n",
+                                  __func__, sharp_info.name.c_str(),
+                                  n_experts_req, n_expert_total,
+                                  total_sharp_bytes_read, alloc_size);
+                }
+
+                return total_sharp_bytes_read;
+            }
+
+            // ---- PINNED HOST FALLBACK ----
+            // When VRAM is exhausted, allocate sharp data in CUDA pinned host
+            // memory.  Pinned memory is in RAM but directly accessible from GPU
+            // kernels via unified virtual addressing (UVA / zero-copy).  The GPU
+            // reads over PCIe — slower than VRAM but preserves sharp quality
+            // instead of falling back to blurry.
+            pinned_expert_fallback:
+            {
+                ggml_backend_buffer_type_t pinned_buft = llama_default_buffer_type_cpu(true);
+                ggml_backend_buffer_t pinned_buf = nullptr;
+
+                // Try CUDA pinned memory first (GPU-accessible via UVA)
+                if (pinned_buft && pinned_buft != ggml_backend_cpu_buffer_type()) {
+                    pinned_buf = ggml_backend_buft_alloc_buffer(pinned_buft, sharp_info.nbytes);
+                }
+
+                // Fallback: plain CPU buffer (may not be GPU-accessible, but
+                // the backend scheduler will insert a copy if needed)
+                if (!pinned_buf) {
+                    pinned_buf = ggml_backend_buft_alloc_buffer(
+                        ggml_backend_cpu_buffer_type(), sharp_info.nbytes);
+                }
+
+                if (!pinned_buf) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate pinned host buffer (%zu bytes) "
+                                   "for expert tensor '%s' — falling back to BLURRY weights\n",
+                                   __func__, sharp_info.nbytes, sharp_info.name.c_str());
+                    bsctx->n_device_tensors_skipped++;
                     return -1;
                 }
 
-                if (src_data) {
-                    ggml_backend_tensor_set(base_tensor, src_data, slice_buf_offset, sharp_expert_slice);
+                ggml_backend_buffer_set_usage(pinned_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+                void * pinned_base = ggml_backend_buffer_get_base(pinned_buf);
+                memset(pinned_base, 0, sharp_info.nbytes);
+
+                backup_out.original_buffer     = base_tensor->buffer;
+                backup_out.device_sharp_buffer = pinned_buf;
+
+                base_tensor->data     = pinned_base;
+                base_tensor->buffer   = pinned_buf;
+                base_tensor->type     = sharp_info.type;
+                base_tensor->nb[0]    = ggml_type_size(sharp_info.type);
+                base_tensor->nb[1]    = base_tensor->nb[0] * (base_tensor->ne[0] / ggml_blck_size(sharp_info.type));
+                base_tensor->nb[2]    = base_tensor->nb[1] * base_tensor->ne[1];
+                base_tensor->nb[3]    = base_tensor->nb[2] * base_tensor->ne[2];
+                base_tensor->view_src = nullptr;
+                base_tensor->extra    = nullptr;
+
+                // Read expert slices directly into pinned memory (memcpy, no GPU upload needed)
+                int si_idx = sharp_info.split_idx;
+                int64_t total_sharp_bytes_read = 0;
+
+                for (int32_t i = 0; i < n_experts_req; ++i) {
+                    int32_t eidx = expert_ids[i];
+                    size_t slice_file_offset = sharp_info.file_offset + (size_t)eidx * sharp_expert_slice;
+                    size_t slice_buf_offset  = (size_t)eidx * sharp_expert_slice;
+                    uint8_t * dst = (uint8_t *)pinned_base + slice_buf_offset;
+
+                    bool have_mmap = (si_idx >= 0 && si_idx < (int)bsctx->sharp_mmaps.size()
+                                      && bsctx->sharp_mmaps[si_idx]);
+                    bool slice_ok = false;
+
+                    // RAM cache
+                    if (bsctx->ram_cache_populated) {
+                        auto rc_it = bsctx->ram_cache.find(sharp_info.name);
+                        if (rc_it != bsctx->ram_cache.end() && rc_it->second.size() >= sharp_info.nbytes) {
+                            size_t slice_cache_offset = (size_t)eidx * sharp_expert_slice;
+                            memcpy(dst, rc_it->second.data() + slice_cache_offset, sharp_expert_slice);
+                            slice_ok = true;
+                        }
+                    }
+
+                    // mmap
+                    if (!slice_ok && have_mmap) {
+                        const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si_idx]->addr();
+                        if (slice_file_offset + sharp_expert_slice <= bsctx->sharp_mmaps[si_idx]->size()) {
+                            memcpy(dst, mmap_base + slice_file_offset, sharp_expert_slice);
+                            bs_release_mmap_pages(bsctx, mmap_base + slice_file_offset, sharp_expert_slice);
+                            slice_ok = true;
+                        }
+                    }
+
+                    // File read
+                    if (!slice_ok && si_idx >= 0 && si_idx < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si_idx]) {
+                        bsctx->sharp_files[si_idx]->seek(slice_file_offset, SEEK_SET);
+                        bsctx->sharp_files[si_idx]->read_raw(dst, sharp_expert_slice);
+                        slice_ok = true;
+                    }
+
+                    if (!slice_ok) {
+                        LLAMA_LOG_ERROR("%s: no data source for split %d (pinned fallback tensor '%s' expert %d)\n",
+                                       __func__, si_idx, sharp_info.name.c_str(), eidx);
+                        ggml_backend_buffer_free(pinned_buf);
+                        return -1;
+                    }
+
                     total_sharp_bytes_read += (int64_t)sharp_expert_slice;
                 }
-            }
 
-            // Track GPU memory
-            bsctx->current_device_sharp_bytes += (int64_t)alloc_size;
+                // Do NOT add to device cache or track as device bytes — this is host memory
+                bsctx->metrics.n_direct_copies++;
 
-            if (bsctx->retain_device_buffers) {
-                blurry_sharp_device_cache_entry entry;
-                entry.buffer       = sharp_buf;
-                entry.nbytes       = alloc_size;
-                entry.populated    = true;
-                entry.use_sequence = bsctx->cache_use_counter++;
-                entry.layer_idx    = sharp_info.layer_idx;
-                bsctx->device_cache[sharp_info.name] = entry;
-                bsctx->device_cache_bytes += (int64_t)alloc_size;
-                bsctx->n_cache_allocs++;
-                backup_out.device_buf_cached = true;
-            }
-
-            bsctx->metrics.n_direct_copies++;
-
-            if (bsctx->params.verbose) {
-                LLAMA_LOG_INFO("%s: device new-buffer expert '%s': %d/%d experts, "
-                              "read %" PRId64 " bytes, alloc %zu bytes VRAM\n",
+                LLAMA_LOG_INFO("%s: pinned host fallback expert '%s': %d/%d experts, "
+                              "read %" PRId64 " bytes (VRAM exhausted, using PCIe zero-copy)\n",
                               __func__, sharp_info.name.c_str(),
                               n_experts_req, n_expert_total,
-                              total_sharp_bytes_read, alloc_size);
-            }
+                              total_sharp_bytes_read);
 
-            return total_sharp_bytes_read;
+                return total_sharp_bytes_read;
+            }
         }
     }
 }
