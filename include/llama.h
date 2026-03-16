@@ -1913,9 +1913,12 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
 
     // Start per-layer JIT sharpening for subsequent llama_decode() calls.
     // Installs an eval callback that sharpens/restores one layer at a time.
+    // When host_only is true, only CPU-resident MoE layers are sharpened;
+    // GPU layers are left at blurry quality to preserve CUDA graph capture.
     LLAMA_API void llama_blurry_sharp_start_jit(
             struct llama_blurry_sharp_context * bsctx,
-            struct llama_context              * ctx);
+            struct llama_context              * ctx,
+            bool                                host_only);
 
     // Stop JIT sharpening.  Restores any still-sharpened layer and removes
     // the eval callback.  Must be called after llama_decode() returns.

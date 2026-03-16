@@ -406,14 +406,28 @@ bool server_context::load_model(const gpt_params& params_) {
             }
         }
 
-        // Prompt pattern: keep only every 4th middle layer (~75% skip)
-        // Prompt eval just builds the KV cache — quality matters less.
-        // JIT layer selection happens at generation time via the router,
-        // so aggressive prompt skipping doesn't affect sharp overlay.
-        for (int il = keep; il < n_layers_total - keep; ++il) {
-            if (il % 4 != 0) {  // keep layers 0,4,8,12,... in the middle
-                turbo_skip_layers_prompt.push_back(il);
+        // Prompt pattern: skip only CPU MoE layers (they get JIT sharpened,
+        // so skip is compensated).  GPU layers must NOT be skipped during
+        // prompt — they run blurry and skipping would be a double quality hit.
+        // Build a set of CPU MoE layer indices by checking tensor buffers.
+        {
+            std::unordered_set<int> cpu_moe_layers;
+            for (int il = 0; il < n_layers_total; ++il) {
+                std::string tname = "blk." + std::to_string(il) + ".ffn_gate_exps.weight";
+                ggml_tensor * t = llama_get_model_tensor(model, tname.c_str());
+                if (t && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
+                    cpu_moe_layers.insert(il);
+                }
             }
+            // Skip CPU MoE layers using same pattern (every 4th kept)
+            for (int il = keep; il < n_layers_total - keep; ++il) {
+                if (cpu_moe_layers.count(il) && il % 4 != 0) {
+                    turbo_skip_layers_prompt.push_back(il);
+                }
+            }
+            LOG_INFO("Prompt skip: CPU MoE layers only", {
+                {"n_cpu_moe_layers", (int)cpu_moe_layers.size()},
+            });
         }
 
         LOG_INFO("Turbo draft tier: auto layer-skip", {
@@ -3699,12 +3713,13 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             llama_set_skip_layers(ctx, turbo_skip_layers_prompt.data(), (int32_t)turbo_skip_layers_prompt.size());
         }
 
-        // Enable JIT sharp overlay for all decodes (prompt + generation)
-        // Sharp overlay during prompt processing improves KV cache quality,
-        // which is critical for longer contexts.
+        // Enable JIT sharp overlay for all decodes (prompt + generation).
+        // During prompt: host_only=true — only CPU MoE layers are sharpened,
+        //   preserving CUDA graph capture on GPU splits.
+        // During generation: host_only=false — all layers sharpened (batch=1, safe).
         const bool jit_this_batch = bs_moe_active && !bs_spec_verify;
         if (jit_this_batch) {
-            llama_blurry_sharp_start_jit(bsctx, ctx);
+            llama_blurry_sharp_start_jit(bsctx, ctx, /*host_only=*/ !is_generation);
         }
 
         // Speculative verify: record router data during blurry pass

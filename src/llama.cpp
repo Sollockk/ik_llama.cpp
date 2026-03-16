@@ -3181,6 +3181,21 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
 
     if (ask) {
         if (is_topk) {
+            // In host-only JIT mode, skip GPU layers to avoid breaking
+            // CUDA graph capture on GPU splits.
+            if (lctx->jit_sharpening && lctx->jit_bsctx && lctx->jit_bsctx->jit_host_only) {
+                int layer_idx = atoi(t->name + prefix_len);
+                auto lt_it = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
+                if (lt_it != lctx->jit_bsctx->layer_tensor_names.end() && !lt_it->second.empty()) {
+                    auto si_it = lctx->jit_bsctx->sharp_index.find(lt_it->second[0]);
+                    if (si_it != lctx->jit_bsctx->sharp_index.end() && si_it->second.base_tensor) {
+                        ggml_tensor * bt = si_it->second.base_tensor;
+                        if (bt->buffer && !ggml_backend_buffer_is_host(bt->buffer)) {
+                            return false; // GPU layer — don't break the graph
+                        }
+                    }
+                }
+            }
             return true; // we want data from this tensor
         }
         // delegate to user callback
@@ -3237,8 +3252,23 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                 lctx->jit_current_layer = -1;
             }
 
-            // 2) Layer budget check: skip layers not in the priority set.
-            //    When the set is empty, all layers are eligible (no filtering).
+            // 2a) Host-only mode: skip device (GPU) layers to preserve CUDA graphs.
+            //     Check the first expert tensor to determine layer location.
+            if (lctx->jit_bsctx->jit_host_only) {
+                auto lt_it = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
+                if (lt_it != lctx->jit_bsctx->layer_tensor_names.end() && !lt_it->second.empty()) {
+                    auto si_it = lctx->jit_bsctx->sharp_index.find(lt_it->second[0]);
+                    if (si_it != lctx->jit_bsctx->sharp_index.end() && si_it->second.base_tensor) {
+                        ggml_tensor * bt = si_it->second.base_tensor;
+                        if (bt->buffer && !ggml_backend_buffer_is_host(bt->buffer)) {
+                            goto jit_done; // GPU layer — skip in host-only mode
+                        }
+                    }
+                }
+            }
+
+            // 2b) Layer budget check: skip layers not in the priority set.
+            //     When the set is empty, all layers are eligible (no filtering).
             if (!lctx->jit_priority_layers.empty() &&
                 lctx->jit_priority_layers.find(layer_idx) == lctx->jit_priority_layers.end()) {
                 // Not a priority layer — use blurry weights, skip sharpening.
@@ -3287,7 +3317,8 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
 
 void llama_blurry_sharp_start_jit(
         struct llama_blurry_sharp_context * bsctx,
-        struct llama_context              * ctx) {
+        struct llama_context              * ctx,
+        bool                                host_only) {
     if (!bsctx || !ctx) return;
 
     // Store the blurry-sharp context on the llama context so the eval
@@ -3300,10 +3331,9 @@ void llama_blurry_sharp_start_jit(
     // know they are being called mid-graph-execution.  Cross-type overlays
     // on host tensors are unsafe in this mode because the backend scheduler
     // has already allocated device copy tensors at the original (blurry) size.
-    if (bsctx) {
-        bsctx->jit_active = true;
-        bsctx->n_jit_host_crosstype_skipped = 0;
-    }
+    bsctx->jit_active = true;
+    bsctx->jit_host_only = host_only;
+    bsctx->n_jit_host_crosstype_skipped = 0;
 
     // Also enable router recording — the JIT callback needs expert IDs
     // from the topk tensor, and recording accumulates them for later query.
@@ -3341,6 +3371,7 @@ void llama_blurry_sharp_stop_jit(
                            __func__, bsctx->n_jit_host_crosstype_skipped);
         }
         bsctx->jit_active = false;
+        bsctx->jit_host_only = false;
     }
 
     LLAMA_LOG_DEBUG("%s: JIT per-layer sharpening stopped\n", __func__);

@@ -358,6 +358,11 @@ struct llama_blurry_sharp_context {
     // are also safe (no scheduler copy involved — we swap the buffer directly).
     bool jit_active = false;
 
+    // When true, JIT sharpening only applies to host (CPU) tensors.
+    // Device (GPU) layers are left at blurry quality.  This preserves
+    // CUDA graph capture on GPU splits (eval callback skips device layers).
+    bool jit_host_only = false;
+
     // Count of host cross-type tensors skipped in JIT mode (for diagnostics)
     int32_t n_jit_host_crosstype_skipped = 0;
 

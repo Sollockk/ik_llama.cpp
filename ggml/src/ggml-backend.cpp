@@ -360,7 +360,22 @@ static bool ggml_are_same_layout(const struct ggml_tensor * a, const struct ggml
 }
 
 void ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst) {
-    GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
+    // JIT sharpening may change tensor type/strides mid-execution.  If the
+    // destination buffer is large enough, update its layout to match the source
+    // so the copy succeeds.  This handles TQ1_0→Q4_K_M type changes.
+    if (!ggml_are_same_layout(src, dst)) {
+        size_t src_bytes = ggml_nbytes(src);
+        size_t dst_buf_size = dst->buffer ? ggml_backend_buffer_get_size(dst->buffer) : 0;
+        if (dst_buf_size >= src_bytes) {
+            dst->type = src->type;
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                dst->ne[i] = src->ne[i];
+                dst->nb[i] = src->nb[i];
+            }
+        } else {
+            GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
+        }
+    }
 
     if (src == dst) {
         return;
