@@ -190,6 +190,7 @@ Halves MoE compute. The sharp overlay on important layers compensates for the qu
 | All experts loaded | JIT: only routed expert slices loaded per token |
 | Static memory layout | Dynamic: VRAM -> RAM -> Swap -> Disk tiering |
 | Fixed expert count | Adjustable experts-per-token at runtime |
+-
 
 ## License
 
