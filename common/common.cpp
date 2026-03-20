@@ -2316,15 +2316,15 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
-    if (arg == "--bs-layer-skip") {
+    if (arg == "--bs-cpu-skip-pct") {
         CHECK_ARG
-        params.bs_layer_skip = std::stoi(argv[i]);
+        params.bs_cpu_skip_pct = std::stoi(argv[i]);
         return true;
     }
-    if (arg == "--bs-layer-skip-list") {
+    if (arg == "--bs-cpu-skip-list") {
         CHECK_ARG
-        // parse comma-separated int list of layers to skip
-        params.bs_layer_skip_list.clear();
+        // parse comma-separated int list of CPU layers to skip
+        params.bs_cpu_skip_list.clear();
         std::string s(argv[i]);
         size_t pos = 0;
         while (pos < s.size()) {
@@ -2332,7 +2332,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             if (next == std::string::npos) next = s.size();
             std::string tok = s.substr(pos, next - pos);
             if (!tok.empty()) {
-                params.bs_layer_skip_list.push_back(std::stoi(tok));
+                params.bs_cpu_skip_list.push_back(std::stoi(tok));
             }
             pos = next + 1;
         }
@@ -2748,13 +2748,14 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "expert slices replaced by sharp data. Reduces I/O by n_expert/n_used" });
     options.push_back({ "*",           "       --bs-moe-top-k N",       "override the number of active experts per token for MoE combination\n"
                                                                         "mode (default: 0 = use model's n_expert_used)" });
-    options.push_back({ "*",           "       --bs-layer-skip N",      "turbo draft mode: skip alternate middle layers, keeping first/last N\n"
-                                                                        "layers intact. Creates fast 'ultra-blurry' tier for 3-tier inference:\n"
-                                                                        "  turbo (layer-skip) -> blurry (all layers) -> sharp (overlay)\n"
+    options.push_back({ "*",           "       --bs-cpu-skip-pct N",    "skip N%% of CPU MoE layers (evenly distributed, keeps first/last 3).\n"
+                                                                        "Only skips layers on CPU (host) — GPU layers are never skipped.\n"
+                                                                        "Creates fast tier for 3-tier inference:\n"
+                                                                        "  turbo (cpu-skip) -> blurry (all layers) -> sharp (overlay)\n"
                                                                         "(default: 0 = disabled)" });
-    options.push_back({ "*",           "       --bs-layer-skip-list L1,L2,...",
-                                                                        "explicit comma-separated list of layer indices to skip\n"
-                                                                        "overrides --bs-layer-skip auto-generation" });
+    options.push_back({ "*",           "       --bs-cpu-skip-list L1,L2,...",
+                                                                        "explicit comma-separated list of CPU layer indices to skip\n"
+                                                                        "overrides --bs-cpu-skip-pct auto-generation" });
 
     options.push_back({ "retrieval" });
     options.push_back({ "retrieval",   "       --context-file FNAME",   "file to load context from (repeat to specify multiple files)" });
@@ -3332,71 +3333,20 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
 
     // -----------------------------------------------------------------------
-    // Selective layer offloading for layer-skip mode.
+    // NOTE: Selective layer offloading for CPU-skip mode was removed.
     //
-    // When --bs-layer-skip is active, skipped layers are never evaluated
-    // during the forward pass.  Keeping them on GPU wastes VRAM.  We peek
-    // at the GGUF metadata to learn n_layers, compute the skip pattern,
-    // and add tensor_buft_overrides to place skipped layers on CPU.
-    // This frees VRAM for sharp overlay caching and other uses.
+    // Previously, --bs-cpu-skip-pct forced ALL tensors in skipped layers to
+    // CPU via tensor_buft_overrides.  This caused JIT overlay failures:
+    // when JIT changed expert tensor types (TQ1_0 → Q4_K) mid-execution,
+    // the scheduler's only_active_experts copy path used the modified
+    // strides to compute offsets into a GPU buffer allocated at the
+    // original size — writing data at wrong offsets → NaN logits.
+    //
+    // The skip is now purely a graph-level optimization (skip_ffn in the
+    // build function).  Tensor placement is handled by --n-cpu-moe for
+    // expert tensors and -ngl for everything else.  Attention weights stay
+    // on GPU for fast attention even in skipped layers.
     // -----------------------------------------------------------------------
-    if ((params.bs_layer_skip > 0 || !params.bs_layer_skip_list.empty())
-        && params.n_gpu_layers > 0) {
-
-        // Peek at GGUF to get the layer count
-        struct gguf_init_params gguf_params = { /*.no_alloc =*/ true, /*.ctx =*/ NULL };
-        auto * ctx_gguf = gguf_init_from_file(params.model.c_str(), gguf_params);
-        if (ctx_gguf) {
-            // Get architecture name for the block_count key
-            int arch_key = gguf_find_key(ctx_gguf, "general.architecture");
-            std::string arch = "llama";
-            if (arch_key >= 0) {
-                arch = gguf_get_val_str(ctx_gguf, arch_key);
-            }
-            std::string bc_key_name = arch + ".block_count";
-            int bc_idx = gguf_find_key(ctx_gguf, bc_key_name.c_str());
-
-            if (bc_idx >= 0) {
-                int n_layers_total = (int)gguf_get_val_u32(ctx_gguf, bc_idx);
-
-                // Compute which layers to skip
-                std::vector<int> skip_layers;
-                if (!params.bs_layer_skip_list.empty()) {
-                    skip_layers = params.bs_layer_skip_list;
-                } else {
-                    int keep = params.bs_layer_skip;
-                    for (int il = keep; il < n_layers_total - keep; ++il) {
-                        if (il % 2 == 1) {
-                            skip_layers.push_back(il);
-                        }
-                    }
-                }
-
-                if (!skip_layers.empty()) {
-                    // Remove null terminator if present (added during arg parsing)
-                    if (!params.tensor_buft_overrides.empty()
-                        && params.tensor_buft_overrides.back().pattern == nullptr) {
-                        params.tensor_buft_overrides.pop_back();
-                    }
-
-                    // Add CPU override for ALL tensors in each skipped layer
-                    for (int il : skip_layers) {
-                        std::string pattern = "blk\\." + std::to_string(il) + "\\.";
-                        params.tensor_buft_overrides.push_back(
-                            {strdup(pattern.c_str()), ggml_backend_cpu_buffer_type()});
-                    }
-
-                    // Re-add null terminator
-                    params.tensor_buft_overrides.push_back({nullptr, nullptr});
-
-                    fprintf(stderr, "%s: layer-skip offload: %zu skipped layers will stay on CPU "
-                            "(freeing VRAM for sharp data)\n",
-                            __func__, skip_layers.size());
-                }
-            }
-            gguf_free(ctx_gguf);
-        }
-    }
 
     auto mparams = common_model_params_to_llama(params);
 

@@ -2041,13 +2041,7 @@ ggml_cgraph * llm_build_context::build_llama() {
     //const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : 1.f;
     for (int il = 0; il < n_layer; ++il) {
-        // Layer skipping: when this layer is in the skip set, pass input
-        // straight through without attention or FFN.  Used for "turbo" draft
-        // mode in 3-tier blurry-sharp inference.
-        if (!lctx.skip_layers.empty() && lctx.skip_layers.count(il)) {
-            cb(inpL, "l_out", il);
-            continue;
-        }
+        const bool skip_ffn = !lctx.skip_layers.empty() && lctx.skip_layers.count(il);
 
         struct ggml_tensor * inpSA = inpL;
 
@@ -2138,7 +2132,7 @@ ggml_cgraph * llm_build_context::build_llama() {
 
         // feed-forward network
         if (model.layers[il].ffn_gate_inp == nullptr) {
-            // non-MoE
+            // non-MoE — dense layers always run (cheap, never skipped)
             cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
                     model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   NULL,
                     model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, NULL,
@@ -2151,32 +2145,44 @@ ggml_cgraph * llm_build_context::build_llama() {
             ggml_tensor * ffn_inp_normed = llm_build_norm(ctx0, ffn_inp, hparams, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, cb, il);
             cb(cur, "ffn_norm", il);
 
-            ggml_tensor * moe_out = llm_build_moe_ffn(ctx0, lctx, ffn_inp_normed,
-                    model.layers[il].ffn_gate_inp,
-                    model.layers[il].ffn_up_exps,
-                    model.layers[il].ffn_gate_exps,
-                    model.layers[il].ffn_down_exps,
-                    nullptr,
-                    n_expert, n_expert_used,
-                    LLM_FFN_SILU, false,
-                    false, 0.0,
-                    LLM_EXPERT_GATING_FUNC_SIGMOID,
-                    cb, il, gf, true, model.layers[il].ffn_up_gate_exps);
+            if (skip_ffn) {
+                // MoE-skip: run only shared experts
+                cur = llm_build_ffn(ctx0, lctx, nullptr, ffn_inp_normed,
+                        model.layers[il].ffn_up_shexp,   NULL, NULL,
+                        model.layers[il].ffn_gate_shexp, NULL, NULL,
+                        model.layers[il].ffn_down_shexp, NULL, NULL,
+                        NULL,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                cb(cur, "ffn_moe_shexp", il);
+            } else {
+                ggml_tensor * moe_out = llm_build_moe_ffn(ctx0, lctx, ffn_inp_normed,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps,
+                        model.layers[il].ffn_gate_exps,
+                        model.layers[il].ffn_down_exps,
+                        nullptr,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, false,
+                        false, 0.0,
+                        LLM_EXPERT_GATING_FUNC_SIGMOID,
+                        cb, il, gf, true, model.layers[il].ffn_up_gate_exps);
 
-            // Shared experts
-            ggml_tensor * shexp_out = llm_build_ffn(ctx0, lctx, nullptr, ffn_inp_normed,
-                    model.layers[il].ffn_up_shexp,   NULL, NULL,
-                    model.layers[il].ffn_gate_shexp, NULL, NULL,
-                    model.layers[il].ffn_down_shexp, NULL, NULL,
-                    NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
-            cb(shexp_out, "ffn_moe_shexp", il);
+                ggml_tensor * shexp_out = llm_build_ffn(ctx0, lctx, nullptr, ffn_inp_normed,
+                        model.layers[il].ffn_up_shexp,   NULL, NULL,
+                        model.layers[il].ffn_gate_shexp, NULL, NULL,
+                        model.layers[il].ffn_down_shexp, NULL, NULL,
+                        NULL,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                cb(shexp_out, "ffn_moe_shexp", il);
 
-            cur = ggml_add(ctx0, moe_out, shexp_out);
-            cb(cur, "ffn_moe_out_merged", il);
-
+                cur = ggml_add(ctx0, moe_out, shexp_out);
+                cb(cur, "ffn_moe_out_merged", il);
+            }
+        } else if (skip_ffn) {
+            // Generic MoE with no shared experts — skip entirely, use residual
+            cur = ffn_inp;
         } else {
-            // MoE branch
+            // Generic MoE branch
             cur = llm_build_norm(ctx0, ffn_inp, hparams, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, cb, il);
             cb(cur, "ffn_norm", il);
 
@@ -2193,11 +2199,9 @@ ggml_cgraph * llm_build_context::build_llama() {
                     cb, il, gf, true);
             cb(cur, "ffn_moe_out", il);
         }
-        //printf("%s: ffn result for layer %d is %s, %s\n", __func__, il, cur->name, ggml_op_name(cur->op));
 
         // For Granite architecture
         if (hparams.f_residual_scale) {
-            // Why is hparams.f_residual_scale not simply absorbed into model.layers[il].ffn_down_exps ?
             cur = ggml_scale(ctx0, cur, hparams.f_residual_scale);
         }
 
@@ -2258,11 +2262,7 @@ ggml_cgraph * llm_build_context::build_mistral3() {
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : 1.f;
 
     for (int il = 0; il < n_layer; ++il) {
-        // Layer skipping for turbo draft mode
-        if (!lctx.skip_layers.empty() && lctx.skip_layers.count(il)) {
-            cb(inpL, "l_out", il);
-            continue;
-        }
+        const bool skip_ffn = !lctx.skip_layers.empty() && lctx.skip_layers.count(il);
 
         ggml_tensor * inpSA = inpL;
 
@@ -2281,33 +2281,37 @@ ggml_cgraph * llm_build_context::build_mistral3() {
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
-        // feed-forward network (non-MoE)
-        if (model.layers[il].ffn_gate_inp == nullptr) {
-            // non-MoE
-            cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
-                    model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   nullptr,
-                    model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, nullptr,
-                    model.layers[il].ffn_down, model.layers[il].ffn_down_b, nullptr,
-                    NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf);
-            cb(cur, "ffn_out", il);
+        if (skip_ffn) {
+            cur = ffn_inp;
         } else {
-            // MoE branch
-            cur = llm_build_std_moe_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
-                    model.layers[il].ffn_gate_inp,  nullptr,
-                    model.layers[il].ffn_up_exps,   nullptr,
-                    model.layers[il].ffn_gate_exps, nullptr,
-                    model.layers[il].ffn_down_exps, nullptr,
-                    model.layers[il].ffn_exp_probs_b,
-                    nullptr,  nullptr, // we don't have shared experts
-                    nullptr,  nullptr,
-                    nullptr,  nullptr,
-                    n_expert, n_expert_used,
-                    LLM_FFN_SILU, true, false, 0.0f,
-                    LLM_EXPERT_GATING_FUNC_SOFTMAX,
-                    LLM_FFN_SILU, cb, il, gf);
+            // feed-forward network (non-MoE)
+            if (model.layers[il].ffn_gate_inp == nullptr) {
+                // non-MoE
+                cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
+                        model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   nullptr,
+                        model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, nullptr,
+                        model.layers[il].ffn_down, model.layers[il].ffn_down_b, nullptr,
+                        NULL,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf);
+                cb(cur, "ffn_out", il);
+            } else {
+                // MoE branch
+                cur = llm_build_std_moe_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
+                        model.layers[il].ffn_gate_inp,  nullptr,
+                        model.layers[il].ffn_up_exps,   nullptr,
+                        model.layers[il].ffn_gate_exps, nullptr,
+                        model.layers[il].ffn_down_exps, nullptr,
+                        model.layers[il].ffn_exp_probs_b,
+                        nullptr,  nullptr, // we don't have shared experts
+                        nullptr,  nullptr,
+                        nullptr,  nullptr,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, true, false, 0.0f,
+                        LLM_EXPERT_GATING_FUNC_SOFTMAX,
+                        LLM_FFN_SILU, cb, il, gf);
+            }
+            cur = ggml_add(ctx0, cur, ffn_inp);
         }
-        cur = ggml_add(ctx0, cur, ffn_inp);
         cb(cur, "ffn_out", il);
 
         cur = lctx.cvec.apply_to(ctx0, cur, il);
@@ -3941,8 +3945,9 @@ ggml_cgraph * llm_build_context::build_qwen() {
 ggml_cgraph * llm_build_context::build_qwen2() {
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model, n_tokens), false);
 
-    // Note: layer skipping for turbo draft mode is supported here.
-    // When lctx.skip_layers is non-empty, layers in the set are skipped.
+    // Note: FFN-skip for turbo draft mode is supported here.
+    // When lctx.skip_layers is non-empty, FFN/MoE is skipped but attention
+    // still runs (KV cache is always populated).
     const int64_t n_embd_head = hparams.n_embd_head_v;
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
     GGML_ASSERT(n_embd_head == hparams.n_rot);
@@ -3959,11 +3964,7 @@ ggml_cgraph * llm_build_context::build_qwen2() {
     struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
     for (int il = 0; il < n_layer; ++il) {
-        // Layer skipping for turbo draft mode
-        if (!lctx.skip_layers.empty() && lctx.skip_layers.count(il)) {
-            cb(inpL, "l_out", il);
-            continue;
-        }
+        const bool skip_ffn = !lctx.skip_layers.empty() && lctx.skip_layers.count(il);
 
         struct ggml_tensor * inpSA = inpL;
 
@@ -4006,16 +4007,20 @@ ggml_cgraph * llm_build_context::build_qwen2() {
         struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
-        // feed-forward network
-        cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
-                model.layers[il].ffn_up,   NULL, NULL,
-                model.layers[il].ffn_gate, NULL, NULL,
-                model.layers[il].ffn_down, NULL, NULL,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
-        cb(cur, "ffn_out", il);
+        if (skip_ffn) {
+            cur = ffn_inp;
+        } else {
+            // feed-forward network
+            cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
+                    model.layers[il].ffn_up,   NULL, NULL,
+                    model.layers[il].ffn_gate, NULL, NULL,
+                    model.layers[il].ffn_down, NULL, NULL,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+            cb(cur, "ffn_out", il);
 
-        cur = ggml_add(ctx0, cur, ffn_inp);
+            cur = ggml_add(ctx0, cur, ffn_inp);
+        }
         cur = lctx.cvec.apply_to(ctx0, cur, il);
         cb(cur, "l_out", il);
 
@@ -4160,11 +4165,7 @@ ggml_cgraph * llm_build_context::build_qwen2moe() {
     struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
     for (int il = 0; il < n_layer; ++il) {
-        // Layer skipping for turbo draft mode
-        if (!lctx.skip_layers.empty() && lctx.skip_layers.count(il)) {
-            cb(inpL, "l_out", il);
-            continue;
-        }
+        const bool skip_ffn = !lctx.skip_layers.empty() && lctx.skip_layers.count(il);
 
         struct ggml_tensor * inpSA = inpL;
 
@@ -4208,30 +4209,14 @@ ggml_cgraph * llm_build_context::build_qwen2moe() {
         struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
-        // MoE branch
         cur = llm_build_norm(ctx0, ffn_inp, hparams, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, cb, il);
         cb(cur, "ffn_norm", il);
 
-        ggml_tensor * moe_out =
-            llm_build_moe_ffn(ctx0, lctx, cur,
-                    model.layers[il].ffn_gate_inp,
-                    model.layers[il].ffn_up_exps,
-                    model.layers[il].ffn_gate_exps,
-                    model.layers[il].ffn_down_exps,
-                    nullptr,
-                    n_expert, n_expert_used,
-                    LLM_FFN_SILU, false,
-                    false, 0.0,
-                    LLM_EXPERT_GATING_FUNC_SOFTMAX,
-                    cb, il, gf, false, model.layers[il].ffn_up_gate_exps);
-        cb(cur, "ffn_moe_out", il);
-
-        // FFN shared expert
-        {
+        if (skip_ffn) {
+            // MoE-skip: skip expensive MoE routing, still run shared expert + gate
             ggml_tensor * cur_gate_inp = llm_build_lora_mm(lctx, ctx0, model.layers[il].ffn_gate_inp_shexp, cur);
             cb(cur_gate_inp, "ffn_shexp_gate_inp", il);
 
-            // sigmoid
             ggml_tensor * cur_gate = ggml_div(ctx0, ggml_silu(ctx0, cur_gate_inp), cur_gate_inp);
             cb(cur_gate, "ffn_shexp_gate", il);
 
@@ -4243,13 +4228,48 @@ ggml_cgraph * llm_build_context::build_qwen2moe() {
                     LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
             cb(cur_ffn, "ffn_shexp", il);
 
-            ggml_tensor * ffn_shexp_out = ggml_mul(ctx0, cur_ffn, cur_gate);
-            cb(ffn_shexp_out, "ffn_shexp_out", il);
+            cur = ggml_mul(ctx0, cur_ffn, cur_gate);
+            cb(cur, "ffn_shexp_out", il);
+        } else {
+            // MoE branch — full computation
+            ggml_tensor * moe_out =
+                llm_build_moe_ffn(ctx0, lctx, cur,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps,
+                        model.layers[il].ffn_gate_exps,
+                        model.layers[il].ffn_down_exps,
+                        nullptr,
+                        n_expert, n_expert_used,
+                        LLM_FFN_SILU, false,
+                        false, 0.0,
+                        LLM_EXPERT_GATING_FUNC_SOFTMAX,
+                        cb, il, gf, false, model.layers[il].ffn_up_gate_exps);
+            cb(cur, "ffn_moe_out", il);
 
-            moe_out = ggml_add(ctx0, moe_out, ffn_shexp_out);
-            cb(moe_out, "ffn_out", il);
+            // FFN shared expert
+            {
+                ggml_tensor * cur_gate_inp = llm_build_lora_mm(lctx, ctx0, model.layers[il].ffn_gate_inp_shexp, cur);
+                cb(cur_gate_inp, "ffn_shexp_gate_inp", il);
 
-            cur = moe_out;
+                ggml_tensor * cur_gate = ggml_div(ctx0, ggml_silu(ctx0, cur_gate_inp), cur_gate_inp);
+                cb(cur_gate, "ffn_shexp_gate", il);
+
+                ggml_tensor * cur_ffn = llm_build_ffn(ctx0, lctx, nullptr, cur,
+                        model.layers[il].ffn_up_shexp,   NULL, NULL,
+                        model.layers[il].ffn_gate_shexp, NULL, NULL,
+                        model.layers[il].ffn_down_shexp, NULL, NULL,
+                        NULL,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+                cb(cur_ffn, "ffn_shexp", il);
+
+                ggml_tensor * ffn_shexp_out = ggml_mul(ctx0, cur_ffn, cur_gate);
+                cb(ffn_shexp_out, "ffn_shexp_out", il);
+
+                moe_out = ggml_add(ctx0, moe_out, ffn_shexp_out);
+                cb(moe_out, "ffn_out", il);
+
+                cur = moe_out;
+            }
         }
 
         cur = ggml_add(ctx0, cur, ffn_inp);
@@ -6948,11 +6968,7 @@ ggml_cgraph * llm_build_context::build_deepseek2() {
 
     int n_active_layers = hparams.n_layer - hparams.nextn_predict_layers;
     for (int il = 0; il < n_active_layers; ++il) {
-        // Layer skipping for turbo draft mode
-        if (!lctx.skip_layers.empty() && lctx.skip_layers.count(il)) {
-            cb(inpL, "l_out", il);
-            continue;
-        }
+        const bool skip_ffn = !lctx.skip_layers.empty() && lctx.skip_layers.count(il);
 
         struct ggml_tensor * inpSA = inpL;
 
@@ -7393,6 +7409,7 @@ ggml_cgraph * llm_build_context::build_deepseek2() {
         cb(cur, "ffn_norm", il);
 
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
+            // Dense layers — never skipped (they're always few and cheap)
             cur = llm_build_ffn(ctx0, lctx, nullptr, cur,
                     model.layers[il].ffn_up,   NULL, NULL,
                     model.layers[il].ffn_gate, NULL, NULL,
@@ -7400,8 +7417,19 @@ ggml_cgraph * llm_build_context::build_deepseek2() {
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
             cb(cur, "ffn_out", il);
+        } else if (skip_ffn) {
+            // MoE-skip mode: skip the expensive MoE routing (160 experts)
+            // but still run the shared expert to stabilize hidden states.
+            ggml_tensor * ffn_shexp = llm_build_ffn(ctx0, lctx, nullptr, cur,
+                    model.layers[il].ffn_up_shexp,   NULL, NULL,
+                    model.layers[il].ffn_gate_shexp, NULL, NULL,
+                    model.layers[il].ffn_down_shexp, NULL, NULL,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+            cb(ffn_shexp, "ffn_shexp", il);
+            cur = ffn_shexp;
         } else {
-            // MoE branch
+            // MoE branch — full computation
             ggml_tensor * moe_out =
                 llm_build_moe_ffn(ctx0, lctx, cur,
                         model.layers[il].ffn_gate_inp,
@@ -7504,6 +7532,11 @@ ggml_cgraph * llm_build_context::build_glm4_moe() {
         // Final layer tensors are loaded but not processed in forward pass
         const int n_transformer_layers = n_layer - hparams.nextn_predict_layers;
         for (int il = 0; il < n_transformer_layers; ++il) {
+            // MoE-skip: when skip_layers is set, skip expensive MoE routing
+            // but still run the shared expert FFN to stabilize hidden states.
+            // Attention always runs to populate KV cache.
+            const bool skip_ffn = !lctx.skip_layers.empty() && lctx.skip_layers.count(il);
+
             struct ggml_tensor * inpSA = inpL;
 
             // self-attention
@@ -7566,7 +7599,7 @@ ggml_cgraph * llm_build_context::build_glm4_moe() {
             }
 
             if ((uint32_t) il < hparams.n_layer_dense_lead) {
-                // dense FFN
+                // dense FFN — never skipped (always few and cheap)
                 cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
                         model.layers[il].ffn_up,   NULL, NULL,
                         model.layers[il].ffn_gate, NULL, NULL,
@@ -7574,14 +7607,31 @@ ggml_cgraph * llm_build_context::build_glm4_moe() {
                         NULL,
                         LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true);
                 cb(cur, "ffn_out", il);
+            } else if (skip_ffn && model.layers[il].ffn_up_shexp &&
+                       model.layers[il].ffn_gate_shexp &&
+                       model.layers[il].ffn_down_shexp) {
+                // MoE-skip mode: skip expensive MoE routing, run only shared expert.
+                // This avoids the 128-expert routing + FFN while keeping hidden
+                // state flow stable through the shared expert path.
+                cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
+                        model.layers[il].ffn_up_shexp,    nullptr, nullptr,
+                        model.layers[il].ffn_gate_shexp,  nullptr, nullptr,
+                        model.layers[il].ffn_down_shexp,  nullptr, nullptr,
+                        nullptr,
+                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true);
+                cb(cur, "ffn_shexp", il);
+            } else if (skip_ffn) {
+                // MoE-skip but no shared expert — just pass through with residual
+                cur = ffn_inp;
             } else {
+                // Full MoE + shared expert computation
                 cur = llm_build_std_moe_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
                         model.layers[il].ffn_gate_inp,  model.layers[il].ffn_gate_inp_b,
                         model.layers[il].ffn_up_exps,   model.layers[il].ffn_up_exps_b,
                         model.layers[il].ffn_gate_exps, model.layers[il].ffn_gate_exps_b,
                         model.layers[il].ffn_down_exps, model.layers[il].ffn_down_exps_b,
                         model.layers[il].ffn_exp_probs_b,
-                        model.layers[il].ffn_up_shexp,    nullptr, // we don't have shared expert biases?
+                        model.layers[il].ffn_up_shexp,    nullptr,
                         model.layers[il].ffn_gate_shexp,  nullptr,
                         model.layers[il].ffn_down_shexp,  nullptr,
                         n_expert, n_expert_used,

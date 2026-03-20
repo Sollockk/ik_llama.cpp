@@ -360,20 +360,30 @@ static bool ggml_are_same_layout(const struct ggml_tensor * a, const struct ggml
 }
 
 void ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst) {
-    // JIT sharpening may change tensor type/strides mid-execution.  If the
-    // destination buffer is large enough, update its layout to match the source
-    // so the copy succeeds.  This handles TQ1_0→Q4_K_M type changes.
     if (!ggml_are_same_layout(src, dst)) {
-        size_t src_bytes = ggml_nbytes(src);
-        size_t dst_buf_size = dst->buffer ? ggml_backend_buffer_get_size(dst->buffer) : 0;
-        if (dst_buf_size >= src_bytes) {
+        // JIT cross-type overlay: src type changed (e.g. TQ1_0 → Q4_K) but
+        // dst still has the original type.  Safe to re-type dst if the byte
+        // counts match (same allocation size, no overflow).
+        if (ggml_nbytes(src) == ggml_nbytes(dst)) {
             dst->type = src->type;
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                dst->ne[i] = src->ne[i];
                 dst->nb[i] = src->nb[i];
             }
         } else {
-            GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
+            fprintf(stderr, "\n%s: LAYOUT MISMATCH (different nbytes):\n"
+                    "  src '%s' type=%d ne=[%lld,%lld,%lld,%lld] nbytes=%zu\n"
+                    "  dst '%s' type=%d ne=[%lld,%lld,%lld,%lld] nbytes=%zu\n"
+                    "  src_buf='%s' dst_buf='%s'\n",
+                    __func__,
+                    src->name, src->type,
+                    (long long)src->ne[0], (long long)src->ne[1], (long long)src->ne[2], (long long)src->ne[3],
+                    ggml_nbytes(src),
+                    dst->name, dst->type,
+                    (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2], (long long)dst->ne[3],
+                    ggml_nbytes(dst),
+                    src->buffer ? ggml_backend_buffer_name(src->buffer) : "null",
+                    dst->buffer ? ggml_backend_buffer_name(dst->buffer) : "null");
+            GGML_ASSERT(false && "cannot copy tensors with different layouts and sizes");
         }
     }
 

@@ -7,6 +7,7 @@
 #include "llama.h"
 
 #include <unordered_set>
+#include <cmath>
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -379,64 +380,56 @@ bool server_context::load_model(const gpt_params& params_) {
     }
 
     // -----------------------------------------------------------------------
-    // Layer-skip "turbo" draft tier initialization
+    // CPU-skip "turbo" draft tier initialization
     //
-    // When --bs-layer-skip N is set, compute which layers to skip for the
-    // fast draft tier.  Strategy: keep first N and last N layers (they
-    // contribute most to quality), skip every other layer in between.
-    // This gives roughly 2x speedup on the blurry model for drafting.
+    // When --bs-cpu-skip-pct N is set, skip N% of CPU MoE layers (evenly
+    // distributed, keeping first/last 3 intact).  Only CPU-bound layers
+    // are skipped — GPU layers are never skipped.
     // -----------------------------------------------------------------------
-    if (!params_base.bs_layer_skip_list.empty()) {
+    if (!params_base.bs_cpu_skip_list.empty()) {
         // Explicit list provided — use same pattern for both prompt and generation
         turbo_skip_layers.assign(
-            params_base.bs_layer_skip_list.begin(),
-            params_base.bs_layer_skip_list.end());
+            params_base.bs_cpu_skip_list.begin(),
+            params_base.bs_cpu_skip_list.end());
         turbo_skip_layers_prompt = turbo_skip_layers;
-        LOG_INFO("Turbo draft tier: explicit layer-skip list", {
+        LOG_INFO("Turbo draft tier: explicit cpu-skip list", {
             {"n_skip", (int)turbo_skip_layers.size()},
         });
-    } else if (params_base.bs_layer_skip > 0) {
+    } else if (params_base.bs_cpu_skip_pct > 0) {
         const int n_layers_total = llama_n_layer(model);
-        const int keep = params_base.bs_layer_skip;
+        const int pct = params_base.bs_cpu_skip_pct;
+        const int n_skip_target = (n_layers_total * pct + 99) / 100; // ceil
 
-        // Generation pattern: skip every other middle layer (~50% skip)
-        for (int il = keep; il < n_layers_total - keep; ++il) {
-            if (il % 2 == 1) {
-                turbo_skip_layers.push_back(il);
+        // Build list of skippable CPU MoE layers (exclude first 3 and last 3)
+        std::vector<int> cpu_layers;
+        for (int il = 3; il < n_layers_total - 3; ++il) {
+            std::string tname = "blk." + std::to_string(il) + ".ffn_gate_exps.weight";
+            ggml_tensor * t = llama_get_model_tensor(model, tname.c_str());
+            if (t && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
+                cpu_layers.push_back(il);
             }
         }
 
-        // Prompt pattern: skip only CPU MoE layers (they get JIT sharpened,
-        // so skip is compensated).  GPU layers must NOT be skipped during
-        // prompt — they run blurry and skipping would be a double quality hit.
-        // Build a set of CPU MoE layer indices by checking tensor buffers.
-        {
-            std::unordered_set<int> cpu_moe_layers;
-            for (int il = 0; il < n_layers_total; ++il) {
-                std::string tname = "blk." + std::to_string(il) + ".ffn_gate_exps.weight";
-                ggml_tensor * t = llama_get_model_tensor(model, tname.c_str());
-                if (t && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
-                    cpu_moe_layers.insert(il);
-                }
+        // Evenly distribute skips across CPU layers
+        const int n_cpu = (int)cpu_layers.size();
+        const int n_skip = std::min(n_skip_target, n_cpu);
+        if (n_skip > 0 && n_cpu > 0) {
+            for (int i = 0; i < n_skip; ++i) {
+                int idx = (int)((int64_t)i * n_cpu / n_skip);
+                turbo_skip_layers.push_back(cpu_layers[idx]);
             }
-            // Skip CPU MoE layers using same pattern (every 4th kept)
-            for (int il = keep; il < n_layers_total - keep; ++il) {
-                if (cpu_moe_layers.count(il) && il % 4 != 0) {
-                    turbo_skip_layers_prompt.push_back(il);
-                }
-            }
-            LOG_INFO("Prompt skip: CPU MoE layers only", {
-                {"n_cpu_moe_layers", (int)cpu_moe_layers.size()},
-            });
+            std::sort(turbo_skip_layers.begin(), turbo_skip_layers.end());
         }
 
-        LOG_INFO("Turbo draft tier: auto layer-skip", {
+        // Same skip pattern for prompt and generation
+        turbo_skip_layers_prompt = turbo_skip_layers;
+
+        LOG_INFO("Turbo draft tier: layer-skip", {
             {"n_layers_total", n_layers_total},
-            {"keep_first_last", keep},
-            {"n_skip_generation", (int)turbo_skip_layers.size()},
-            {"n_skip_prompt", (int)turbo_skip_layers_prompt.size()},
-            {"n_eval_generation", n_layers_total - (int)turbo_skip_layers.size()},
-            {"n_eval_prompt", n_layers_total - (int)turbo_skip_layers_prompt.size()},
+            {"skip_pct", pct},
+            {"n_cpu_layers", n_cpu},
+            {"n_skip", n_skip},
+            {"n_eval", n_layers_total - n_skip},
         });
     }
 
@@ -3717,6 +3710,10 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // During prompt: host_only=true — only CPU MoE layers are sharpened,
         //   preserving CUDA graph capture on GPU splits.
         // During generation: host_only=false — all layers sharpened (batch=1, safe).
+        // Enable JIT sharp overlay for all decodes (prompt + generation).
+        // During prompt: host_only=true — only CPU MoE layers are sharpened,
+        //   preserving CUDA graph capture on GPU splits.
+        // During generation: host_only=false — all layers sharpened (batch=1, safe).
         const bool jit_this_batch = bs_moe_active && !bs_spec_verify;
         if (jit_this_batch) {
             llama_blurry_sharp_start_jit(bsctx, ctx, /*host_only=*/ !is_generation);
@@ -4020,6 +4017,36 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             completion_token_output result;
             const int tok_idx = slot.i_batch - i;
+
+            // NaN logit diagnostic — detect degenerate output before sampling crashes
+            {
+                const float * logits = llama_get_logits_ith(ctx, tok_idx);
+                const int n_vocab = llama_n_vocab(model);
+                int n_nan = 0, n_inf = 0, n_ninf = 0;
+                float max_val = -INFINITY, min_val = INFINITY;
+                for (int v = 0; v < n_vocab; ++v) {
+                    if (std::isnan(logits[v])) { ++n_nan; }
+                    else if (logits[v] == INFINITY) { ++n_inf; }
+                    else if (logits[v] == -INFINITY) { ++n_ninf; }
+                    else { max_val = std::max(max_val, logits[v]); min_val = std::min(min_val, logits[v]); }
+                }
+                if (n_nan > 0 || n_inf > 0 || n_ninf == n_vocab) {
+                    LOG_ERROR("degenerate logits detected before sampling", {
+                        {"tok_idx", tok_idx},
+                        {"n_vocab", n_vocab},
+                        {"n_nan", n_nan},
+                        {"n_inf", n_inf},
+                        {"n_ninf", n_ninf},
+                        {"max_finite", max_val},
+                        {"min_finite", min_val},
+                        {"n_tokens_in_batch", batch_view.n_tokens},
+                        {"is_generation", is_generation},
+                        {"skip_active", turbo_active && !is_generation},
+                        {"jit_active", jit_this_batch},
+                    });
+                }
+            }
+
             const llama_token id = common_sampler_sample(slot.ctx_sampling, ctx, tok_idx);
 
             common_sampler_accept(slot.ctx_sampling, ctx, id, true);

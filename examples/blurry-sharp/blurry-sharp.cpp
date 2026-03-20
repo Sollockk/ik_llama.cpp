@@ -2931,11 +2931,11 @@ int main(int argc, char ** argv) {
     // -----------------------------------------------------------------------
     generation_result result_three_tier;
 
-    if (params.bs_layer_skip > 0) {
+    if (params.bs_cpu_skip_pct > 0) {
         fprintf(stderr, "--- 3-Tier generation (turbo → blurry%s) ---\n",
                 bsctx ? " → sharp" : "");
         fprintf(stderr, "  Draft tokens:     %d\n", params.bs_spec_draft);
-        fprintf(stderr, "  Layer-skip keep:  %d (first/last layers kept intact)\n", params.bs_layer_skip);
+        fprintf(stderr, "  CPU-skip pct:     %d%%\n", params.bs_cpu_skip_pct);
         fprintf(stderr, "\n");
 
         llama_kv_cache_clear(ctx);
@@ -2945,7 +2945,7 @@ int main(int argc, char ** argv) {
             prompt_tokens,
             params.n_predict,
             params.bs_spec_draft,
-            params.bs_layer_skip,
+            params.bs_cpu_skip_pct,
             params.bs_dynamic_top_k,
             params.bs_verbose
         );

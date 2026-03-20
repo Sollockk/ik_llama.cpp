@@ -26,26 +26,26 @@ A 253B-parameter MoE model has 93 transformer layers. Even with TQ1_0 quantizati
 
 This works because transformer layers have significant redundancy, particularly in the middle of the network. Research on layer pruning shows that the first few and last few layers contribute most to output quality (they handle input embedding and output prediction), while many middle layers perform incremental refinement that can be approximated or skipped.
 
-The system uses two skip patterns:
+The skip is **MoE-only**: attention always runs (to populate the KV cache), but the expensive MoE expert routing (128-160 experts) is bypassed. The shared expert FFN still runs on skipped layers to stabilize the hidden state flow.
 
-- **Prompt processing** (building the KV cache): Very aggressive, keeps only every 4th middle layer (~75% skip). The KV cache just needs to be "good enough" since the sharp overlay during generation does the real quality work.
-- **Token generation** (producing output): Moderate, keeps every 2nd middle layer (~50% skip). Combined with JIT sharp overlay on the non-skipped layers, this recovers most of the quality lost from skipping.
+- **Prompt processing** (building the KV cache): Skip is applied to reduce MoE compute during prefill. Attention runs on all layers so the KV cache is fully populated.
+- **Token generation** (producing output): All layers run with JIT sharp overlay for maximum quality. No skip during generation.
 
-The layers that ARE evaluated get sharp expert overlays via JIT, so they run at high quality. The layers that are skipped cost nothing — zero compute, and their weights are offloaded to CPU to free VRAM.
+The layers that ARE evaluated get sharp expert overlays via JIT, so they run at high quality. Skipped layers cost only attention + shared expert compute (the expensive 128-expert routing is eliminated).
 
-### Compensating for Skipped Layers
+### Compensating for Skipped MoE Routing
 
-Layer-skip on its own degrades output quality — you're literally throwing away half the model's computation. The idea is that **sharp overlays on the remaining layers help to compensate** for this loss.
+MoE-skip on its own degrades output quality — you're bypassing the multi-expert routing that gives MoE models their capacity. The idea is that **sharp overlays on the remaining layers help to compensate** for this loss.
 
 Consider: a full blurry model (93 layers, all TQ1_0 ~1-bit) processes every layer but with severely degraded weight precision. Each layer contributes a "noisy" version of what it should compute. Errors accumulate across layers.
 
-With layer-skip + sharp overlay: 49 layers are evaluated, but each one runs with Q4_K_M weights (~4.8-bit) — roughly 3x the precision per layer. The theory is that **fewer layers at high precision can outperform more layers at low precision**, because:
+With MoE-skip + sharp overlay: skipped layers still run attention and the shared expert (stabilizing the hidden state), while non-skipped layers run at Q4_K_M precision (~4.8-bit) — roughly 3x the precision per weight. The theory is that **fewer full-MoE layers at high precision can outperform more layers at low precision**, because:
 
 1. **Quality per layer is much higher**: A Q4_K_M expert is far more accurate than a TQ1_0 expert. The MoE routing decision (which experts to activate) is also more accurate with sharp weights, leading to better expert selection cascading through subsequent layers.
 2. **Errors don't accumulate**: With blurry-only, each layer adds quantization noise that compounds through the network. With sharp overlays, the layers that run produce clean activations, so there's less error to propagate.
 3. **The first and last layers matter most**: These are always kept (never skipped) and always sharpened. The first layers establish the representation, the last layers produce the output distribution. Getting these right matters more than any middle layer.
-4. **Middle layers are redundant**: Research shows that middle transformer layers often learn similar features. Skipping every other one and sharpening the rest is a better allocation of resources than running all of them at low quality.
-5. **Only the routed experts are sharpened, not the whole layer**: MoE models activate a small subset of experts per token (e.g. 8 out of 160). The JIT system intercepts the router's decision and overlays sharp weights for only those 8 experts. This keeps the I/O cost per layer small (~150 MiB instead of ~2.3 GiB), making it practical to sharpen every non-skipped layer on every token. Without this expert selectivity, sharpening would be too slow — you'd be reading gigabytes of data per layer from disk. With it, the sharp overlay adds only a modest cost per layer, making the skip-fewer-but-sharpen-each strategy viable.
+4. **Shared expert stabilizes skipped layers**: Even when the full MoE routing is skipped, the shared expert FFN still runs. This maintains the hidden state flow through the network, preventing the "empty residual" problem that would occur if the entire FFN were skipped.
+5. **Only the routed experts are sharpened, not the whole layer**: MoE models activate a small subset of experts per token (e.g. 8 out of 160). The JIT system intercepts the router's decision and overlays sharp weights for only those 8 experts. This keeps the I/O cost per layer small (~150 MiB instead of ~2.3 GiB), making it practical to sharpen every non-skipped layer on every token.
 
 ## What is JIT (Just-In-Time) Overlay?
 
@@ -81,16 +81,16 @@ As for which **layers** get sharpened: during token generation, every non-skippe
 
 ## Three-Tier Inference Pipeline
 
-### Tier 1: Layer-Skip (Turbo)
+### Tier 1: MoE-Skip (Turbo)
 
-Skip a large fraction of transformer layers entirely during the forward pass. Skipped layers are never evaluated, giving a direct compute reduction.
+Skip the expensive MoE expert routing on a fraction of layers during prompt processing. Attention always runs (KV cache is fully populated). The shared expert FFN still runs on skipped layers to maintain hidden state stability.
 
-- **Prompt processing**: Aggressive skip (~75% of middle layers). Only builds the KV cache, so quality requirements are low.
-- **Token generation**: Moderate skip (~50% of middle layers). First and last N layers are always kept since they contribute most to output quality.
-- Skipped layers are automatically offloaded to CPU at model load time, freeing VRAM for sharp data.
+- **Prompt processing**: Skip N% of CPU MoE layers' routing. Attention + shared expert still run.
+- **Token generation**: No skip — all layers run with JIT sharp overlay for maximum quality.
+- First and last 3 layers are always kept intact.
 
 ```
---bs-layer-skip 3    # keep first/last 3 layers, skip every other middle layer
+--bs-cpu-skip-pct N  # skip MoE routing on N% of CPU layers (keeps first/last 3)
 ```
 
 ### Tier 2: Blurry Model (TQ1_0)
@@ -118,17 +118,17 @@ During token generation, the JIT system intercepts each layer's MoE routing deci
 
 Layer-skip and JIT sharp overlay are enabled simultaneously during a single `llama_decode` call — they are not separate passes. Here is what happens for each token during generation:
 
-1. **Layer-skip is set** before the decode call. The forward pass skips layers marked in the skip list — their computations never run, their tensors are never accessed.
+1. **MoE-skip is set** before the decode call. The graph builder uses `skip_ffn` to replace full MoE routing with shared-expert-only computation on marked layers. Attention always runs.
 
 2. **JIT is started** before the same decode call. An eval callback is registered that will fire during the forward pass.
 
 3. **A single `llama_decode` executes.** As the forward pass walks through the layers:
-   - **Skipped layer** (e.g. layer 5): The layer is entirely bypassed. No compute, no JIT callback, no sharp overlay. Its weights sit idle on CPU.
+   - **Skipped layer** (e.g. layer 5): Attention runs normally (KV cache populated). The MoE routing is replaced with shared expert FFN only — no expert selection, no JIT callback, no sharp overlay. The shared expert stabilizes the hidden state.
    - **Non-skipped layer** (e.g. layer 6): The layer runs normally. When it reaches the MoE routing step, the JIT callback fires. The callback reads the router's expert selections, swaps in sharp weights for those experts via mmap pointer swap (CPU) or buffer copy (GPU), and the layer computes at sharp precision. Then the callback restores blurry weights before the next layer.
 
 4. **After decode**, JIT is stopped and any remaining sharp overlays are restored to blurry.
 
-The key point: there is **no separate turbo/scout pass followed by a re-decode**. Layer-skip and JIT sharp coexist in a single forward pass. Skipped layers are free, non-skipped layers are sharpened. This gives you the speed benefit of evaluating fewer layers AND the quality benefit of sharp precision on the layers that do run, in one decode call.
+The key point: there is **no separate turbo/scout pass followed by a re-decode**. MoE-skip and JIT sharp coexist in a single forward pass. Skipped layers run attention + shared expert (cheap), non-skipped layers get full MoE with sharp precision. This gives you the speed benefit of reduced MoE compute AND the quality benefit of sharp precision on the layers that do full routing, in one decode call.
 
 ## Memory Tiering
 
@@ -136,12 +136,12 @@ The system uses a four-tier memory hierarchy:
 
 | Tier | Storage | Purpose |
 |------|---------|---------|
-| VRAM | GPU | Active model weights (non-skipped layers), KV cache |
+| VRAM | GPU | Model weights (attention, norms, output), KV cache |
 | RAM | CPU | MoE expert tensors (via `--n-cpu-moe`), sharp data cache |
 | Swap | SSD | Sharp data that has been accessed once, staged via `--bs-lazy-swap` |
 | Disk | SSD | Sharp model GGUF files, demand-paged via mmap |
 
-Skipped layers are offloaded to CPU at load time (via `tensor_buft_overrides`), freeing VRAM for the layers that are actually evaluated.
+Expert tensors are placed on CPU via `--n-cpu-moe`. Skipped layers' MoE routing is bypassed at the graph level, but their attention weights remain on GPU for fast KV cache population.
 
 ## MoE Top-K Override
 
@@ -162,7 +162,7 @@ Halves MoE compute. The sharp overlay on important layers compensates for the qu
   --bs-moe-combination \
   -np 1 -ngl 99 -fa on -c 4000 -t 16 \
   --n-cpu-moe 57 \
-  --bs-layer-skip 3 \
+  --bs-cpu-skip-pct 10 \
   --bs-gpu-budget-mb 2048 \
   --bs-lazy-swap \
   --bs-moe-top-k-override 4
@@ -174,7 +174,7 @@ Halves MoE compute. The sharp overlay on important layers compensates for the qu
 |-----------|-------------|
 | `--sharp <path>` | Path to the sharp (lightly-quantized) model GGUF |
 | `--bs-moe-combination` | Enable MoE blurry-sharp combination mode |
-| `--bs-layer-skip N` | Keep first/last N layers, skip every other middle layer |
+| `--bs-cpu-skip-pct N` | Skip MoE routing on N% of CPU layers (keeps first/last 3, runs shared expert) |
 | `--n-cpu-moe N` | Put first N layers' MoE experts on CPU (frees VRAM) |
 | `--bs-gpu-budget-mb N` | VRAM budget for sharp overlay buffers |
 | `--bs-lazy-swap` | Cache sharp data to RAM on first access, stage to swap on restore |
@@ -186,7 +186,7 @@ Halves MoE compute. The sharp overlay on important layers compensates for the qu
 | Standard | VLLMWarpstone |
 |----------|---------------|
 | One model, one quantization | Two models: blurry (speed) + sharp (quality) |
-| All layers evaluated | Layer-skip: 50-75% of middle layers skipped |
+| All layers evaluated | MoE-skip: shared expert only on skipped layers |
 | All experts loaded | JIT: only routed expert slices loaded per token |
 | Static memory layout | Dynamic: VRAM -> RAM -> Swap -> Disk tiering |
 | Fixed expert count | Adjustable experts-per-token at runtime |

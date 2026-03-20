@@ -5009,21 +5009,41 @@ int32_t llama_blurry_sharp_apply_experts(
         }
 
         // In JIT mode, check if this tensor would be a cross-type host
-        // overlay BEFORE doing any work.  Cross-type overlays on pinned/host
-        // buffers are unsafe (scheduler device copies are pre-allocated at
-        // blurry size).  But plain CPU buffers (from --n-cpu-moe) have no
-        // device copies and are safe for cross-type overlay.
-        if (bsctx->jit_active) {
-            bool tih = true;
-            if (base_tensor->buffer) {
-                tih = ggml_backend_buffer_is_host(base_tensor->buffer);
-            }
-            if (tih && base_tensor->type != sharp_info.type) {
+        // overlay BEFORE doing any work.  Cross-type overlays change the
+        // tensor type; the scheduler's pre-allocated device copies have the
+        // original type/size.
+        //
+        // Safe cases:
+        //   - Expert tensors on plain CPU buffers (--n-cpu-moe): these have
+        //     no device copies, the MoE kernel reads them directly on CPU.
+        //   - Any tensor where sharp nbytes == blurry nbytes: the device
+        //     copy fits, tensor_copy re-types dst in place.
+        //
+        // Unsafe cases (skip):
+        //   - Non-plain-CPU host buffers (pinned): have device copies at
+        //     blurry size, any type change risks overflow.
+        //   - Plain CPU non-expert tensors where sharp nbytes > blurry
+        //     nbytes: the scheduler may copy them to GPU, and the device
+        //     copy is too small for the larger sharp data.
+        if (bsctx->jit_active && base_tensor->type != sharp_info.type) {
+            bool tih = base_tensor->buffer && ggml_backend_buffer_is_host(base_tensor->buffer);
+            if (tih) {
                 bool is_plain_cpu = base_tensor->buffer &&
                     ggml_backend_buffer_get_type(base_tensor->buffer) == ggml_backend_cpu_buffer_type();
                 if (!is_plain_cpu) {
                     n_jit_skipped++;
                     continue;  // pinned buffer — skip to avoid device copy overflow
+                }
+                // Plain CPU: expert tensors are safe (no device copies).
+                // Non-expert tensors (shared experts, norms) may be copied
+                // to GPU by the scheduler.  Only safe if nbytes match.
+                if (!bs_is_expert_tensor(tensor_name)) {
+                    size_t blurry_nbytes = ggml_nbytes(base_tensor);
+                    size_t sharp_nbytes  = sharp_info.nbytes;
+                    if (sharp_nbytes != blurry_nbytes) {
+                        n_jit_skipped++;
+                        continue;  // device copy too small for larger sharp type
+                    }
                 }
             }
         }
