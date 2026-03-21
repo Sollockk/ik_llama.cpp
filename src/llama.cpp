@@ -3289,7 +3289,11 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
 
             // 2b) Layer budget check: skip layers not in the priority set.
             //     When the set is empty, all layers are eligible (no filtering).
-            if (!lctx->jit_priority_layers.empty() &&
+            //     In host-only mode (prompt processing), bypass the budget so
+            //     ALL non-skipped layers get sharpened — the priority set is
+            //     designed for generation I/O savings, not prompt quality.
+            if (!lctx->jit_bsctx->jit_host_only &&
+                !lctx->jit_priority_layers.empty() &&
                 lctx->jit_priority_layers.find(layer_idx) == lctx->jit_priority_layers.end()) {
                 // Not a priority layer — use blurry weights, skip sharpening.
                 goto jit_done;
