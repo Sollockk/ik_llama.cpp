@@ -3181,18 +3181,29 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
 
     if (ask) {
         if (is_topk) {
-            // In host-only JIT mode, skip GPU layers to avoid breaking
-            // CUDA graph capture on GPU splits.
+            // In host-only JIT mode, skip layers whose expert tensors are on
+            // GPU to avoid breaking CUDA graph capture.  We check expert
+            // tensors specifically (ffn_{gate,up,down,norm}_exps) because
+            // those are what JIT overlays.  Non-expert tensors (attn_norm,
+            // wq, etc.) may be on GPU even when experts are on CPU (--n-cpu-moe).
             if (lctx->jit_sharpening && lctx->jit_bsctx && lctx->jit_bsctx->jit_host_only) {
                 int layer_idx = atoi(t->name + prefix_len);
                 auto lt_it = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
-                if (lt_it != lctx->jit_bsctx->layer_tensor_names.end() && !lt_it->second.empty()) {
-                    auto si_it = lctx->jit_bsctx->sharp_index.find(lt_it->second[0]);
-                    if (si_it != lctx->jit_bsctx->sharp_index.end() && si_it->second.base_tensor) {
-                        ggml_tensor * bt = si_it->second.base_tensor;
-                        if (bt->buffer && !ggml_backend_buffer_is_host(bt->buffer)) {
-                            return false; // GPU layer — don't break the graph
+                if (lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
+                    for (const auto & tname : lt_it->second) {
+                        // Match the exact expert tensor names used by bs_is_expert_tensor()
+                        if (tname.find("ffn_gate_exps") == std::string::npos &&
+                            tname.find("ffn_up_exps")   == std::string::npos &&
+                            tname.find("ffn_down_exps") == std::string::npos &&
+                            tname.find("ffn_norm_exps") == std::string::npos) continue;
+                        auto si_it = lctx->jit_bsctx->sharp_index.find(tname);
+                        if (si_it != lctx->jit_bsctx->sharp_index.end() && si_it->second.base_tensor) {
+                            ggml_tensor * bt = si_it->second.base_tensor;
+                            if (bt->buffer && !ggml_backend_buffer_is_host(bt->buffer)) {
+                                return false; // GPU experts — don't break the graph
+                            }
                         }
+                        break; // checked one expert tensor, that's enough
                     }
                 }
             }
@@ -3252,17 +3263,26 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                 lctx->jit_current_layer = -1;
             }
 
-            // 2a) Host-only mode: skip device (GPU) layers to preserve CUDA graphs.
-            //     Check the first expert tensor to determine layer location.
+            // 2a) Host-only mode: skip layers whose expert tensors are on GPU
+            //     to preserve CUDA graphs.  Check an actual expert tensor
+            //     (ffn_{gate,up,down,norm}_exps — matching bs_is_expert_tensor())
+            //     not attn_norm which may be on GPU even with --n-cpu-moe.
             if (lctx->jit_bsctx->jit_host_only) {
                 auto lt_it = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
-                if (lt_it != lctx->jit_bsctx->layer_tensor_names.end() && !lt_it->second.empty()) {
-                    auto si_it = lctx->jit_bsctx->sharp_index.find(lt_it->second[0]);
-                    if (si_it != lctx->jit_bsctx->sharp_index.end() && si_it->second.base_tensor) {
-                        ggml_tensor * bt = si_it->second.base_tensor;
-                        if (bt->buffer && !ggml_backend_buffer_is_host(bt->buffer)) {
-                            goto jit_done; // GPU layer — skip in host-only mode
+                if (lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
+                    for (const auto & tname : lt_it->second) {
+                        if (tname.find("ffn_gate_exps") == std::string::npos &&
+                            tname.find("ffn_up_exps")   == std::string::npos &&
+                            tname.find("ffn_down_exps") == std::string::npos &&
+                            tname.find("ffn_norm_exps") == std::string::npos) continue;
+                        auto si_it = lctx->jit_bsctx->sharp_index.find(tname);
+                        if (si_it != lctx->jit_bsctx->sharp_index.end() && si_it->second.base_tensor) {
+                            ggml_tensor * bt = si_it->second.base_tensor;
+                            if (bt->buffer && !ggml_backend_buffer_is_host(bt->buffer)) {
+                                goto jit_done; // GPU experts — skip in host-only mode
+                            }
                         }
+                        break; // checked one expert tensor, that's enough
                     }
                 }
             }
