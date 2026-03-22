@@ -537,6 +537,12 @@ struct gpt_params {
     // --bs-cpu-skip-list L      explicit comma-separated list of CPU layers to skip
     int         bs_cpu_skip_pct        = 0;            // % of CPU layers to skip (0=disabled)
     std::vector<int> bs_cpu_skip_list;                  // explicit list of CPU layers to skip
+
+    // --bs-sharp-experts N     only overlay top-N most-used experts per layer (0=all)
+    // --bs-no-parallel-io      disable parallel pread for expert slices
+    int         bs_sharp_experts       = 0;            // 0 = overlay all selected experts
+    bool        bs_parallel_expert_io  = true;         // parallel pread for expert slices
+    int         bs_gpu_cache_mb        = 0;            // GPU expert cache size in MiB (0 = disabled)
 };
 
 

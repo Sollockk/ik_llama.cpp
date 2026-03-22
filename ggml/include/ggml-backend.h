@@ -197,6 +197,10 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
+    // Get the device copy of a tensor for a specific backend (used for JIT overlay GPU re-upload).
+    // Returns NULL if no copy exists.
+    GGML_API struct ggml_tensor *  ggml_backend_sched_get_tensor_copy(ggml_backend_sched_t sched, struct ggml_tensor * tensor, ggml_backend_t backend);
+
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);

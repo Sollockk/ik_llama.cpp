@@ -457,6 +457,27 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
         params.kv_overrides.emplace_back();
         params.kv_overrides.back().key[0] = 0;
     }
+    // When --sharp is active, auto-add --cpu-moe if the user didn't already
+    // specify --cpu-moe or --n-cpu-moe.  Cross-type JIT overlays (e.g.
+    // TQ1_0 → Q3_K_M) only work on plain CPU buffers; CUDA host/pinned
+    // buffers have pre-allocated device copies at the blurry type size and
+    // cross-type overlays must be skipped there.  Putting ALL MoE expert
+    // tensors on plain CPU ensures every layer gets sharpened.
+    if (!params.sharp_model.empty()) {
+        bool has_cpu_moe = false;
+        for (const auto & ov : params.tensor_buft_overrides) {
+            if (ov.pattern && strstr(ov.pattern, "ffn_") && strstr(ov.pattern, "_exps")) {
+                has_cpu_moe = true;
+                break;
+            }
+        }
+        if (!has_cpu_moe) {
+            fprintf(stderr, "%s: --sharp active, auto-adding --cpu-moe "
+                    "(all MoE expert tensors → plain CPU for cross-type overlay)\n", __func__);
+            params.tensor_buft_overrides.push_back(
+                {strdup("\\.ffn_(up|down|gate)_exps\\.weight"), ggml_backend_cpu_buffer_type()});
+        }
+    }
     if (!params.tensor_buft_overrides.empty()) {
         params.tensor_buft_overrides.push_back({nullptr, nullptr});
     }
@@ -2336,6 +2357,20 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             }
             pos = next + 1;
         }
+        return true;
+    }
+    if (arg == "--bs-sharp-experts") {
+        CHECK_ARG
+        params.bs_sharp_experts = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-no-parallel-io") {
+        params.bs_parallel_expert_io = false;
+        return true;
+    }
+    if (arg == "--bs-gpu-cache") {
+        CHECK_ARG
+        params.bs_gpu_cache_mb = std::stoi(argv[i]);
         return true;
     }
 

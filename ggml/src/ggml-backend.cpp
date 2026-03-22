@@ -2073,6 +2073,16 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     last_ids_tensor = ids_tensor;
                 }
 
+                // If the device copy was allocated at a different (inflated) type
+                // (from pre-inflate for cross-type JIT overlay), skip the copy
+                // entirely.  The JIT eval callback will populate the device copy
+                // with the correct (sharp or blurry) data before the compute
+                // kernel reads it.  This avoids a wasted TQ1_0→GPU copy that
+                // would be immediately overwritten.
+                if (input->type != input_cpy->type) {
+                    continue;
+                }
+
                 const size_t expert_size = input->ne[2] > 1 ? input->nb[2] : input->nb[1];
 
                 if (input->ne[2] > 1) {
@@ -2720,6 +2730,21 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
         return NULL;
     }
     return sched->backends[backend_index];
+}
+
+struct ggml_tensor * ggml_backend_sched_get_tensor_copy(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor * tensor,
+        ggml_backend_t backend) {
+    if (!sched || !tensor || !backend) return NULL;
+    int backend_id = ggml_backend_sched_backend_id(sched, backend);
+    if (backend_id < 0) return NULL;
+    size_t id = ggml_hash_find(&sched->hash_set, tensor);
+    if (id == GGML_HASHSET_FULL || !ggml_bitset_get(sched->hash_set.used, id)) return NULL;
+    struct ggml_tensor * cpy = sched->hv_tensor_copies[id * sched->n_backends * sched->n_copies + backend_id * sched->n_copies + sched->cur_copy];
+    // Don't return the tensor itself (same backend = no copy needed)
+    if (cpy == tensor) return NULL;
+    return cpy;
 }
 
 // utils

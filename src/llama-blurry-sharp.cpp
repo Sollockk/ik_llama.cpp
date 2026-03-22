@@ -69,6 +69,49 @@ static void bs_sync_device_before_eviction(
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Parallel pread for expert slices (inspired by flash-moe's io_pool_dispatch)
+//
+// Reads multiple expert slices from the sharp GGUF file in parallel using
+// pthreads.  On NVMe SSDs with warm page cache, parallel reads achieve
+// significantly higher throughput than sequential reads.
+// ---------------------------------------------------------------------------
+
+#include <pthread.h>
+
+struct bs_pread_task {
+    int         fd;
+    void      * dst;
+    off_t       offset;
+    size_t      size;
+    ssize_t     result;
+};
+
+static void * bs_pread_worker(void * arg) {
+    auto * task = (bs_pread_task *)arg;
+    task->result = pread(task->fd, task->dst, task->size, task->offset);
+    return nullptr;
+}
+
+// Read n_tasks expert slices in parallel.  Falls back to sequential if n_tasks <= 1.
+static void bs_parallel_pread(bs_pread_task * tasks, int n_tasks) {
+    if (n_tasks <= 0) return;
+    if (n_tasks == 1) {
+        // Single task — no thread overhead
+        tasks[0].result = pread(tasks[0].fd, tasks[0].dst, tasks[0].size, tasks[0].offset);
+        return;
+    }
+
+    // Fire n_tasks threads
+    std::vector<pthread_t> threads(n_tasks);
+    for (int i = 0; i < n_tasks; ++i) {
+        pthread_create(&threads[i], nullptr, bs_pread_worker, &tasks[i]);
+    }
+    for (int i = 0; i < n_tasks; ++i) {
+        pthread_join(threads[i], nullptr);
+    }
+}
+
 // Check whether a tensor name corresponds to a merged expert tensor.
 // Merged expert tensors have names like:
 //   blk.N.ffn_gate_exps, blk.N.ffn_up_exps, blk.N.ffn_down_exps
@@ -4047,6 +4090,11 @@ static int64_t bs_overlay_expert_tensor(
 
             uint8_t * base_data = (uint8_t *)base_tensor->data;
 
+            // Phase 1: back up all blurry slices and check RAM cache
+            std::vector<int> file_miss_indices;  // indices into expert_ids[] needing file read
+            bool have_file = (si >= 0 && si < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si]);
+            int file_fd = have_file ? bsctx->sharp_files[si]->file_id() : -1;
+
             for (int32_t i = 0; i < n_experts_req; ++i) {
                 int32_t eidx = expert_ids[i];
                 size_t slice_offset = (size_t)eidx * base_expert_slice;
@@ -4058,12 +4106,8 @@ static int64_t bs_overlay_expert_tensor(
                 std::memcpy(backup_out.expert_backup_data.data() + old_size,
                             base_data + slice_offset, base_expert_slice);
 
-                // Read sharp slice into the same offset.
-                // Try RAM cache first, then file.
-                size_t slice_file_offset = sharp_info.file_offset + (size_t)eidx * sharp_expert_slice;
+                // Try RAM cache first
                 bool slice_ok = false;
-
-                // RAM cache: read the expert slice directly from the cached buffer
                 if (bsctx->ram_cache_populated) {
                     auto cache_it = bsctx->ram_cache.find(sharp_info.name);
                     if (cache_it != bsctx->ram_cache.end() && cache_it->second.size() >= sharp_info.nbytes) {
@@ -4075,21 +4119,19 @@ static int64_t bs_overlay_expert_tensor(
                     }
                 }
 
-                // Fallback: file read
                 if (!slice_ok) {
-                    if (si >= 0 && si < (int)bsctx->sharp_files.size() && bsctx->sharp_files[si]) {
-                        bsctx->sharp_files[si]->seek(slice_file_offset, SEEK_SET);
-                        bsctx->sharp_files[si]->read_raw(base_data + slice_offset, sharp_expert_slice);
-                        slice_ok = true;
-                    }
+                    file_miss_indices.push_back(i);
                 }
+            }
 
-                if (!slice_ok) {
-                    LLAMA_LOG_ERROR("%s: no data source for split %d (tensor '%s' expert %d)\n",
-                                   __func__, si, sharp_info.name.c_str(), eidx);
-                    // Restore already-overwritten slices
+            // Phase 2: parallel pread for all cache misses
+            if (!file_miss_indices.empty()) {
+                if (file_fd < 0) {
+                    LLAMA_LOG_ERROR("%s: no data source for split %d (tensor '%s', %d cache misses)\n",
+                                   __func__, si, sharp_info.name.c_str(), (int)file_miss_indices.size());
+                    // Restore all overwritten slices
                     size_t restore_off = 0;
-                    for (int32_t j = 0; j < i; ++j) {
+                    for (int32_t j = 0; j < n_experts_req; ++j) {
                         size_t roff = (size_t)backup_out.expert_backup_ids[j] * base_expert_slice;
                         std::memcpy(base_data + roff,
                                     backup_out.expert_backup_data.data() + restore_off,
@@ -4097,6 +4139,49 @@ static int64_t bs_overlay_expert_tensor(
                         restore_off += base_expert_slice;
                     }
                     return -1;
+                }
+
+                if (bsctx->params.parallel_expert_io && (int)file_miss_indices.size() > 1) {
+                    // Parallel pread: read all cache-miss expert slices simultaneously
+                    std::vector<bs_pread_task> tasks(file_miss_indices.size());
+                    for (size_t m = 0; m < file_miss_indices.size(); ++m) {
+                        int idx = file_miss_indices[m];
+                        int32_t eidx = expert_ids[idx];
+                        tasks[m].fd     = file_fd;
+                        tasks[m].dst    = base_data + (size_t)eidx * base_expert_slice;
+                        tasks[m].offset = (off_t)(sharp_info.file_offset + (size_t)eidx * sharp_expert_slice);
+                        tasks[m].size   = sharp_expert_slice;
+                        tasks[m].result = 0;
+                    }
+                    bs_parallel_pread(tasks.data(), (int)tasks.size());
+
+                    // Validate results
+                    for (size_t m = 0; m < tasks.size(); ++m) {
+                        if (tasks[m].result != (ssize_t)sharp_expert_slice) {
+                            LLAMA_LOG_ERROR("%s: pread failed for expert %d of tensor '%s': %zd/%zu\n",
+                                           __func__, expert_ids[file_miss_indices[m]],
+                                           sharp_info.name.c_str(), tasks[m].result, sharp_expert_slice);
+                            // Restore all overwritten slices
+                            size_t restore_off = 0;
+                            for (int32_t j = 0; j < n_experts_req; ++j) {
+                                size_t roff = (size_t)backup_out.expert_backup_ids[j] * base_expert_slice;
+                                std::memcpy(base_data + roff,
+                                            backup_out.expert_backup_data.data() + restore_off,
+                                            base_expert_slice);
+                                restore_off += base_expert_slice;
+                            }
+                            return -1;
+                        }
+                    }
+                } else {
+                    // Sequential fallback (single miss or parallel disabled)
+                    for (int idx : file_miss_indices) {
+                        int32_t eidx = expert_ids[idx];
+                        size_t slice_offset = (size_t)eidx * base_expert_slice;
+                        size_t slice_file_offset = sharp_info.file_offset + (size_t)eidx * sharp_expert_slice;
+                        bsctx->sharp_files[si]->seek(slice_file_offset, SEEK_SET);
+                        bsctx->sharp_files[si]->read_raw(base_data + slice_offset, sharp_expert_slice);
+                    }
                 }
             }
 
@@ -5158,4 +5243,295 @@ int32_t llama_blurry_sharp_apply_experts(
     }
 
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// GPU Expert Cache
+//
+// Persistent GPU-side cache of sharp (Q3_K_M) expert slices.  Cache hits
+// use fast GPU→GPU copy (~10μs per 5MB slice on a 3090).  Cache misses
+// read from SSD/page-cache → host → GPU cache + device copy.
+//
+// Between tokens, expert routing has strong temporal locality (70-95% of
+// experts repeat), so most slices are already cached → dramatically reduces
+// PCIe and SSD I/O per token.
+// ---------------------------------------------------------------------------
+
+static uint64_t bs_gpu_cache_key(const std::string & tensor_name, int expert_id) {
+    // Simple hash combining tensor name and expert ID
+    uint64_t h = 14695981039346656037ULL; // FNV-1a offset basis
+    for (char c : tensor_name) {
+        h ^= (uint64_t)(unsigned char)c;
+        h *= 1099511628211ULL;
+    }
+    h ^= (uint64_t)expert_id;
+    h *= 1099511628211ULL;
+    return h;
+}
+
+void llama_blurry_sharp_gpu_cache_init(
+        llama_blurry_sharp_context * bsctx,
+        ggml_backend_t               gpu_backend) {
+    if (!bsctx || !gpu_backend) return;
+    auto & cache = bsctx->gpu_cache;
+    if (cache.enabled) return;  // already initialized
+
+    int64_t cache_bytes = bsctx->params.gpu_cache_bytes;
+    if (cache_bytes <= 0) return;  // disabled
+
+    // Allocate GPU buffer
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(gpu_backend);
+    cache.cache_buf = ggml_backend_buft_alloc_buffer(buft, (size_t)cache_bytes);
+    if (!cache.cache_buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate GPU expert cache (%lld MiB)\n",
+                       __func__, (long long)(cache_bytes / (1024 * 1024)));
+        return;
+    }
+
+    cache.gpu_base    = ggml_backend_buffer_get_base(cache.cache_buf);
+    cache.total_bytes = (size_t)cache_bytes;
+    cache.used_bytes  = 0;
+    cache.gpu_backend = gpu_backend;
+    cache.enabled     = true;
+
+    // Initialize free list with one big block
+    cache.free_list.clear();
+    cache.free_list.push_back({0, cache.total_bytes});
+
+    LLAMA_LOG_INFO("%s: GPU expert cache initialized: %.1f MiB on %s\n",
+                   __func__,
+                   cache.total_bytes / (1024.0 * 1024.0),
+                   ggml_backend_name(gpu_backend));
+}
+
+// Allocate space in the cache, evicting LRU entries if needed.
+// Returns byte offset into cache buffer, or -1 on failure.
+static int64_t bs_gpu_cache_alloc(
+        llama_blurry_sharp_context::gpu_expert_cache & cache,
+        size_t size) {
+    // Alignment to 512 bytes for GPU efficiency
+    size = (size + 511) & ~(size_t)511;
+
+    // First-fit search
+    for (size_t i = 0; i < cache.free_list.size(); ++i) {
+        auto & blk = cache.free_list[i];
+        if (blk.size >= size) {
+            size_t offset = blk.offset;
+            if (blk.size == size) {
+                cache.free_list.erase(cache.free_list.begin() + i);
+            } else {
+                blk.offset += size;
+                blk.size   -= size;
+            }
+            cache.used_bytes += size;
+            return (int64_t)offset;
+        }
+    }
+
+    // No space — evict LRU entries until we have enough
+    while (cache.used_bytes + size > cache.total_bytes && !cache.entries.empty()) {
+        // Find LRU entry
+        uint64_t lru_key = 0;
+        int64_t  lru_access = INT64_MAX;
+        for (auto & [key, entry] : cache.entries) {
+            if (entry.last_access < lru_access) {
+                lru_access = entry.last_access;
+                lru_key    = key;
+            }
+        }
+        auto it = cache.entries.find(lru_key);
+        if (it == cache.entries.end()) break;
+
+        // Free the entry
+        size_t freed_offset = it->second.offset;
+        size_t freed_size   = (it->second.size + 511) & ~(size_t)511;
+        cache.used_bytes -= freed_size;
+        cache.entries.erase(it);
+
+        // Add to free list and coalesce
+        cache.free_list.push_back({freed_offset, freed_size});
+        // Simple coalescing: sort by offset and merge adjacent
+        std::sort(cache.free_list.begin(), cache.free_list.end(),
+            [](const auto & a, const auto & b) { return a.offset < b.offset; });
+        for (size_t j = 0; j + 1 < cache.free_list.size(); ) {
+            auto & a = cache.free_list[j];
+            auto & b = cache.free_list[j + 1];
+            if (a.offset + a.size == b.offset) {
+                a.size += b.size;
+                cache.free_list.erase(cache.free_list.begin() + j + 1);
+            } else {
+                ++j;
+            }
+        }
+    }
+
+    // Try first-fit again after eviction
+    for (size_t i = 0; i < cache.free_list.size(); ++i) {
+        auto & blk = cache.free_list[i];
+        if (blk.size >= size) {
+            size_t offset = blk.offset;
+            if (blk.size == size) {
+                cache.free_list.erase(cache.free_list.begin() + i);
+            } else {
+                blk.offset += size;
+                blk.size   -= size;
+            }
+            cache.used_bytes += size;
+            return (int64_t)offset;
+        }
+    }
+
+    return -1;  // still can't fit
+}
+
+// Look up an expert slice in the GPU cache.
+// On hit: updates LRU, returns cache_offset.  On miss: returns -1.
+int64_t bs_gpu_cache_lookup(
+        llama_blurry_sharp_context::gpu_expert_cache & cache,
+        const std::string & tensor_name,
+        int expert_id) {
+    uint64_t key = bs_gpu_cache_key(tensor_name, expert_id);
+    auto it = cache.entries.find(key);
+    if (it == cache.entries.end()) return -1;
+    it->second.last_access = ++cache.access_counter;
+    return (int64_t)it->second.offset;
+}
+
+// Store an expert slice in the GPU cache (host_data → GPU cache buffer).
+// Returns cache offset on success, -1 on failure.
+int64_t bs_gpu_cache_store(
+        llama_blurry_sharp_context::gpu_expert_cache & cache,
+        const std::string & tensor_name,
+        int expert_id,
+        const void * host_data,
+        size_t size) {
+    uint64_t key = bs_gpu_cache_key(tensor_name, expert_id);
+
+    // Check if already stored (update access time)
+    auto it = cache.entries.find(key);
+    if (it != cache.entries.end()) {
+        it->second.last_access = ++cache.access_counter;
+        return (int64_t)it->second.offset;
+    }
+
+    // Allocate space (may evict LRU entries)
+    int64_t offset = bs_gpu_cache_alloc(cache, size);
+    if (offset < 0) return -1;
+
+    // Upload host data to GPU cache buffer using a temporary tensor descriptor
+    {
+        ggml_tensor tmp = {};
+        tmp.type  = GGML_TYPE_I8;
+        tmp.ne[0] = (int64_t)size;
+        tmp.ne[1] = tmp.ne[2] = tmp.ne[3] = 1;
+        tmp.nb[0] = 1;
+        tmp.nb[1] = (int64_t)size;
+        tmp.nb[2] = (int64_t)size;
+        tmp.nb[3] = (int64_t)size;
+        tmp.data   = (uint8_t *)cache.gpu_base + offset;
+        tmp.buffer = cache.cache_buf;
+
+        ggml_backend_tensor_set(&tmp, host_data, 0, size);
+    }
+
+    // Record entry
+    cache.entries[key] = {(size_t)offset, size, ++cache.access_counter};
+    return offset;
+}
+
+// Copy an expert slice from GPU cache to a device copy tensor.
+// Uses GPU→GPU copy (ggml_backend_buffer_copy_tensor) — ~10μs per 5MB.
+void bs_gpu_cache_copy_to_dcpy(
+        llama_blurry_sharp_context::gpu_expert_cache & cache,
+        int64_t cache_offset,
+        size_t  size,
+        ggml_tensor * dcpy,
+        size_t  dcpy_offset) {
+    // Create temporary tensor descriptors for GPU→GPU copy
+    ggml_tensor src = {};
+    src.type  = GGML_TYPE_I8;
+    src.ne[0] = (int64_t)size;
+    src.ne[1] = src.ne[2] = src.ne[3] = 1;
+    src.nb[0] = 1;
+    src.nb[1] = (int64_t)size;
+    src.nb[2] = (int64_t)size;
+    src.nb[3] = (int64_t)size;
+    src.data   = (uint8_t *)cache.gpu_base + cache_offset;
+    src.buffer = cache.cache_buf;
+
+    ggml_tensor dst = {};
+    dst.type  = GGML_TYPE_I8;
+    dst.ne[0] = (int64_t)size;
+    dst.ne[1] = dst.ne[2] = dst.ne[3] = 1;
+    dst.nb[0] = 1;
+    dst.nb[1] = (int64_t)size;
+    dst.nb[2] = (int64_t)size;
+    dst.nb[3] = (int64_t)size;
+    dst.data   = (uint8_t *)dcpy->data + dcpy_offset;
+    dst.buffer = dcpy->buffer;
+
+    // ggml_backend_tensor_copy handles same-backend GPU→GPU via
+    // cudaMemcpyDeviceToDevice, and falls back to host staging otherwise.
+    ggml_backend_tensor_copy(&src, &dst);
+}
+
+// ---------------------------------------------------------------------------
+// Expert tensor type inflation/deflation for scheduler device copy sizing
+//
+// The backend scheduler creates device copies of host tensors at graph-alloc
+// time, sized according to the tensor's current type.  For cross-type JIT
+// overlays (e.g. TQ1_0 → Q3_K_M), the sharp data is larger than the blurry
+// tensor.  By temporarily setting expert tensor types to the sharp type
+// BEFORE alloc, the scheduler allocates device copies large enough to hold
+// sharp data.  We restore the original types immediately after alloc.
+// ---------------------------------------------------------------------------
+
+void llama_blurry_sharp_inflate_expert_types(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->model) return;
+
+    bsctx->inflate_saved_types.clear();
+
+    for (auto & [name, info] : bsctx->sharp_index) {
+        if (!bs_is_expert_tensor(name)) continue;
+
+        ggml_tensor * t = info.base_tensor;
+        if (!t) {
+            t = bs_find_model_tensor(bsctx->model, name.c_str());
+            if (!t) continue;
+            info.base_tensor = t;
+        }
+
+        // Only inflate if the sharp type is different (and larger)
+        if (t->type == info.type) continue;
+
+        // Save original type and strides for deflation
+        size_t orig_nb[GGML_MAX_DIMS];
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) orig_nb[d] = t->nb[d];
+        bsctx->inflate_saved_types.push_back({t, t->type, {}});
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            bsctx->inflate_saved_types.back().orig_nb[d] = orig_nb[d];
+        }
+
+        // Set tensor to the sharp type so scheduler sizes device copies for it
+        t->type  = info.type;
+        t->nb[0] = ggml_type_size(info.type);
+        t->nb[1] = ggml_row_size(info.type, t->ne[0]);
+        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+            t->nb[d] = t->nb[d - 1] * t->ne[d - 1];
+        }
+    }
+}
+
+void llama_blurry_sharp_deflate_expert_types(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx) return;
+
+    for (auto & saved : bsctx->inflate_saved_types) {
+        saved.tensor->type = saved.orig_type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            saved.tensor->nb[d] = saved.orig_nb[d];
+        }
+    }
+    bsctx->inflate_saved_types.clear();
 }

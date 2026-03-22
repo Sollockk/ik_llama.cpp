@@ -366,6 +366,47 @@ struct llama_blurry_sharp_context {
     // Count of host cross-type tensors skipped in JIT mode (for diagnostics)
     int32_t n_jit_host_crosstype_skipped = 0;
 
+    // Saved original types for inflate/deflate cycle.
+    // Populated by llama_blurry_sharp_inflate_expert_types(), consumed by deflate.
+    struct inflate_saved_entry {
+        ggml_tensor * tensor;
+        ggml_type     orig_type;
+        size_t        orig_nb[GGML_MAX_DIMS];
+    };
+    std::vector<inflate_saved_entry> inflate_saved_types;
+
+    // ---- GPU Expert Cache ----
+    // Persistent GPU-side cache of Q3_K_M (sharp) expert slices.
+    // Cache hits use fast GPU→GPU copy; misses read from SSD and populate cache.
+    // Between tokens, expert routing has temporal locality, so most slices
+    // are already cached → dramatically reduces PCIe/SSD I/O.
+    struct gpu_expert_cache {
+        bool enabled = false;
+        ggml_backend_t gpu_backend = nullptr;
+        ggml_backend_buffer_t cache_buf = nullptr;
+        void * gpu_base = nullptr;          // device pointer (base of cache_buf)
+        size_t total_bytes = 0;
+        size_t used_bytes = 0;
+
+        struct entry {
+            size_t offset;          // byte offset in cache_buf
+            size_t size;            // byte size of the cached slice
+            int64_t last_access;    // access counter for LRU eviction
+        };
+
+        // Key: "tensor_name\0expert_id" → cache entry
+        std::unordered_map<uint64_t, entry> entries;
+        int64_t access_counter = 0;
+
+        // Simple free-list arena allocator (first-fit).
+        struct free_block { size_t offset, size; };
+        std::vector<free_block> free_list;
+
+        // Stats
+        int64_t n_hits = 0;
+        int64_t n_misses = 0;
+    } gpu_cache;
+
     // -- self-eviction guard --
     // During apply_layer / apply_experts, tensors are overlaid one at a time.
     // Each overlay may allocate a new device buffer and insert it into the
@@ -394,6 +435,32 @@ struct llama_blurry_sharp_context {
 // ---------------------------------------------------------------------------
 // Internal C++ helpers  (not exposed through the public C API)
 // ---------------------------------------------------------------------------
+
+// Initialize the GPU expert cache.  Call once with a GPU backend after
+// the blurry-sharp context is created and params.gpu_cache_bytes > 0.
+void llama_blurry_sharp_gpu_cache_init(
+        llama_blurry_sharp_context * bsctx,
+        ggml_backend_t               gpu_backend);
+
+// GPU expert cache helpers (used by JIT callback in llama.cpp)
+int64_t bs_gpu_cache_lookup(
+        llama_blurry_sharp_context::gpu_expert_cache & cache,
+        const std::string & tensor_name,
+        int expert_id);
+
+int64_t bs_gpu_cache_store(
+        llama_blurry_sharp_context::gpu_expert_cache & cache,
+        const std::string & tensor_name,
+        int expert_id,
+        const void * host_data,
+        size_t size);
+
+void bs_gpu_cache_copy_to_dcpy(
+        llama_blurry_sharp_context::gpu_expert_cache & cache,
+        int64_t cache_offset,
+        size_t  size,
+        ggml_tensor * dcpy,
+        size_t  dcpy_offset);
 
 // Pre-read all sharp tensor data into anonymous heap buffers (RAM cache).
 // This populates the RAM tier so that data can be swapped out under pressure

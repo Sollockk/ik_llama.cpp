@@ -3256,6 +3256,7 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
         // ----- JIT per-layer sharpening -----
         // This is the core of the "hot-swap one layer at a time" approach.
         // Only one layer is ever sharpened simultaneously.
+        bool jit_overlaid = false;
         if (lctx->jit_sharpening && lctx->jit_bsctx) {
             // 1) Restore the previous layer (if any)
             if (lctx->jit_current_layer >= 0) {
@@ -3299,17 +3300,35 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                 goto jit_done;
             }
 
-            // 3) Collect unique expert IDs for this layer
+            // 3) Collect unique expert IDs for this layer, ranked by frequency
             {
-                std::unordered_set<int32_t> unique_ids;
+                // Count how many tokens selected each expert (frequency = importance)
+                std::unordered_map<int32_t, int> expert_freq;
                 for (size_t i = 0; i < n_ids; ++i) {
                     if (ids[i] >= 0) {
-                        unique_ids.insert(ids[i]);
+                        expert_freq[ids[i]]++;
                     }
                 }
 
-                if (!unique_ids.empty()) {
-                    std::vector<int32_t> expert_vec(unique_ids.begin(), unique_ids.end());
+                if (!expert_freq.empty()) {
+                    // Sort by frequency descending (most-used experts first)
+                    std::vector<std::pair<int32_t, int>> sorted_experts(
+                        expert_freq.begin(), expert_freq.end());
+                    std::sort(sorted_experts.begin(), sorted_experts.end(),
+                        [](const auto & a, const auto & b) { return a.second > b.second; });
+
+                    // Mixed-precision: only overlay top-N experts if configured
+                    int n_sharp = lctx->jit_bsctx->params.n_sharp_experts;
+                    int n_to_overlay = (int)sorted_experts.size();
+                    if (n_sharp > 0 && n_sharp < n_to_overlay) {
+                        n_to_overlay = n_sharp;
+                    }
+
+                    std::vector<int32_t> expert_vec;
+                    expert_vec.reserve(n_to_overlay);
+                    for (int i = 0; i < n_to_overlay; ++i) {
+                        expert_vec.push_back(sorted_experts[i].first);
+                    }
 
                     // 4) Sharpen this layer's expert weights
                     int32_t ret = llama_blurry_sharp_apply_experts(
@@ -3318,13 +3337,170 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
 
                     if (ret == 0) {
                         lctx->jit_current_layer = layer_idx;
+                        jit_overlaid = true;
+
+                        // 5) Upload sharp expert slices to GPU device copies.
+                        //    Since we skipped only_active_experts for type-mismatched
+                        //    tensors, the device copy is empty.  Use GPU cache for
+                        //    fast GPU→GPU copies on repeat experts.
+                        {
+                            auto & gcache = lctx->jit_bsctx->gpu_cache;
+                            auto lt_it = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
+                            if (lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
+                                int n_be = ggml_backend_sched_get_n_backends(lctx->sched);
+                                for (const auto & tname : lt_it->second) {
+                                    if (tname.find("_exps") == std::string::npos) continue;
+                                    auto si_it = lctx->jit_bsctx->sharp_index.find(tname);
+                                    if (si_it == lctx->jit_bsctx->sharp_index.end()) continue;
+                                    ggml_tensor * bt = si_it->second.base_tensor;
+                                    if (!bt || !bt->data) continue;
+
+                                    for (int bi = 0; bi < n_be; ++bi) {
+                                        ggml_backend_t be = ggml_backend_sched_get_backend(lctx->sched, bi);
+                                        if (ggml_backend_is_cpu(be)) continue;
+
+                                        // Lazy-init GPU cache on first use
+                                        if (!gcache.enabled && lctx->jit_bsctx->params.gpu_cache_bytes > 0) {
+                                            llama_blurry_sharp_gpu_cache_init(lctx->jit_bsctx, be);
+                                        }
+
+                                        ggml_tensor * dcpy = ggml_backend_sched_get_tensor_copy(
+                                            lctx->sched, bt, be);
+                                        if (!dcpy) {
+                                            static int n_dcpy_miss = 0;
+                                            if (n_dcpy_miss++ < 5) {
+                                                fprintf(stderr, "JIT-GPU: no device copy for '%s' on %s (bt->type=%d)\n",
+                                                        tname.c_str(), ggml_backend_name(be), bt->type);
+                                            }
+                                            continue;
+                                        }
+
+                                        static int n_dcpy_ok = 0;
+                                        if (n_dcpy_ok++ < 3) {
+                                            fprintf(stderr, "JIT-GPU: uploading '%s' experts to %s dcpy (bt->type=%d→dcpy->type=%d, stride=%zu)\n",
+                                                    tname.c_str(), ggml_backend_name(be), bt->type, dcpy->type,
+                                                    (size_t)(bt->ne[2] > 1 ? bt->nb[2] : bt->nb[1]));
+                                        }
+
+                                        // Sync device copy type/strides to sharp type
+                                        dcpy->type = bt->type;
+                                        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                                            dcpy->nb[d] = bt->nb[d];
+                                        }
+
+                                        // Upload active expert slices, using GPU cache
+                                        if (bt->ne[2] > 1) {
+                                            size_t expert_stride = bt->nb[2];
+                                            for (int ei = 0; ei < (int)expert_vec.size(); ++ei) {
+                                                int32_t eid = expert_vec[ei];
+                                                size_t off = (size_t)eid * expert_stride;
+                                                size_t sz  = expert_stride;
+                                                if (off + sz > ggml_nbytes(bt)) continue;
+
+                                                if (gcache.enabled) {
+                                                    // Check GPU cache
+                                                    int64_t cache_off = bs_gpu_cache_lookup(
+                                                        gcache, tname, eid);
+                                                    if (cache_off >= 0) {
+                                                        // Cache HIT: GPU→GPU copy (~10μs)
+                                                        bs_gpu_cache_copy_to_dcpy(
+                                                            gcache, cache_off, sz, dcpy, off);
+                                                        gcache.n_hits++;
+                                                    } else {
+                                                        // Cache MISS: host→GPU cache + device copy
+                                                        const void * src = (const uint8_t *)bt->data + off;
+                                                        cache_off = bs_gpu_cache_store(
+                                                            gcache, tname, eid, src, sz);
+                                                        if (cache_off >= 0) {
+                                                            // Stored in cache, now GPU→GPU to dcpy
+                                                            bs_gpu_cache_copy_to_dcpy(
+                                                                gcache, cache_off, sz, dcpy, off);
+                                                        } else {
+                                                            // Cache full, direct host→GPU
+                                                            ggml_backend_tensor_set(dcpy, src, off, sz);
+                                                        }
+                                                        gcache.n_misses++;
+                                                    }
+                                                } else {
+                                                    // No cache: direct host→GPU
+                                                    ggml_backend_tensor_set(dcpy,
+                                                        (const uint8_t *)bt->data + off, off, sz);
+                                                }
+                                            }
+                                        } else {
+                                            ggml_backend_tensor_set(dcpy, bt->data, 0, ggml_nbytes(bt));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Prefetch next layer's sharp data into page cache
+                        int next_layer = layer_idx + 1;
+                        if (next_layer < (int)lctx->model.hparams.n_layer) {
+                            llama_blurry_sharp_prefetch_layer(lctx->jit_bsctx, next_layer);
+                        }
                     }
-                    // If sharpening fails, we just continue with blurry weights
-                    // for this layer — degraded quality but no crash.
+                    // If sharpening fails, we fall through to jit_done
+                    // which uploads TQ1_0 data as fallback.
                 }
             }
 
             jit_done:;
+
+            // 6) Fallback: if JIT overlay was skipped or failed for this layer,
+            //    the device copy is empty (we skipped only_active_experts).
+            //    Upload TQ1_0 (blurry) data so the kernel has valid data.
+            if (!jit_overlaid && lctx->jit_bsctx) {
+                static int n_fallback = 0;
+                if (n_fallback++ < 5) {
+                    fprintf(stderr, "JIT-GPU: FALLBACK layer %d — uploading TQ1_0 data\n", layer_idx);
+                }
+                auto lt_it = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
+                if (lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
+                    int n_be = ggml_backend_sched_get_n_backends(lctx->sched);
+                    for (const auto & tname : lt_it->second) {
+                        if (tname.find("_exps") == std::string::npos) continue;
+                        auto si_it = lctx->jit_bsctx->sharp_index.find(tname);
+                        if (si_it == lctx->jit_bsctx->sharp_index.end()) continue;
+                        ggml_tensor * bt = si_it->second.base_tensor;
+                        if (!bt || !bt->data) continue;
+
+                        for (int bi = 0; bi < n_be; ++bi) {
+                            ggml_backend_t be = ggml_backend_sched_get_backend(lctx->sched, bi);
+                            if (ggml_backend_is_cpu(be)) continue;
+                            ggml_tensor * dcpy = ggml_backend_sched_get_tensor_copy(
+                                lctx->sched, bt, be);
+                            if (!dcpy) continue;
+
+                            // Sync device copy to TQ1_0 type
+                            dcpy->type = bt->type;
+                            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                                dcpy->nb[d] = bt->nb[d];
+                            }
+
+                            // Upload active TQ1_0 expert slices
+                            if (bt->ne[2] > 1 && n_ids > 0) {
+                                size_t expert_stride = bt->nb[2];
+                                // Use the parsed expert IDs (ids array)
+                                std::unordered_set<int32_t> unique_eids;
+                                for (size_t i = 0; i < n_ids; ++i) {
+                                    if (ids[i] >= 0) unique_eids.insert(ids[i]);
+                                }
+                                for (int32_t eid : unique_eids) {
+                                    size_t off = (size_t)eid * expert_stride;
+                                    if (off + expert_stride <= ggml_nbytes(bt)) {
+                                        ggml_backend_tensor_set(dcpy,
+                                            (const uint8_t *)bt->data + off, off, expert_stride);
+                                    }
+                                }
+                            } else {
+                                ggml_backend_tensor_set(dcpy, bt->data, 0, ggml_nbytes(bt));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3692,7 +3868,16 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
+            // Pre-inflate expert tensor types so scheduler allocates device
+            // copies at the sharp (larger) size, enabling cross-type JIT overlay.
+            if (lctx.jit_sharpening && lctx.jit_bsctx) {
+                llama_blurry_sharp_inflate_expert_types(lctx.jit_bsctx);
+            }
             ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            // Restore original (blurry) types now that device copies are sized.
+            if (lctx.jit_sharpening && lctx.jit_bsctx) {
+                llama_blurry_sharp_deflate_expert_types(lctx.jit_bsctx);
+            }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
@@ -4617,6 +4802,9 @@ struct llama_blurry_sharp_params llama_blurry_sharp_default_params() {
     params.permanent             = false;
     params.lazy_swap             = false;
     params.retain_mmap_pages     = false;
+    params.n_sharp_experts       = 0;
+    params.parallel_expert_io    = true;
+    params.gpu_cache_bytes       = 0;
     return params;
 }
 
