@@ -3752,7 +3752,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // During generation: host_only=false — all layers sharpened (batch=1, safe).
         const bool jit_this_batch = bs_moe_active && !bs_spec_verify;
         if (jit_this_batch) {
-            llama_blurry_sharp_start_jit(bsctx, ctx, /*host_only=*/ !is_generation);
+            llama_blurry_sharp_start_jit(bsctx, ctx, /*host_only=*/ false);
         }
 
         // Speculative verify: record router data during blurry pass
