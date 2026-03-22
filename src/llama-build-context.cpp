@@ -9822,6 +9822,26 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             }
         }
 
+        // Force MoE expert computation results to GPU when JIT sharpening is active.
+        // Without this, the scheduler assigns MoE to CPU (because --cpu-moe puts
+        // expert weight tensors on CPU), making MoE compute ~100x slower than GPU.
+        // By forcing results to GPU, the scheduler creates GPU device copies of the
+        // CPU expert weight inputs.  The JIT callback then uploads sharp (Q4_K_M)
+        // data to those copies, giving us GPU MoE with sharp quality.
+        if (lctx.jit_sharpening && il >= 0 &&
+            (strcmp(name, "ffn_moe_up") == 0 ||
+             strcmp(name, "ffn_moe_gate") == 0 ||
+             strcmp(name, "ffn_moe_down") == 0 ||
+             strcmp(name, "ffn_moe_gate_par") == 0)) {
+            for (auto * backend : lctx.backends) {
+                if (!ggml_backend_is_cpu(backend) &&
+                    ggml_backend_supports_op(backend, cur)) {
+                    ggml_backend_sched_set_tensor_backend(lctx.sched, cur, backend);
+                    break;
+                }
+            }
+        }
+
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = lctx.model.n_gpu_layers > (int)lctx.model.hparams.n_layer;

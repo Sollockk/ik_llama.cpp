@@ -3523,12 +3523,25 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
             //    the device copy is empty (we skipped only_active_experts).
             //    Upload TQ1_0 (blurry) data so the kernel has valid data.
             if (!jit_overlaid && lctx->jit_bsctx) {
-                static int n_fallback = 0;
-                if (n_fallback++ < 5) {
-                    fprintf(stderr, "JIT-GPU: FALLBACK layer %d — uploading TQ1_0 data\n", layer_idx);
-                }
+                // Check if this layer even has expert tensors — dense (non-MoE)
+                // layers have nothing to overlay, so no fallback needed.
+                bool has_experts = false;
                 auto lt_it = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
                 if (lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
+                    for (const auto & tname : lt_it->second) {
+                        if (tname.find("_exps") != std::string::npos) {
+                            has_experts = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Only do fallback upload for MoE layers that actually failed
+                if (has_experts && lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
+                    static int n_fallback = 0;
+                    if (n_fallback++ < 5) {
+                        fprintf(stderr, "JIT-GPU: FALLBACK layer %d — MoE overlay failed, using blurry\n", layer_idx);
+                    }
                     int n_be = ggml_backend_sched_get_n_backends(lctx->sched);
                     for (const auto & tname : lt_it->second) {
                         if (tname.find("_exps") == std::string::npos) continue;
@@ -3553,7 +3566,6 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                             // Upload active TQ1_0 expert slices
                             if (bt->ne[2] > 1 && n_ids > 0) {
                                 size_t expert_stride = bt->nb[2];
-                                // Use the parsed expert IDs (ids array)
                                 std::unordered_set<int32_t> unique_eids;
                                 for (size_t i = 0; i < n_ids; ++i) {
                                     if (ids[i] >= 0) unique_eids.insert(ids[i]);

@@ -3750,6 +3750,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // During prompt: host_only=true — only CPU MoE layers are sharpened,
         //   preserving CUDA graph capture on GPU splits.
         // During generation: host_only=false — all layers sharpened (batch=1, safe).
+        // JIT sharp overlay for both prompt and generation.
+        // MoE results are forced to GPU, so the scheduler creates device copies
+        // for CPU expert weights.  The JIT callback uploads sharp data to GPU.
         const bool jit_this_batch = bs_moe_active && !bs_spec_verify;
         if (jit_this_batch) {
             llama_blurry_sharp_start_jit(bsctx, ctx, /*host_only=*/ false);
