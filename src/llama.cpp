@@ -3258,11 +3258,26 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
         // Only one layer is ever sharpened simultaneously.
         bool jit_overlaid = false;
         if (lctx->jit_sharpening && lctx->jit_bsctx) {
+            // Timing accumulators (per-token, printed periodically)
+            static int64_t t_restore_us = 0, t_apply_us = 0, t_upload_us = 0, t_fallback_us = 0;
+            static int64_t n_upload_calls = 0, n_upload_bytes = 0;
+            static int     n_tokens_timed = 0;
+            static int     current_layer_count = 0;
+            auto now_us = []() {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                return (int64_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+            };
+
+            int64_t t0 = now_us();
+
             // 1) Restore the previous layer (if any)
             if (lctx->jit_current_layer >= 0) {
                 llama_blurry_sharp_restore_layer(lctx->jit_bsctx, lctx->jit_current_layer);
                 lctx->jit_current_layer = -1;
             }
+            int64_t t1 = now_us();
+            t_restore_us += (t1 - t0);
 
             // 2a) Host-only mode: skip layers whose expert tensors are on GPU
             //     to preserve CUDA graphs.  Check an actual expert tensor
@@ -3331,15 +3346,19 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                     }
 
                     // 4) Sharpen this layer's expert weights
+                    int64_t t2 = now_us();
                     int32_t ret = llama_blurry_sharp_apply_experts(
                         lctx->jit_bsctx, layer_idx,
                         expert_vec.data(), (int32_t)expert_vec.size());
+                    int64_t t3 = now_us();
+                    t_apply_us += (t3 - t2);
 
                     if (ret == 0) {
                         lctx->jit_current_layer = layer_idx;
                         jit_overlaid = true;
 
                         // 5) Upload sharp expert slices to GPU device copies.
+                        int64_t t_upload_start = now_us();
                         //    Since we skipped only_active_experts for type-mismatched
                         //    tensors, the device copy is empty.  Use GPU cache for
                         //    fast GPU→GPU copies on repeat experts.
@@ -3362,6 +3381,10 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                         // Lazy-init GPU cache on first use
                                         if (!gcache.enabled && lctx->jit_bsctx->params.gpu_cache_bytes > 0) {
                                             llama_blurry_sharp_gpu_cache_init(lctx->jit_bsctx, be);
+                                        }
+                                        // Set backend on pre-allocated cache if not yet set
+                                        if (gcache.enabled && !gcache.gpu_backend) {
+                                            gcache.gpu_backend = be;
                                         }
 
                                         ggml_tensor * dcpy = ggml_backend_sched_get_tensor_copy(
@@ -3435,10 +3458,21 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                             }
                         }
 
-                        // Prefetch next layer's sharp data into page cache
-                        int next_layer = layer_idx + 1;
-                        if (next_layer < (int)lctx->model.hparams.n_layer) {
-                            llama_blurry_sharp_prefetch_layer(lctx->jit_bsctx, next_layer);
+                        int64_t t_upload_end = now_us();
+                        t_upload_us += (t_upload_end - t_upload_start);
+
+                        // Prefetch upcoming layers' expert slices into page
+                        // cache.  Use the current layer's active experts as
+                        // a prediction (expert routing has ~70% overlap
+                        // between adjacent layers).  Targeted prefetch: only
+                        // the needed slices, not the full 160-expert tensors.
+                        for (int pf = 1; pf <= 5; ++pf) {
+                            int pf_layer = layer_idx + pf;
+                            if (pf_layer < (int)lctx->model.hparams.n_layer) {
+                                llama_blurry_sharp_prefetch_expert_slices(
+                                    lctx->jit_bsctx, pf_layer,
+                                    expert_vec.data(), (int32_t)expert_vec.size());
+                            }
                         }
                     }
                     // If sharpening fails, we fall through to jit_done
@@ -3447,6 +3481,43 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
             }
 
             jit_done:;
+            current_layer_count++;
+
+            // Print timing every ~52 layers (≈ 1 token)
+            static int prev_layer_idx = -1;
+            if (layer_idx < prev_layer_idx && current_layer_count > 10) {
+                n_tokens_timed++;
+                auto & gc = lctx->jit_bsctx->gpu_cache;
+                if (n_tokens_timed <= 10 || (n_tokens_timed % 20 == 0)) {
+                    fprintf(stderr, "JIT-TIMING[tok %d]: restore=%.1fms apply=%.1fms upload=%.1fms "
+                                    "fallback=%.1fms | layers=%d",
+                            n_tokens_timed,
+                            t_restore_us / 1000.0,
+                            t_apply_us / 1000.0,
+                            t_upload_us / 1000.0,
+                            t_fallback_us / 1000.0,
+                            current_layer_count);
+                    if (gc.enabled) {
+                        fprintf(stderr, " | gpu-cache: hits=%lld misses=%lld (%.0f%%)",
+                                (long long)gc.n_hits, (long long)gc.n_misses,
+                                (gc.n_hits + gc.n_misses) > 0
+                                    ? 100.0 * gc.n_hits / (gc.n_hits + gc.n_misses) : 0.0);
+                    }
+                    auto & rc = lctx->jit_bsctx->ram_expert_cache;
+                    if (rc.enabled) {
+                        int64_t rt = rc.n_hits + rc.n_misses;
+                        fprintf(stderr, " | ram-cache: hits=%lld misses=%lld (%.0f%%) %.1fMiB",
+                                (long long)rc.n_hits, (long long)rc.n_misses,
+                                rt > 0 ? 100.0 * rc.n_hits / rt : 0.0,
+                                rc.used_bytes / (1024.0 * 1024.0));
+                    }
+                    fprintf(stderr, "\n");
+                }
+                t_restore_us = t_apply_us = t_upload_us = t_fallback_us = 0;
+                n_upload_calls = n_upload_bytes = 0;
+                current_layer_count = 0;
+            }
+            prev_layer_idx = layer_idx;
 
             // 6) Fallback: if JIT overlay was skipped or failed for this layer,
             //    the device copy is empty (we skipped only_active_experts).
@@ -4805,6 +4876,7 @@ struct llama_blurry_sharp_params llama_blurry_sharp_default_params() {
     params.n_sharp_experts       = 0;
     params.parallel_expert_io    = true;
     params.gpu_cache_bytes       = 0;
+    params.ram_cache_bytes       = 0;  // 0 = auto (4 GiB), -1 = disabled
     return params;
 }
 

@@ -2373,6 +2373,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.bs_gpu_cache_mb = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--bs-ram-cache") {
+        CHECK_ARG
+        params.bs_ram_cache_mb = std::stoi(argv[i]);
+        return true;
+    }
 
 #ifndef LOG_DISABLE_LOGS
     // Parse args for logging parameters

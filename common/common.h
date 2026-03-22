@@ -543,6 +543,7 @@ struct gpt_params {
     int         bs_sharp_experts       = 0;            // 0 = overlay all selected experts
     bool        bs_parallel_expert_io  = true;         // parallel pread for expert slices
     int         bs_gpu_cache_mb        = 0;            // GPU expert cache size in MiB (0 = disabled)
+    int         bs_ram_cache_mb        = 0;            // RAM expert cache in MiB (0 = auto 4096, -1 = off)
 };
 
 

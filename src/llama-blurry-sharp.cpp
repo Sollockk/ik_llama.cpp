@@ -33,6 +33,12 @@
 #include <set>
 
 // ---------------------------------------------------------------------------
+// Forward declarations (file-local)
+// ---------------------------------------------------------------------------
+
+static uint64_t bs_gpu_cache_key(const std::string & tensor_name, int expert_id);
+
+// ---------------------------------------------------------------------------
 // Helpers (file-local)
 // ---------------------------------------------------------------------------
 
@@ -1398,6 +1404,25 @@ llama_blurry_sharp_context * llama_blurry_sharp_init(
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Initialize RAM expert cache
+    // -----------------------------------------------------------------------
+    {
+        int64_t budget = bsctx->params.ram_cache_bytes;
+        if (budget == 0) {
+            // Auto: default 4 GiB
+            budget = (int64_t)4 * 1024 * 1024 * 1024;
+        }
+        if (budget > 0) {
+            bsctx->ram_expert_cache.enabled      = true;
+            bsctx->ram_expert_cache.budget_bytes  = (size_t)budget;
+            LLAMA_LOG_INFO("%s: RAM expert cache enabled: %.1f GiB budget\n",
+                           __func__, budget / (1024.0 * 1024.0 * 1024.0));
+        } else {
+            LLAMA_LOG_INFO("%s: RAM expert cache disabled\n", __func__);
+        }
+    }
+
     return bsctx;
 }
 
@@ -1452,6 +1477,33 @@ void llama_blurry_sharp_free(llama_blurry_sharp_context * bsctx) {
     if (bsctx->params.verbose) {
         LLAMA_LOG_INFO("%s: device cache stats: %" PRId64 " hits, %" PRId64 " allocs, %" PRId64 " recopies, %" PRId64 " evictions\n",
                       __func__, bsctx->n_cache_hits, bsctx->n_cache_allocs, bsctx->n_cache_recopies, bsctx->n_cache_evictions);
+    }
+
+    // Free RAM expert cache
+    if (bsctx->ram_expert_cache.enabled) {
+        auto & rc = bsctx->ram_expert_cache;
+        int64_t total = rc.n_hits + rc.n_misses;
+        LLAMA_LOG_INFO("%s: RAM expert cache stats: %" PRId64 " hits, %" PRId64 " misses (%.0f%% hit rate), %.1f MiB used, %d entries\n",
+                       __func__, rc.n_hits, rc.n_misses,
+                       total > 0 ? 100.0 * rc.n_hits / total : 0.0,
+                       rc.used_bytes / (1024.0 * 1024.0),
+                       (int)rc.entries.size());
+        rc.entries.clear();
+        rc.used_bytes = 0;
+    }
+    bsctx->combo_buffers.clear();
+
+    // Free GPU expert cache
+    if (bsctx->gpu_cache.cache_buf) {
+        if (bsctx->gpu_cache.enabled) {
+            LLAMA_LOG_INFO("%s: GPU expert cache stats: %" PRId64 " hits, %" PRId64 " misses (%.0f%% hit rate)\n",
+                          __func__, bsctx->gpu_cache.n_hits, bsctx->gpu_cache.n_misses,
+                          (bsctx->gpu_cache.n_hits + bsctx->gpu_cache.n_misses) > 0
+                              ? 100.0 * bsctx->gpu_cache.n_hits / (bsctx->gpu_cache.n_hits + bsctx->gpu_cache.n_misses) : 0.0);
+        }
+        ggml_backend_buffer_free(bsctx->gpu_cache.cache_buf);
+        bsctx->gpu_cache.cache_buf = nullptr;
+        bsctx->gpu_cache.enabled = false;
     }
 
     // Free sharp GGUF resources (all splits)
@@ -2457,20 +2509,32 @@ static bool bs_restore_single_tensor(
         // On Linux, MADV_DONTNEED on anonymous (heap) pages ZEROS them out,
         // destroying the cached data.  Only release file-backed mmap pages.
         if (backup.zero_copy && base_tensor->data) {
-            bool is_ram_cache_ptr = false;
+            bool is_heap_ptr = false;
+            // Check if data points into any RAM cache buffer (old full-tensor cache)
             if (bsctx->ram_cache_populated || bsctx->lazy_swap_enabled) {
-                // Check if data points into any RAM cache buffer
                 for (auto & kv : bsctx->ram_cache) {
                     const uint8_t * buf_start = kv.second.data();
                     const uint8_t * buf_end   = buf_start + kv.second.size();
                     const uint8_t * data_ptr  = (const uint8_t *)base_tensor->data;
                     if (data_ptr >= buf_start && data_ptr < buf_end) {
-                        is_ram_cache_ptr = true;
+                        is_heap_ptr = true;
                         break;
                     }
                 }
             }
-            if (!is_ram_cache_ptr) {
+            // Check if data points into a combo buffer (per-expert cache path)
+            if (!is_heap_ptr) {
+                for (auto & kv : bsctx->combo_buffers) {
+                    const uint8_t * buf_start = kv.second.data();
+                    const uint8_t * buf_end   = buf_start + kv.second.size();
+                    const uint8_t * data_ptr  = (const uint8_t *)base_tensor->data;
+                    if (data_ptr >= buf_start && data_ptr < buf_end) {
+                        is_heap_ptr = true;
+                        break;
+                    }
+                }
+            }
+            if (!is_heap_ptr) {
                 size_t sharp_nbytes = bs_tensor_nbytes(base_tensor->type, backup.ne);
                 bs_release_mmap_pages(bsctx, base_tensor->data, sharp_nbytes);
             }
@@ -3350,6 +3414,82 @@ void llama_blurry_sharp_prefetch_layer(
 }
 
 // ---------------------------------------------------------------------------
+// Targeted expert-slice prefetch for a single layer.
+//
+// Only issues madvise(WILLNEED) on the specific expert slices identified
+// by expert_ids, not the full tensor.  For a 160-expert model with 2 active
+// experts, this prefetches ~27 MiB per layer instead of ~2.2 GiB.
+// ---------------------------------------------------------------------------
+
+void llama_blurry_sharp_prefetch_expert_slices(
+        llama_blurry_sharp_context * bsctx,
+        int32_t                      layer_idx,
+        const int32_t              * expert_ids,
+        int32_t                      n_experts) {
+    if (!bsctx || !bsctx->initialized || !expert_ids || n_experts <= 0) return;
+
+#ifndef _WIN32
+    auto lt_it = bsctx->layer_tensor_names.find(layer_idx);
+    if (lt_it == bsctx->layer_tensor_names.end()) return;
+
+    for (const auto & tensor_name : lt_it->second) {
+        // Only prefetch expert tensors (skip attention, norms, etc.)
+        if (!bs_is_expert_tensor(tensor_name)) continue;
+
+        // Check RAM cache first
+        if (bsctx->lazy_swap_enabled || bsctx->ram_cache_populated) {
+            auto cache_it = bsctx->ram_cache.find(tensor_name);
+            if (cache_it != bsctx->ram_cache.end() && !cache_it->second.empty()) {
+                auto info_it = bsctx->sharp_index.find(tensor_name);
+                if (info_it != bsctx->sharp_index.end() && info_it->second.ne[2] > 1) {
+                    size_t slice_bytes = cache_it->second.size() / (size_t)info_it->second.ne[2];
+                    for (int32_t ei = 0; ei < n_experts; ++ei) {
+                        size_t off = (size_t)expert_ids[ei] * slice_bytes;
+                        if (off + slice_bytes <= cache_it->second.size()) {
+                            madvise(cache_it->second.data() + off, slice_bytes, MADV_WILLNEED);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        // mmap path: prefetch only the requested expert slices
+        auto info_it = bsctx->sharp_index.find(tensor_name);
+        if (info_it == bsctx->sharp_index.end()) continue;
+        const auto & si = info_it->second;
+
+        int split = si.split_idx;
+        if (split < 0 || split >= (int)bsctx->sharp_mmaps.size()) continue;
+        if (!bsctx->sharp_mmaps[split]) continue;
+
+        const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[split]->addr();
+        size_t file_size = bsctx->sharp_mmaps[split]->size();
+
+        if (si.ne[2] > 1) {
+            size_t slice_bytes = si.nbytes / (size_t)si.ne[2];
+            for (int32_t ei = 0; ei < n_experts; ++ei) {
+                int32_t eid = expert_ids[ei];
+                if (eid < 0 || eid >= si.ne[2]) continue;
+                size_t slice_off = si.file_offset + (size_t)eid * slice_bytes;
+                size_t end = slice_off + slice_bytes;
+                if (end > file_size) end = file_size;
+                if (slice_off < end) {
+                    posix_madvise((void *)(mmap_base + slice_off), end - slice_off,
+                                  POSIX_MADV_WILLNEED);
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED(bsctx);
+    GGML_UNUSED(layer_idx);
+    GGML_UNUSED(expert_ids);
+    GGML_UNUSED(n_experts);
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Parallel prefetch: pre-read multiple layers' data concurrently.
 //
 // Spawns up to n_threads temporary worker threads.  Each worker reads a
@@ -4042,21 +4182,6 @@ static int64_t bs_overlay_expert_tensor(
         }
 
         if (!used_ram_cache && have_mmap) {
-            // ---- Strategy A: ZERO-COPY mmap pointer swap ----
-            //
-            // KEY INSIGHT: MoE kernels only read selected expert slices:
-            //   if (matrix_row_counts[cur_a] == 0) continue;
-            //   src0_cur = src0->data + cur_a * nb02;
-            //
-            // By pointing the tensor at the sharp mmap, the kernel
-            // demand-pages only the pages that contain the selected
-            // experts.  Non-selected expert pages are never accessed,
-            // so they stay on disk and consume ZERO RAM.
-            //
-            // This is identical to bs_overlay_single_tensor's zero-copy
-            // path, and it is correct even for cross-type (e.g. base=IQ1_S,
-            // sharp=Q4_K) because the tensor type is updated to sharp and
-            // the kernel only reads sharp-typed slices.
             const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
             if (sharp_info.file_offset + sharp_info.nbytes > bsctx->sharp_mmaps[si]->size()) {
                 LLAMA_LOG_ERROR("%s: mmap read out of bounds for expert tensor '%s' (split %d)\n",
@@ -4064,15 +4189,104 @@ static int64_t bs_overlay_expert_tensor(
                 return -1;
             }
 
-            // Release old blurry mmap pages — the tensor now points at the
-            // sharp mmap, so blurry file-backed pages can be dropped.
-            if (backup_out.original_data) {
-                size_t old_nbytes = bs_tensor_nbytes(backup_out.original_type, backup_out.ne);
-                bs_release_mmap_pages(bsctx, backup_out.original_data, old_nbytes);
+            auto & rcache = bsctx->ram_expert_cache;
+            const uint8_t * sharp_data = mmap_base + sharp_info.file_offset;
+
+            // Check if ALL requested experts are in RAM cache
+            int n_cached = 0;
+            if (rcache.enabled) {
+                for (int32_t i = 0; i < n_experts_req; ++i) {
+                    uint64_t key = bs_gpu_cache_key(sharp_info.name, expert_ids[i]);
+                    if (rcache.entries.count(key)) n_cached++;
+                }
             }
 
-            base_tensor->data = const_cast<uint8_t *>(mmap_base + sharp_info.file_offset);
-            backup_out.zero_copy = true;
+            if (n_cached == n_experts_req && n_cached > 0) {
+                // ---- Strategy A-cached: ALL experts in RAM cache ----
+                // Use combo buffer populated entirely from anonymous RAM.
+                // No mmap page faults — data is in swap-backed memory.
+                auto & combo = bsctx->combo_buffers[sharp_info.name];
+                if (combo.size() < sharp_info.nbytes) {
+                    combo.resize(sharp_info.nbytes);
+                }
+#ifndef _WIN32
+                madvise(combo.data(), combo.size(), MADV_DONTNEED);
+#endif
+                for (int32_t i = 0; i < n_experts_req; ++i) {
+                    int32_t eid = expert_ids[i];
+                    size_t off = (size_t)eid * sharp_expert_slice;
+                    if (off + sharp_expert_slice > sharp_info.nbytes) continue;
+
+                    uint64_t key = bs_gpu_cache_key(sharp_info.name, eid);
+                    auto it = rcache.entries.find(key);
+                    std::memcpy(combo.data() + off, it->second.data.data(), sharp_expert_slice);
+                    it->second.last_access = ++rcache.access_counter;
+                    rcache.n_hits++;
+                }
+
+                if (backup_out.original_data) {
+                    size_t old_nbytes = bs_tensor_nbytes(backup_out.original_type, backup_out.ne);
+                    bs_release_mmap_pages(bsctx, backup_out.original_data, old_nbytes);
+                }
+
+                base_tensor->data = combo.data();
+                backup_out.zero_copy = true;
+            } else {
+                // ---- Strategy A-mmap: ZERO-COPY mmap pointer swap ----
+                // Point tensor at sharp mmap.  The kernel demand-pages only
+                // the expert slices the MoE kernel actually reads.
+                if (backup_out.original_data) {
+                    size_t old_nbytes = bs_tensor_nbytes(backup_out.original_type, backup_out.ne);
+                    bs_release_mmap_pages(bsctx, backup_out.original_data, old_nbytes);
+                }
+
+                base_tensor->data = const_cast<uint8_t *>(mmap_base + sharp_info.file_offset);
+                backup_out.zero_copy = true;
+
+                // Cache expert slices for future tokens (anonymous memory
+                // survives kernel page pressure better than file-backed mmap)
+                if (rcache.enabled && rcache.budget_bytes > 0) {
+                    for (int32_t i = 0; i < n_experts_req; ++i) {
+                        int32_t eid = expert_ids[i];
+                        size_t off = (size_t)eid * sharp_expert_slice;
+                        if (off + sharp_expert_slice > sharp_info.nbytes) continue;
+
+                        uint64_t key = bs_gpu_cache_key(sharp_info.name, eid);
+                        if (rcache.entries.count(key)) {
+                            // Already cached — just update access time
+                            rcache.entries[key].last_access = ++rcache.access_counter;
+                            rcache.n_hits++;
+                            continue;
+                        }
+                        rcache.n_misses++;
+
+                        // Evict LRU entries if over budget
+                        while (rcache.used_bytes + sharp_expert_slice > rcache.budget_bytes
+                               && !rcache.entries.empty()) {
+                            uint64_t lru_key = 0;
+                            int64_t lru_access = INT64_MAX;
+                            for (auto & [k, e] : rcache.entries) {
+                                if (e.last_access < lru_access) {
+                                    lru_access = e.last_access;
+                                    lru_key = k;
+                                }
+                            }
+                            auto evict_it = rcache.entries.find(lru_key);
+                            if (evict_it != rcache.entries.end()) {
+                                rcache.used_bytes -= evict_it->second.data.size();
+                                rcache.entries.erase(evict_it);
+                            }
+                        }
+                        if (rcache.used_bytes + sharp_expert_slice <= rcache.budget_bytes) {
+                            llama_blurry_sharp_context::ram_expert_cache::entry e;
+                            e.data.assign(sharp_data + off, sharp_data + off + sharp_expert_slice);
+                            e.last_access = ++rcache.access_counter;
+                            rcache.used_bytes += sharp_expert_slice;
+                            rcache.entries[key] = std::move(e);
+                        }
+                    }
+                }
+            }
 
         } else if (!used_ram_cache && base_tensor->type == sharp_info.type && base_expert_slice == sharp_expert_slice) {
             // ---- Strategy B: IN-PLACE slice overwrite (same type) ----
@@ -5267,6 +5481,29 @@ static uint64_t bs_gpu_cache_key(const std::string & tensor_name, int expert_id)
     h ^= (uint64_t)expert_id;
     h *= 1099511628211ULL;
     return h;
+}
+
+void llama_blurry_sharp_set_gpu_cache_buffer(
+        llama_blurry_sharp_context * bsctx,
+        ggml_backend_buffer_t        buf,
+        ggml_backend_t               backend) {
+    if (!bsctx || !buf) return;
+    auto & cache = bsctx->gpu_cache;
+    if (cache.enabled) return;
+
+    cache.cache_buf   = buf;
+    cache.gpu_base    = ggml_backend_buffer_get_base(buf);
+    cache.total_bytes = ggml_backend_buffer_get_size(buf);
+    cache.used_bytes  = 0;
+    cache.gpu_backend = backend;  // may be null; set during JIT if needed
+    cache.enabled     = true;
+
+    cache.free_list.clear();
+    cache.free_list.push_back({0, cache.total_bytes});
+
+    LLAMA_LOG_INFO("%s: GPU expert cache set from pre-allocated buffer: %.1f MiB\n",
+                   __func__,
+                   cache.total_bytes / (1024.0 * 1024.0));
 }
 
 void llama_blurry_sharp_gpu_cache_init(

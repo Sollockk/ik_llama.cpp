@@ -229,12 +229,45 @@ bool server_context::load_model(const gpt_params& params_) {
         bs_params.n_sharp_experts    = params_base.bs_sharp_experts;
         bs_params.parallel_expert_io = params_base.bs_parallel_expert_io;
         bs_params.gpu_cache_bytes    = (int64_t)params_base.bs_gpu_cache_mb * 1024 * 1024;
+        bs_params.ram_cache_bytes    = (int64_t)params_base.bs_ram_cache_mb * 1024 * 1024;
 
         bsctx = llama_blurry_sharp_init(model, bs_params);
 
         if (!bsctx) {
             LOG_WARNING("Failed to initialize blurry-sharp overlay, proceeding without it", {});
         } else {
+            // Allocate GPU expert cache AFTER model loading.
+            // Try the requested size first; if OOM, halve repeatedly.
+            if (params_base.bs_gpu_cache_mb > 0) {
+                size_t n_reg = ggml_backend_reg_get_count();
+                size_t gpu_reg = SIZE_MAX;
+                for (size_t ri = 0; ri < n_reg; ++ri) {
+                    const char * rname = ggml_backend_reg_get_name(ri);
+                    if (strstr(rname, "CUDA") || strstr(rname, "ROCm") || strstr(rname, "Metal")) {
+                        gpu_reg = ri;
+                        break;
+                    }
+                }
+                if (gpu_reg != SIZE_MAX) {
+                    int try_mb = params_base.bs_gpu_cache_mb;
+                    ggml_backend_buffer_t gpu_cache_buf = nullptr;
+                    while (try_mb >= 128) {  // minimum useful cache: 128 MiB
+                        gpu_cache_buf = ggml_backend_reg_alloc_buffer(gpu_reg, (size_t)try_mb * 1024 * 1024);
+                        if (gpu_cache_buf) break;
+                        try_mb /= 2;
+                    }
+                    if (gpu_cache_buf) {
+                        llama_blurry_sharp_set_gpu_cache_buffer(bsctx, gpu_cache_buf, nullptr);
+                        if (try_mb < params_base.bs_gpu_cache_mb) {
+                            LOG_WARNING("GPU expert cache reduced due to VRAM pressure",
+                                    {{"requested_mb", params_base.bs_gpu_cache_mb}, {"allocated_mb", try_mb}});
+                        }
+                    } else {
+                        LOG_WARNING("Could not allocate GPU expert cache, proceeding without it",
+                                {{"requested_mb", params_base.bs_gpu_cache_mb}});
+                    }
+                }
+            }
             // Determine mode
             bool use_moe_dynamic = params_base.bs_moe_combination;
             int32_t n_expert      = llama_blurry_sharp_n_experts(bsctx);

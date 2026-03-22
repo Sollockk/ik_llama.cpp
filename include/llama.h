@@ -1605,6 +1605,13 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
                                                 // sharp expert slices.  Cache hits use fast GPU→GPU
                                                 // copy (~10μs) instead of SSD→host→GPU (~5ms).
                                                 // Recommended: 4096-8192 MiB for 160-expert models.
+
+        int64_t  ram_cache_bytes;               // RAM expert cache size in bytes (0 = auto 4 GiB).
+                                                // Caches sharp expert slices in anonymous memory
+                                                // (not file-backed mmap) so the kernel swaps them
+                                                // to SSD swap instead of dropping them.  Swap-backed
+                                                // pages are faster to recover than re-faulting from
+                                                // a GGUF mmap.  Set -1 to disable.
     };
 
     struct llama_blurry_sharp_state {
@@ -1700,6 +1707,17 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             struct llama_blurry_sharp_context * bsctx,
             int32_t                             layer_idx);
 
+    // Prefetch specific expert slices for a layer into page cache.
+    // Uses madvise(WILLNEED) on only the given expert IDs' data regions,
+    // avoiding the cost of prefetching all 160 experts (~2GB) per layer.
+    // Ideal for lookahead prefetch using the current layer's routing
+    // as a prediction for upcoming layers.
+    LLAMA_API void llama_blurry_sharp_prefetch_expert_slices(
+            struct llama_blurry_sharp_context * bsctx,
+            int32_t                             layer_idx,
+            const int32_t                     * expert_ids,
+            int32_t                             n_experts);
+
     // Prefetch multiple layers in parallel using n_threads worker threads.
     // Each worker reads its assigned layers' tensor data from mmap/file
     // into a staging cache concurrently.  The subsequent sequential apply
@@ -1733,6 +1751,15 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // Call llama_blurry_sharp_deflate_expert_types() to restore after alloc.
     LLAMA_API void llama_blurry_sharp_inflate_expert_types(
             struct llama_blurry_sharp_context * bsctx);
+
+    // Set a pre-allocated GPU buffer as the expert cache.
+    // This should be called AFTER llama_blurry_sharp_init() but BEFORE inference.
+    // The buffer must have been allocated on a GPU backend.
+    // Takes ownership of the buffer (freed by llama_blurry_sharp_free).
+    LLAMA_API void llama_blurry_sharp_set_gpu_cache_buffer(
+            struct llama_blurry_sharp_context * bsctx,
+            ggml_backend_buffer_t               buf,
+            ggml_backend_t                      backend);
 
     // Restore expert tensor types to their original (blurry) types after
     // the scheduler has allocated device copies at the inflated size.

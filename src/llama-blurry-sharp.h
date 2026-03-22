@@ -407,6 +407,33 @@ struct llama_blurry_sharp_context {
         int64_t n_misses = 0;
     } gpu_cache;
 
+    // ---- RAM Expert Cache ----
+    // Persistent host-side cache of sharp expert slices in anonymous memory.
+    // File-backed mmap pages get evicted by the kernel under memory pressure;
+    // anonymous pages go to swap instead (faster to recover from SSD).
+    // Cache key: FNV-1a hash of (tensor_name, expert_id).
+    struct ram_expert_cache {
+        bool enabled = false;
+        size_t budget_bytes = 0;        // max cache size
+        size_t used_bytes = 0;
+
+        struct entry {
+            std::vector<uint8_t> data;
+            int64_t last_access;
+        };
+
+        std::unordered_map<uint64_t, entry> entries;
+        int64_t access_counter = 0;
+        int64_t n_hits = 0;
+        int64_t n_misses = 0;
+    } ram_expert_cache;
+
+    // Reusable combination buffers for expert tensor overlay.
+    // One per concurrent expert tensor (gate, up, down).  Allocated lazily,
+    // sized for the full tensor (160 experts × slice_size).  Only the
+    // active expert slots are populated; untouched pages consume no RAM.
+    std::unordered_map<std::string, std::vector<uint8_t>> combo_buffers;
+
     // -- self-eviction guard --
     // During apply_layer / apply_experts, tensors are overlaid one at a time.
     // Each overlay may allocate a new device buffer and insert it into the
