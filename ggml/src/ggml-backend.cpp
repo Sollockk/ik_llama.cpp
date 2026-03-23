@@ -2077,15 +2077,10 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     last_ids_tensor = ids_tensor;
                 }
 
-                // Skip the copy for JIT-managed expert tensors.  Two cases:
-                //  1) Type mismatch: inflate set the device copy to a different
-                //     (sharp) type.  The JIT callback will populate it.
-                //  2) Shrunk ne[2]: inflate reduced the device copy's expert
-                //     dimension.  After the JIT overlay changes the base tensor's
-                //     type to match, only_active_experts would see matching types
-                //     but the buffer is too small for the original expert count.
-                if (input->type != input_cpy->type ||
-                    input_cpy->ne[2] < input->ne[2]) {
+                // Skip the copy for JIT-managed expert tensors: inflate set
+                // the device copy to the sharp type.  The JIT callback will
+                // populate it with the correct expert slices.
+                if (input->type != input_cpy->type) {
                     continue;
                 }
 

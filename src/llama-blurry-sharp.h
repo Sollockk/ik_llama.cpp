@@ -367,7 +367,8 @@ struct llama_blurry_sharp_context {
     int32_t n_jit_host_crosstype_skipped = 0;
 
     // True when inflate shrunk ne[2] for this batch (generation).
-    // Tells the JIT callback to do contiguous upload + topk remap.
+    // Set during inflate — tells the JIT callback to upload sharp expert
+    // slices to GPU device copies (type was inflated for correct sizing).
     bool inflate_shrunk_ne2 = false;
 
     // Saved original types for inflate/deflate cycle.
@@ -376,7 +377,6 @@ struct llama_blurry_sharp_context {
         ggml_tensor * tensor;
         ggml_type     orig_type;
         size_t        orig_nb[GGML_MAX_DIMS];
-        int64_t       orig_ne2;  // original n_experts dimension
     };
     std::vector<inflate_saved_entry> inflate_saved_types;
 

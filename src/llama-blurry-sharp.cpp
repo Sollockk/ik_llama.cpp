@@ -5791,11 +5791,10 @@ void llama_blurry_sharp_inflate_expert_types(
         // Only inflate if the sharp type is different (and larger)
         if (t->type == info.type) continue;
 
-        // Save original type, strides, and expert count for deflation
+        // Save original type and strides for deflation
         llama_blurry_sharp_context::inflate_saved_entry entry;
         entry.tensor    = t;
         entry.orig_type = t->type;
-        entry.orig_ne2  = t->ne[2];
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
             entry.orig_nb[d] = t->nb[d];
         }
@@ -5820,7 +5819,6 @@ void llama_blurry_sharp_deflate_expert_types(
 
     for (auto & saved : bsctx->inflate_saved_types) {
         saved.tensor->type = saved.orig_type;
-        saved.tensor->ne[2] = saved.orig_ne2;
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
             saved.tensor->nb[d] = saved.orig_nb[d];
         }
