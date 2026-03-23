@@ -5119,9 +5119,9 @@ int32_t llama_blurry_sharp_apply_experts(
 
     // Check eligibility
     if (bsctx->eligible_layers.find(layer_idx) == bsctx->eligible_layers.end()) {
-        if (bsctx->params.verbose) {
-            LLAMA_LOG_INFO("%s: layer %d is not eligible for sharpening\n",
-                          __func__, layer_idx);
+        static int n_elig_log = 0;
+        if (n_elig_log++ < 10) {
+            fprintf(stderr, "apply_experts: layer %d NOT ELIGIBLE\n", layer_idx);
         }
         return -1;
     }
@@ -5398,7 +5398,15 @@ int32_t llama_blurry_sharp_apply_experts(
 
     if (layer_backup.tensor_backups.empty()) {
         bsctx->building_layer_idx = -1;
-        return (any_hard_failed || n_jit_skipped > 0) ? -4 : -2;
+        int rc = (any_hard_failed || n_jit_skipped > 0) ? -4 : -2;
+        static int n_empty_log = 0;
+        if (n_empty_log++ < 10) {
+            fprintf(stderr, "apply_experts: layer %d EMPTY BACKUPS rc=%d "
+                    "(hard_fail=%d, jit_skip=%d, expert_ok=%d, nonexp_ok=%d)\n",
+                    layer_idx, rc, any_hard_failed, n_jit_skipped,
+                    n_expert_tensors_overlaid, n_nonexpert_tensors_overlaid);
+        }
+        return rc;
     }
 
     // Roll back on hard failure (I/O error, allocation failure, etc.)
@@ -5724,13 +5732,54 @@ void bs_gpu_cache_copy_to_dcpy(
 // ---------------------------------------------------------------------------
 
 void llama_blurry_sharp_inflate_expert_types(
-        llama_blurry_sharp_context * bsctx) {
+        llama_blurry_sharp_context * bsctx,
+        int32_t n_tokens,
+        const int32_t * priority_layers,
+        int32_t         n_priority_layers) {
     if (!bsctx || !bsctx->model) return;
 
     bsctx->inflate_saved_types.clear();
 
+    const int64_t n_expert_used = bsctx->model->hparams.n_expert_used;
+
+    // For large batches (prompt), skip inflation entirely.  Device copies
+    // stay at TQ1_0 type/size → only_active_experts copies TQ1_0 data
+    // normally → MoE runs on GPU with blurry quality at GPU speed.
+    //
+    // For small batches (generation), inflate type to Q4_K_M AND shrink
+    // ne[2] to n_expert_used → small device copies.  The JIT callback
+    // uploads sharp data to contiguous slots and remaps topk IDs.
+    if (n_tokens > (int32_t)n_expert_used) {
+        bsctx->inflate_shrunk_ne2 = false;
+        return;  // prompt — no inflation, normal device copy path
+    }
+    bsctx->inflate_shrunk_ne2 = true;
+
+    // Build set of priority layer indices.  When non-empty, only inflate
+    // tensors belonging to these layers.  Non-priority layers keep their
+    // original TQ1_0/ne[2]=n_expert type — the scheduler creates normal
+    // device copies for them, and only_active_experts handles the copy.
+    std::unordered_set<int> prio_set;
+    if (priority_layers && n_priority_layers > 0) {
+        for (int32_t i = 0; i < n_priority_layers; ++i) {
+            prio_set.insert(priority_layers[i]);
+        }
+    }
+
     for (auto & [name, info] : bsctx->sharp_index) {
         if (!bs_is_expert_tensor(name)) continue;
+
+        // If priority set is active, only inflate tensors in priority layers.
+        // Extract layer index from tensor name "blk.{N}.ffn_..."
+        if (!prio_set.empty()) {
+            int layer_idx = -1;
+            if (name.compare(0, 4, "blk.") == 0) {
+                layer_idx = atoi(name.c_str() + 4);
+            }
+            if (layer_idx < 0 || prio_set.find(layer_idx) == prio_set.end()) {
+                continue;  // not a priority layer — skip inflation
+            }
+        }
 
         ggml_tensor * t = info.base_tensor;
         if (!t) {
@@ -5742,15 +5791,20 @@ void llama_blurry_sharp_inflate_expert_types(
         // Only inflate if the sharp type is different (and larger)
         if (t->type == info.type) continue;
 
-        // Save original type and strides for deflation
-        size_t orig_nb[GGML_MAX_DIMS];
-        for (int d = 0; d < GGML_MAX_DIMS; ++d) orig_nb[d] = t->nb[d];
-        bsctx->inflate_saved_types.push_back({t, t->type, {}});
+        // Save original type, strides, and expert count for deflation
+        llama_blurry_sharp_context::inflate_saved_entry entry;
+        entry.tensor    = t;
+        entry.orig_type = t->type;
+        entry.orig_ne2  = t->ne[2];
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-            bsctx->inflate_saved_types.back().orig_nb[d] = orig_nb[d];
+            entry.orig_nb[d] = t->nb[d];
         }
+        bsctx->inflate_saved_types.push_back(entry);
 
-        // Set tensor to the sharp type so scheduler sizes device copies for it
+        // Set tensor to the sharp type so scheduler sizes device copies for it.
+        // ne[2] stays at the original n_expert — shrinking it to n_expert_used
+        // would break fused MoE kernels that use ne[2] as the expert count.
+        // The scheduler efficiently shares buffer space between layers.
         t->type  = info.type;
         t->nb[0] = ggml_type_size(info.type);
         t->nb[1] = ggml_row_size(info.type, t->ne[0]);
@@ -5766,6 +5820,7 @@ void llama_blurry_sharp_deflate_expert_types(
 
     for (auto & saved : bsctx->inflate_saved_types) {
         saved.tensor->type = saved.orig_type;
+        saved.tensor->ne[2] = saved.orig_ne2;
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
             saved.tensor->nb[d] = saved.orig_nb[d];
         }

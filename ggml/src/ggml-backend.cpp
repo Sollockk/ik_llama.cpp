@@ -2051,7 +2051,11 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     }
                 }
 
-                int n_expert = node->src[0]->ne[2];
+                // Use the original input's ne[2] (not the device copy's) because
+                // inflate may have shrunk the device copy's ne[2] to n_expert_used.
+                // The topk IDs still reference the full expert range until the
+                // JIT callback remaps them.
+                int n_expert = input->ne[2];
 
                 if (ids_tensor != last_ids_tensor) {
                     ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
@@ -2073,13 +2077,15 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     last_ids_tensor = ids_tensor;
                 }
 
-                // If the device copy was allocated at a different (inflated) type
-                // (from pre-inflate for cross-type JIT overlay), skip the copy
-                // entirely.  The JIT eval callback will populate the device copy
-                // with the correct (sharp or blurry) data before the compute
-                // kernel reads it.  This avoids a wasted TQ1_0→GPU copy that
-                // would be immediately overwritten.
-                if (input->type != input_cpy->type) {
+                // Skip the copy for JIT-managed expert tensors.  Two cases:
+                //  1) Type mismatch: inflate set the device copy to a different
+                //     (sharp) type.  The JIT callback will populate it.
+                //  2) Shrunk ne[2]: inflate reduced the device copy's expert
+                //     dimension.  After the JIT overlay changes the base tensor's
+                //     type to match, only_active_experts would see matching types
+                //     but the buffer is too small for the original expert count.
+                if (input->type != input_cpy->type ||
+                    input_cpy->ne[2] < input->ne[2]) {
                     continue;
                 }
 

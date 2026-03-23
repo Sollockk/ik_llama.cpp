@@ -9822,13 +9822,18 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             }
         }
 
-        // Force MoE expert computation results to GPU when JIT sharpening is active.
-        // Without this, the scheduler assigns MoE to CPU (because --cpu-moe puts
-        // expert weight tensors on CPU), making MoE compute ~100x slower than GPU.
-        // By forcing results to GPU, the scheduler creates GPU device copies of the
-        // CPU expert weight inputs.  The JIT callback then uploads sharp (Q4_K_M)
-        // data to those copies, giving us GPU MoE with sharp quality.
+        // Force MoE expert computation results to GPU when JIT sharpening is active
+        // AND the batch is small (generation).  During generation (1-few tokens),
+        // there are at most n_expert_used unique experts, and device copies are
+        // shrunk to n_expert_used slots by pre-inflate.  During prompt (many tokens),
+        // there can be more unique experts than slots, so MoE stays on CPU.
+        // Only force layers that will actually be sharpened (priority layers).
+        // Non-priority layers stay on CPU with TQ1_0 data — forcing them to GPU
+        // would require a TQ1_0→GPU fallback that produces garbage.
         if (lctx.jit_sharpening && il >= 0 &&
+            batch.n_tokens <= (int32_t)lctx.model.hparams.n_expert_used &&
+            (lctx.jit_priority_layers.empty() ||
+             lctx.jit_priority_layers.count(il) > 0) &&
             (strcmp(name, "ffn_moe_up") == 0 ||
              strcmp(name, "ffn_moe_gate") == 0 ||
              strcmp(name, "ffn_moe_down") == 0 ||

@@ -366,12 +366,17 @@ struct llama_blurry_sharp_context {
     // Count of host cross-type tensors skipped in JIT mode (for diagnostics)
     int32_t n_jit_host_crosstype_skipped = 0;
 
+    // True when inflate shrunk ne[2] for this batch (generation).
+    // Tells the JIT callback to do contiguous upload + topk remap.
+    bool inflate_shrunk_ne2 = false;
+
     // Saved original types for inflate/deflate cycle.
     // Populated by llama_blurry_sharp_inflate_expert_types(), consumed by deflate.
     struct inflate_saved_entry {
         ggml_tensor * tensor;
         ggml_type     orig_type;
         size_t        orig_nb[GGML_MAX_DIMS];
+        int64_t       orig_ne2;  // original n_experts dimension
     };
     std::vector<inflate_saved_entry> inflate_saved_types;
 

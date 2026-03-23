@@ -3353,16 +3353,43 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                     int64_t t3 = now_us();
                     t_apply_us += (t3 - t2);
 
+                    if (ret != 0) {
+                        static int n_fail_log = 0;
+                        if (n_fail_log++ < 20) {
+                            fprintf(stderr, "JIT-GPU: apply_experts FAILED layer %d ret=%d "
+                                    "(n_experts=%d, inflate=%d)\n",
+                                    layer_idx, ret, (int)expert_vec.size(),
+                                    (int)lctx->jit_bsctx->inflate_shrunk_ne2);
+                        }
+                    }
                     if (ret == 0) {
                         lctx->jit_current_layer = layer_idx;
                         jit_overlaid = true;
 
                         // 5) Upload sharp expert slices to GPU device copies.
+                        //    Only for generation (small batch) where inflate shrunk ne[2].
+                        //    For prompt (large batch), only_active_experts handles it.
                         int64_t t_upload_start = now_us();
-                        //    Since we skipped only_active_experts for type-mismatched
-                        //    tensors, the device copy is empty.  Use GPU cache for
-                        //    fast GPU→GPU copies on repeat experts.
-                        {
+                        bool has_dcpy = false;
+                        // Build remap: original expert ID → contiguous slot [0, n_unique)
+                        std::unordered_map<int32_t, int32_t> expert_id_to_slot;
+                        const bool inflated = lctx->jit_bsctx->inflate_shrunk_ne2;
+                        bool needs_remap = false;  // only remap when ne[2] actually shrunk
+                        if (inflated) {
+                            // Build slot mapping for contiguous packing
+                            int32_t slot = 0;
+                            for (int ei = 0; ei < (int)expert_vec.size(); ++ei) {
+                                expert_id_to_slot[expert_vec[ei]] = slot++;
+                            }
+                            // Also map any experts NOT in expert_vec but present
+                            // in the topk (when n_sharp_experts < n_expert_used).
+                            for (size_t i = 0; i < n_ids; ++i) {
+                                if (ids[i] >= 0 && expert_id_to_slot.find(ids[i]) == expert_id_to_slot.end()) {
+                                    expert_id_to_slot[ids[i]] = slot++;
+                                }
+                            }
+                        }
+                        if (inflated) {
                             auto & gcache = lctx->jit_bsctx->gpu_cache;
                             auto lt_it = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
                             if (lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
@@ -3382,7 +3409,6 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                         if (!gcache.enabled && lctx->jit_bsctx->params.gpu_cache_bytes > 0) {
                                             llama_blurry_sharp_gpu_cache_init(lctx->jit_bsctx, be);
                                         }
-                                        // Set backend on pre-allocated cache if not yet set
                                         if (gcache.enabled && !gcache.gpu_backend) {
                                             gcache.gpu_backend = be;
                                         }
@@ -3397,57 +3423,68 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                             }
                                             continue;
                                         }
+                                        has_dcpy = true;
 
                                         static int n_dcpy_ok = 0;
-                                        if (n_dcpy_ok++ < 3) {
-                                            fprintf(stderr, "JIT-GPU: uploading '%s' experts to %s dcpy (bt->type=%d→dcpy->type=%d, stride=%zu)\n",
-                                                    tname.c_str(), ggml_backend_name(be), bt->type, dcpy->type,
-                                                    (size_t)(bt->ne[2] > 1 ? bt->nb[2] : bt->nb[1]));
+                                        if (n_dcpy_ok++ < 6) {
+                                            fprintf(stderr, "JIT-GPU: uploading '%s' %d experts to %s dcpy "
+                                                    "(bt type=%d ne=[%lld,%lld,%lld] | dcpy type=%d ne=[%lld,%lld,%lld] "
+                                                    "buf_size=%zu, ggml_nbytes=%zu)\n",
+                                                    tname.c_str(), (int)expert_id_to_slot.size(),
+                                                    ggml_backend_name(be),
+                                                    bt->type, (long long)bt->ne[0], (long long)bt->ne[1], (long long)bt->ne[2],
+                                                    dcpy->type, (long long)dcpy->ne[0], (long long)dcpy->ne[1], (long long)dcpy->ne[2],
+                                                    dcpy->buffer ? ggml_backend_buffer_get_size(dcpy->buffer) : 0,
+                                                    ggml_nbytes(dcpy));
                                         }
 
                                         // Sync device copy type/strides to sharp type
+                                        // Must compute strides from dcpy's own ne[] (ne[2]=n_expert_used),
+                                        // NOT copy from bt (ne[2]=n_expert after deflate).
                                         dcpy->type = bt->type;
-                                        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-                                            dcpy->nb[d] = bt->nb[d];
+                                        dcpy->nb[0] = ggml_type_size(dcpy->type);
+                                        dcpy->nb[1] = ggml_row_size(dcpy->type, dcpy->ne[0]);
+                                        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+                                            dcpy->nb[d] = dcpy->nb[d-1] * dcpy->ne[d-1];
                                         }
 
-                                        // Upload active expert slices, using GPU cache
+                                        // Upload active expert slices.
+                                        // When ne[2] was shrunk: contiguous slot packing.
+                                        // When ne[2] is full: upload to original positions.
+                                        needs_remap = (dcpy->ne[2] < bt->ne[2]);
                                         if (bt->ne[2] > 1) {
                                             size_t expert_stride = bt->nb[2];
-                                            for (int ei = 0; ei < (int)expert_vec.size(); ++ei) {
-                                                int32_t eid = expert_vec[ei];
-                                                size_t off = (size_t)eid * expert_stride;
-                                                size_t sz  = expert_stride;
-                                                if (off + sz > ggml_nbytes(bt)) continue;
+                                            for (auto & [eid, slot] : expert_id_to_slot) {
+                                                size_t src_off  = (size_t)eid  * expert_stride;
+                                                size_t dst_off  = needs_remap
+                                                    ? (size_t)slot * expert_stride   // contiguous slot
+                                                    : (size_t)eid  * expert_stride;  // original position
+                                                size_t sz       = expert_stride;
+                                                if (src_off + sz > ggml_nbytes(bt)) continue;
+                                                if (dst_off + sz > ggml_nbytes(dcpy)) continue;
 
                                                 if (gcache.enabled) {
-                                                    // Check GPU cache
                                                     int64_t cache_off = bs_gpu_cache_lookup(
                                                         gcache, tname, eid);
                                                     if (cache_off >= 0) {
-                                                        // Cache HIT: GPU→GPU copy (~10μs)
                                                         bs_gpu_cache_copy_to_dcpy(
-                                                            gcache, cache_off, sz, dcpy, off);
+                                                            gcache, cache_off, sz, dcpy, dst_off);
                                                         gcache.n_hits++;
                                                     } else {
-                                                        // Cache MISS: host→GPU cache + device copy
-                                                        const void * src = (const uint8_t *)bt->data + off;
+                                                        const void * src = (const uint8_t *)bt->data + src_off;
                                                         cache_off = bs_gpu_cache_store(
                                                             gcache, tname, eid, src, sz);
                                                         if (cache_off >= 0) {
-                                                            // Stored in cache, now GPU→GPU to dcpy
                                                             bs_gpu_cache_copy_to_dcpy(
-                                                                gcache, cache_off, sz, dcpy, off);
+                                                                gcache, cache_off, sz, dcpy, dst_off);
                                                         } else {
-                                                            // Cache full, direct host→GPU
-                                                            ggml_backend_tensor_set(dcpy, src, off, sz);
+                                                            ggml_backend_tensor_set(dcpy, src, dst_off, sz);
                                                         }
                                                         gcache.n_misses++;
                                                     }
                                                 } else {
-                                                    // No cache: direct host→GPU
                                                     ggml_backend_tensor_set(dcpy,
-                                                        (const uint8_t *)bt->data + off, off, sz);
+                                                        (const uint8_t *)bt->data + src_off, dst_off, sz);
                                                 }
                                             }
                                         } else {
@@ -3455,6 +3492,32 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                         }
                                     }
                                 }
+                            }
+                        }
+                        // Remap topk tensor: original expert IDs → contiguous slot indices.
+                        // Only needed when ne[2] was shrunk (contiguous packing).
+                        if (has_dcpy && needs_remap && !expert_id_to_slot.empty()) {
+                            std::vector<int32_t> remapped(n_ids);
+                            for (size_t i = 0; i < n_ids; ++i) {
+                                auto it = expert_id_to_slot.find(ids[i]);
+                                remapped[i] = (it != expert_id_to_slot.end()) ? it->second : 0;
+                            }
+                            // Debug: log remap for first few layers
+                            {
+                                static int n_remap_log = 0;
+                                if (n_remap_log++ < 20) {
+                                    fprintf(stderr, "JIT-REMAP layer %d: n_ids=%zu, ids=[",
+                                            layer_idx, n_ids);
+                                    for (size_t i = 0; i < std::min(n_ids, (size_t)8); ++i)
+                                        fprintf(stderr, "%s%d→%d", i?",":"", ids[i], remapped[i]);
+                                    fprintf(stderr, "] slots=%zu\n",
+                                            expert_id_to_slot.size());
+                                }
+                            }
+                            if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+                                ggml_backend_tensor_set(t, remapped.data(), 0, n_ids * sizeof(int32_t));
+                            } else if (t->data) {
+                                memcpy(t->data, remapped.data(), n_ids * sizeof(int32_t));
                             }
                         }
 
@@ -3536,52 +3599,125 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                     }
                 }
 
-                // Only do fallback upload for MoE layers that actually failed
-                if (has_experts && lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
-                    static int n_fallback = 0;
-                    if (n_fallback++ < 5) {
-                        fprintf(stderr, "JIT-GPU: FALLBACK layer %d — MoE overlay failed, using blurry\n", layer_idx);
+                // Only do fallback for layers with INFLATED device copies
+                // (dcpy->ne[2] < bt->ne[2], i.e., priority layers that were
+                // ne[2]-shrunk during inflation but whose overlay failed).
+                //
+                // Non-inflated layers (non-priority) are handled correctly by
+                // only_active_experts: data is at original positions, topk IDs
+                // are original.  Running fallback on them would remap topk IDs
+                // to contiguous slots, breaking the original-position indexing.
+                //
+                // During prompt, inflate_shrunk_ne2=false, so this is skipped.
+                // Debug: log non-overlaid MoE layers during generation
+                if (has_experts && lctx->jit_bsctx->inflate_shrunk_ne2) {
+                    static int n_nonoverlaid_log = 0;
+                    if (n_nonoverlaid_log++ < 10) {
+                        fprintf(stderr, "JIT-SKIP layer %d: not overlaid, inflate_shrunk=%d\n",
+                                layer_idx, (int)lctx->jit_bsctx->inflate_shrunk_ne2);
                     }
-                    int n_be = ggml_backend_sched_get_n_backends(lctx->sched);
-                    for (const auto & tname : lt_it->second) {
-                        if (tname.find("_exps") == std::string::npos) continue;
-                        auto si_it = lctx->jit_bsctx->sharp_index.find(tname);
-                        if (si_it == lctx->jit_bsctx->sharp_index.end()) continue;
-                        ggml_tensor * bt = si_it->second.base_tensor;
-                        if (!bt || !bt->data) continue;
+                }
+                if (has_experts && lctx->jit_bsctx->inflate_shrunk_ne2 &&
+                    lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
 
-                        for (int bi = 0; bi < n_be; ++bi) {
-                            ggml_backend_t be = ggml_backend_sched_get_backend(lctx->sched, bi);
-                            if (ggml_backend_is_cpu(be)) continue;
-                            ggml_tensor * dcpy = ggml_backend_sched_get_tensor_copy(
-                                lctx->sched, bt, be);
-                            if (!dcpy) continue;
-
-                            // Sync device copy to TQ1_0 type
-                            dcpy->type = bt->type;
-                            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-                                dcpy->nb[d] = bt->nb[d];
+                    // Check if this layer was actually inflated by looking for
+                    // a device copy with shrunk ne[2].
+                    bool layer_was_inflated = false;
+                    {
+                        for (const auto & tname : lt_it->second) {
+                            if (tname.find("_exps") == std::string::npos) continue;
+                            auto si_it = lctx->jit_bsctx->sharp_index.find(tname);
+                            if (si_it == lctx->jit_bsctx->sharp_index.end()) continue;
+                            ggml_tensor * bt = si_it->second.base_tensor;
+                            if (!bt) continue;
+                            int n_be = ggml_backend_sched_get_n_backends(lctx->sched);
+                            for (int bi = 0; bi < n_be; ++bi) {
+                                ggml_backend_t be = ggml_backend_sched_get_backend(lctx->sched, bi);
+                                if (ggml_backend_is_cpu(be)) continue;
+                                ggml_tensor * dcpy = ggml_backend_sched_get_tensor_copy(
+                                    lctx->sched, bt, be);
+                                if (dcpy && dcpy->ne[2] < bt->ne[2]) {
+                                    layer_was_inflated = true;
+                                }
                             }
+                            break;  // checked one expert tensor, enough
+                        }
+                    }
 
-                            // Upload active TQ1_0 expert slices
-                            if (bt->ne[2] > 1 && n_ids > 0) {
-                                size_t expert_stride = bt->nb[2];
-                                std::unordered_set<int32_t> unique_eids;
-                                for (size_t i = 0; i < n_ids; ++i) {
-                                    if (ids[i] >= 0) unique_eids.insert(ids[i]);
+                    if (layer_was_inflated) {
+                        // Inflated layer whose overlay failed — upload TQ1_0
+                        // data to the shrunk device copy and remap topk IDs.
+                        static int n_fallback = 0;
+                        if (n_fallback++ < 10) {
+                            fprintf(stderr, "JIT-GPU: FALLBACK layer %d — inflated but overlay failed\n", layer_idx);
+                        }
+
+                        std::unordered_map<int32_t, int32_t> fb_id_to_slot;
+                        {
+                            int32_t slot = 0;
+                            for (size_t i = 0; i < n_ids; ++i) {
+                                if (ids[i] >= 0 && fb_id_to_slot.find(ids[i]) == fb_id_to_slot.end()) {
+                                    fb_id_to_slot[ids[i]] = slot++;
                                 }
-                                for (int32_t eid : unique_eids) {
-                                    size_t off = (size_t)eid * expert_stride;
-                                    if (off + expert_stride <= ggml_nbytes(bt)) {
-                                        ggml_backend_tensor_set(dcpy,
-                                            (const uint8_t *)bt->data + off, off, expert_stride);
+                            }
+                        }
+                        bool fb_has_dcpy = false;
+
+                        int n_be = ggml_backend_sched_get_n_backends(lctx->sched);
+                        for (const auto & tname : lt_it->second) {
+                            if (tname.find("_exps") == std::string::npos) continue;
+                            auto si_it = lctx->jit_bsctx->sharp_index.find(tname);
+                            if (si_it == lctx->jit_bsctx->sharp_index.end()) continue;
+                            ggml_tensor * bt = si_it->second.base_tensor;
+                            if (!bt || !bt->data) continue;
+
+                            for (int bi = 0; bi < n_be; ++bi) {
+                                ggml_backend_t be = ggml_backend_sched_get_backend(lctx->sched, bi);
+                                if (ggml_backend_is_cpu(be)) continue;
+                                ggml_tensor * dcpy = ggml_backend_sched_get_tensor_copy(
+                                    lctx->sched, bt, be);
+                                if (!dcpy || dcpy->ne[2] >= bt->ne[2]) continue;
+                                fb_has_dcpy = true;
+
+                                dcpy->type = bt->type;
+                                dcpy->nb[0] = ggml_type_size(dcpy->type);
+                                dcpy->nb[1] = ggml_row_size(dcpy->type, dcpy->ne[0]);
+                                for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+                                    dcpy->nb[d] = dcpy->nb[d-1] * dcpy->ne[d-1];
+                                }
+
+                                if (bt->ne[2] > 1 && n_ids > 0) {
+                                    size_t expert_stride = bt->nb[2];
+                                    for (auto & [eid, slot] : fb_id_to_slot) {
+                                        size_t src_off = (size_t)eid  * expert_stride;
+                                        size_t dst_off = (size_t)slot * expert_stride;
+                                        if (src_off + expert_stride <= ggml_nbytes(bt) &&
+                                            dst_off + expert_stride <= ggml_nbytes(dcpy)) {
+                                            ggml_backend_tensor_set(dcpy,
+                                                (const uint8_t *)bt->data + src_off, dst_off, expert_stride);
+                                        }
                                     }
+                                } else {
+                                    ggml_backend_tensor_set(dcpy, bt->data, 0, ggml_nbytes(bt));
                                 }
-                            } else {
-                                ggml_backend_tensor_set(dcpy, bt->data, 0, ggml_nbytes(bt));
+                            }
+                        }
+
+                        if (fb_has_dcpy && !fb_id_to_slot.empty()) {
+                            std::vector<int32_t> remapped(n_ids);
+                            for (size_t i = 0; i < n_ids; ++i) {
+                                auto it = fb_id_to_slot.find(ids[i]);
+                                remapped[i] = (it != fb_id_to_slot.end()) ? it->second : 0;
+                            }
+                            if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+                                ggml_backend_tensor_set(t, remapped.data(), 0, n_ids * sizeof(int32_t));
+                            } else if (t->data) {
+                                memcpy(t->data, remapped.data(), n_ids * sizeof(int32_t));
                             }
                         }
                     }
+                    // else: non-inflated layer — only_active_experts already
+                    // handled it with original positions + original IDs.
                 }
             }
         }
@@ -3924,6 +4060,16 @@ static int llama_decode_internal(
 #endif
         ggml_cgraph * gf = nullptr;
         if (!lctx.can_reuse_graph(u_batch)) {
+            // Restore the last JIT-overlaid layer BEFORE graph build.
+            // The JIT callback leaves the last layer's base tensors in sharp
+            // state (Q3_K_M type, sharp data pointer).  If we build the graph
+            // with stale types, the scheduler creates wrong-sized device copies
+            // and only_active_experts sees type mismatches → NaN.
+            if (lctx.jit_sharpening && lctx.jit_bsctx && lctx.jit_current_layer >= 0) {
+                llama_blurry_sharp_restore_layer(lctx.jit_bsctx, lctx.jit_current_layer);
+                lctx.jit_current_layer = -1;
+            }
+
             lctx.reset_scheduler();
             // Chain with router recording / JIT sharpening callback if active.
             // Both features use the same callback (llama_router_eval_callback)
@@ -3954,7 +4100,16 @@ static int llama_decode_internal(
             // Pre-inflate expert tensor types so scheduler allocates device
             // copies at the sharp (larger) size, enabling cross-type JIT overlay.
             if (lctx.jit_sharpening && lctx.jit_bsctx) {
-                llama_blurry_sharp_inflate_expert_types(lctx.jit_bsctx);
+                // Pass priority layers so only those get inflated (type + ne[2]
+                // change).  Non-priority layers keep TQ1_0/ne[2]=n_expert, get
+                // normal device copies via only_active_experts, and compute
+                // on GPU with blurry data.
+                std::vector<int32_t> prio_vec(lctx.jit_priority_layers.begin(),
+                                              lctx.jit_priority_layers.end());
+                llama_blurry_sharp_inflate_expert_types(
+                    lctx.jit_bsctx, u_batch.n_tokens,
+                    prio_vec.empty() ? nullptr : prio_vec.data(),
+                    (int32_t)prio_vec.size());
             }
             ggml_backend_sched_alloc_graph(lctx.sched, gf);
             // Restore original (blurry) types now that device copies are sized.

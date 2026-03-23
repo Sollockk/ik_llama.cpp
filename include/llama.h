@@ -1749,8 +1749,16 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // the backend scheduler allocates device copies at the larger size.
     // Must be called AFTER graph build but BEFORE ggml_backend_sched_alloc_graph.
     // Call llama_blurry_sharp_deflate_expert_types() to restore after alloc.
+    //
+    // n_tokens: current batch size.  For small batches (generation), also
+    //   shrinks ne[2] from n_expert to n_expert_used so device copies are
+    //   tiny (~122 MiB vs ~2.5 GiB).  For large batches (prompt), only
+    //   inflates the type (ne[2] stays at n_expert).
     LLAMA_API void llama_blurry_sharp_inflate_expert_types(
-            struct llama_blurry_sharp_context * bsctx);
+            struct llama_blurry_sharp_context * bsctx,
+            int32_t n_tokens,
+            const int32_t * priority_layers,
+            int32_t         n_priority_layers);
 
     // Set a pre-allocated GPU buffer as the expert cache.
     // This should be called AFTER llama_blurry_sharp_init() but BEFORE inference.
