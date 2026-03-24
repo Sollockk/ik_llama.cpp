@@ -3304,14 +3304,11 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
             }
 
             // 2b) Layer budget check: skip layers not in the priority set.
-            //     When the set is empty, all layers are eligible (no filtering).
-            //     In host-only mode (prompt processing), bypass the budget so
-            //     ALL non-skipped layers get sharpened — the priority set is
-            //     designed for generation I/O savings, not prompt quality.
-            if (!lctx->jit_bsctx->jit_host_only &&
-                !lctx->jit_priority_layers.empty() &&
+            //     Non-priority layers use blurry weights:
+            //     - Generation: CPU MoE with TQ1_0 data
+            //     - Prompt: GPU MoE with TQ1_0 via only_active_experts
+            if (!lctx->jit_priority_layers.empty() &&
                 lctx->jit_priority_layers.find(layer_idx) == lctx->jit_priority_layers.end()) {
-                // Not a priority layer — use blurry weights, skip sharpening.
                 goto jit_done;
             }
 
@@ -3384,6 +3381,10 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                 }
                             }
 
+                            // Debug: track upload path progress
+                            static int n_upload_dbg = 0;
+                            int dbg_n_tensors = 0, dbg_n_dcpy = 0, dbg_n_uploaded = 0;
+
                             auto & gcache = lctx->jit_bsctx->gpu_cache;
                             auto lt_it = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
                             if (lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
@@ -3394,6 +3395,7 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                     if (si_it == lctx->jit_bsctx->sharp_index.end()) continue;
                                     ggml_tensor * bt = si_it->second.base_tensor;
                                     if (!bt || !bt->data) continue;
+                                    dbg_n_tensors++;
 
                                     for (int bi = 0; bi < n_be; ++bi) {
                                         ggml_backend_t be = ggml_backend_sched_get_backend(lctx->sched, bi);
@@ -3410,6 +3412,7 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                         ggml_tensor * dcpy = ggml_backend_sched_get_tensor_copy(
                                             lctx->sched, bt, be);
                                         if (!dcpy) continue;
+                                        dbg_n_dcpy++;
 
                                         // Sync device copy type/strides to sharp type
                                         dcpy->type = bt->type;
@@ -3452,9 +3455,21 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                                 ggml_backend_tensor_set(dcpy,
                                                     (const uint8_t *)bt->data + off, off, sz);
                                             }
+                                            dbg_n_uploaded++;
                                         }
                                     }
                                 }
+                            }
+
+                            if (n_upload_dbg++ < 10) {
+                                fprintf(stderr, "UPLOAD-DBG layer %d: inflated=%d tensors=%d dcpy=%d uploaded=%d eids=%d\n",
+                                        layer_idx, (int)inflated, dbg_n_tensors, dbg_n_dcpy, dbg_n_uploaded,
+                                        (int)active_eids.size());
+                            }
+                        } else {
+                            static int n_noinfl_dbg = 0;
+                            if (n_noinfl_dbg++ < 3) {
+                                fprintf(stderr, "UPLOAD-DBG layer %d: inflated=FALSE\n", layer_idx);
                             }
                         }
 

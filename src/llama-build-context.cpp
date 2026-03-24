@@ -9822,27 +9822,39 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             }
         }
 
-        // Force MoE expert computation results to GPU when JIT sharpening is active
-        // AND the batch is small (generation).  During generation (1-few tokens),
-        // there are at most n_expert_used unique experts, and device copies are
-        // shrunk to n_expert_used slots by pre-inflate.  During prompt (many tokens),
-        // there can be more unique experts than slots, so MoE stays on CPU.
-        // Only force layers that will actually be sharpened (priority layers).
-        // Non-priority layers stay on CPU with TQ1_0 data — forcing them to GPU
-        // would require a TQ1_0→GPU fallback that produces garbage.
+        // Force MoE expert computation results to GPU when JIT sharpening
+        // is active.  Two modes depending on batch size:
+        //
+        // Generation (small batch): force PRIORITY layers to GPU.
+        //   Inflate gives sharp-sized device copies; JIT callback uploads
+        //   sharp expert slices.  GPU MoE runs at sharp quality.
+        //
+        // Prompt (large batch): force NON-PRIORITY layers to GPU.
+        //   No inflation — device copies stay at TQ1_0 size (~3× smaller).
+        //   only_active_experts copies TQ1_0 data normally → GPU MoE runs
+        //   at blurry quality but GPU speed.  Priority layers stay on CPU
+        //   where JIT overlay gives sharp quality.
         if (lctx.jit_sharpening && il >= 0 &&
-            batch.n_tokens <= (int32_t)lctx.model.hparams.n_expert_used &&
-            (lctx.jit_priority_layers.empty() ||
-             lctx.jit_priority_layers.count(il) > 0) &&
             (strcmp(name, "ffn_moe_up") == 0 ||
              strcmp(name, "ffn_moe_gate") == 0 ||
              strcmp(name, "ffn_moe_down") == 0 ||
              strcmp(name, "ffn_moe_gate_par") == 0)) {
-            for (auto * backend : lctx.backends) {
-                if (!ggml_backend_is_cpu(backend) &&
-                    ggml_backend_supports_op(backend, cur)) {
-                    ggml_backend_sched_set_tensor_backend(lctx.sched, cur, backend);
-                    break;
+            const bool is_small_batch =
+                batch.n_tokens <= (int32_t)lctx.model.hparams.n_expert_used;
+            const bool is_priority =
+                lctx.jit_priority_layers.empty() ||
+                lctx.jit_priority_layers.count(il) > 0;
+
+            // Generation: GPU for priority (sharp via JIT upload)
+            // Prompt:     GPU for non-priority (blurry via only_active_experts)
+            if ((is_small_batch && is_priority) ||
+                (!is_small_batch && !is_priority)) {
+                for (auto * backend : lctx.backends) {
+                    if (!ggml_backend_is_cpu(backend) &&
+                        ggml_backend_supports_op(backend, cur)) {
+                        ggml_backend_sched_set_tensor_backend(lctx.sched, cur, backend);
+                        break;
+                    }
                 }
             }
         }
