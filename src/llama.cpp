@@ -3260,9 +3260,13 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
         if (lctx->jit_sharpening && lctx->jit_bsctx) {
             // Timing accumulators (per-token, printed periodically)
             static int64_t t_restore_us = 0, t_apply_us = 0, t_upload_us = 0, t_fallback_us = 0;
+            static int64_t t_between_us = 0;  // time between callbacks = GPU compute
+            static int64_t t_overhead_us = 0; // callback overhead (ID collection, sorting, prefetch hints)
             static int64_t n_upload_calls = 0, n_upload_bytes = 0;
+            static int64_t n_pcie_bytes = 0;  // total bytes sent over PCIe this token
             static int     n_tokens_timed = 0;
             static int     current_layer_count = 0;
+            static int64_t t_last_callback_end = 0; // end of previous callback
             auto now_us = []() {
                 struct timespec ts;
                 clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -3270,6 +3274,11 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
             };
 
             int64_t t0 = now_us();
+
+            // Measure time between callbacks (= GPU/CPU compute for previous layer)
+            if (t_last_callback_end > 0) {
+                t_between_us += (t0 - t_last_callback_end);
+            }
 
             // 1) Restore the previous layer (if any)
             if (lctx->jit_current_layer >= 0) {
@@ -3343,7 +3352,9 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                     }
 
                     // 4) Sharpen this layer's expert weights
-                    int64_t t2 = now_us();
+                    int64_t t_pre_apply = now_us();
+                    t_overhead_us += (t_pre_apply - t1); // time from restore-end to apply-start
+                    int64_t t2 = t_pre_apply;
                     int32_t ret = llama_blurry_sharp_apply_experts(
                         lctx->jit_bsctx, layer_idx,
                         expert_vec.data(), (int32_t)expert_vec.size());
@@ -3362,11 +3373,14 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                         jit_overlaid = true;
 
                         // 5) Upload sharp expert slices to GPU device copies.
-                        //    Only for generation (small batch) where inflate is active.
-                        //    For prompt (large batch), only_active_experts handles it.
+                        //    Generation (small batch): manually upload via callback
+                        //      for precise per-expert control + GPU cache.
+                        //    Prompt (large batch): skip manual upload —
+                        //      only_active_experts copies per-token slices automatically
+                        //      since inflate ensures device copies are Q4_K_M sized.
                         int64_t t_upload_start = now_us();
-                        const bool inflated = lctx->jit_bsctx->inflate_shrunk_ne2;
-                        if (inflated) {
+                        const bool is_generation = (n_tokens <= (int64_t)lctx->model.hparams.n_expert_used);
+                        if (is_generation && lctx->jit_bsctx->inflate_shrunk_ne2) {
                             // Collect unique active expert IDs
                             std::vector<int32_t> active_eids;
                             {
@@ -3443,11 +3457,13 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                                     } else {
                                                         ggml_backend_tensor_set(dcpy, src, off, sz);
                                                     }
+                                                    n_pcie_bytes += (int64_t)sz; // CPU→GPU transfer
                                                     gcache.n_misses++;
                                                 }
                                             } else {
                                                 ggml_backend_tensor_set(dcpy,
                                                     (const uint8_t *)bt->data + off, off, sz);
+                                                n_pcie_bytes += (int64_t)sz;
                                             }
                                         }
                                     }
@@ -3459,10 +3475,7 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                         t_upload_us += (t_upload_end - t_upload_start);
 
                         // Hint the OS page cache for upcoming layers.
-                        // madvise(WILLNEED) is non-blocking and zero-overhead
-                        // compared to the async prefetch threads which caused
-                        // memory pressure and thread-creation overhead at 60GB+
-                        // model scale.
+                        int64_t t_hint_start = now_us();
                         for (int pf = 1; pf <= 5; ++pf) {
                             int pf_layer = layer_idx + pf;
                             if (pf_layer < (int)lctx->model.hparams.n_layer) {
@@ -3471,6 +3484,7 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                     expert_vec.data(), (int32_t)expert_vec.size());
                             }
                         }
+                        t_overhead_us += (now_us() - t_hint_start);
                     }
                     // If sharpening fails, we fall through to jit_done
                     // which uploads TQ1_0 data as fallback.
@@ -3478,6 +3492,7 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
             }
 
             jit_done:;
+            t_last_callback_end = now_us();
             current_layer_count++;
 
             // Print timing every ~52 layers (≈ 1 token)
@@ -3486,14 +3501,21 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                 n_tokens_timed++;
                 auto & gc = lctx->jit_bsctx->gpu_cache;
                 if (n_tokens_timed <= 10 || (n_tokens_timed % 20 == 0)) {
-                    fprintf(stderr, "JIT-TIMING[tok %d]: restore=%.1fms apply=%.1fms upload=%.1fms "
-                                    "fallback=%.1fms | layers=%d",
+                    int64_t t_jit_total = t_restore_us + t_apply_us + t_upload_us + t_overhead_us + t_fallback_us;
+                    int64_t t_total = t_jit_total + t_between_us;
+                    fprintf(stderr, "JIT-TIMING[tok %d]: compute=%.1fms jit=%.1fms "
+                                    "(restore=%.1f apply=%.1f upload=%.1f overhead=%.1f fallback=%.1f) "
+                                    "| layers=%d pcie=%.1fMiB",
                             n_tokens_timed,
+                            t_between_us / 1000.0,
+                            t_jit_total / 1000.0,
                             t_restore_us / 1000.0,
                             t_apply_us / 1000.0,
                             t_upload_us / 1000.0,
+                            t_overhead_us / 1000.0,
                             t_fallback_us / 1000.0,
-                            current_layer_count);
+                            current_layer_count,
+                            n_pcie_bytes / (1024.0 * 1024.0));
                     if (gc.enabled) {
                         fprintf(stderr, " | gpu-cache: hits=%lld misses=%lld (%.0f%%)",
                                 (long long)gc.n_hits, (long long)gc.n_misses,
@@ -3511,7 +3533,10 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                     fprintf(stderr, "\n");
                 }
                 t_restore_us = t_apply_us = t_upload_us = t_fallback_us = 0;
+                t_between_us = t_overhead_us = 0;
+                t_last_callback_end = 0;
                 n_upload_calls = n_upload_bytes = 0;
+                n_pcie_bytes = 0;
                 current_layer_count = 0;
             }
             prev_layer_idx = layer_idx;

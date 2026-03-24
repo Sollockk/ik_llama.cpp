@@ -6025,16 +6025,13 @@ void llama_blurry_sharp_inflate_expert_types(
 
     const int64_t n_expert_used = bsctx->model->hparams.n_expert_used;
 
-    // For large batches (prompt), skip inflation.  All ~160 experts may be
-    // active; inflating device copies to sharp type would OOM on GPU.
-    // Prompt uses the CPU path: JIT overlay gives sharp quality at CPU speed.
-    // For small batches (generation), inflate so the scheduler allocates
-    // sharp-sized device copies.  The JIT callback uploads only the active
-    // expert slices.  ne[2] stays at the full n_expert count.
-    if (n_tokens > (int32_t)n_expert_used) {
-        bsctx->inflate_shrunk_ne2 = false;
-        return;
-    }
+    // Always inflate expert tensor types to sharp (Q4_K_M) so the scheduler
+    // allocates device copies large enough for sharp data.  The scheduler
+    // reuses device copy buffers across layers, so the extra VRAM cost is
+    // just ONE layer of (Q4_K_M - TQ1_0) ≈ 700MB — fits on 24GB GPU.
+    //
+    // For prompt: only_active_experts copies sharp slices CPU→GPU automatically.
+    // For generation: the JIT callback uploads active slices manually.
     bsctx->inflate_shrunk_ne2 = true;
 
     // Build set of priority layer indices.  When non-empty, only inflate
