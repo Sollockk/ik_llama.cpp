@@ -37,6 +37,12 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <new>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 #include <memory>
 #include <mutex>
 #include <string>
@@ -47,6 +53,70 @@
 
 struct llama_model;
 struct gguf_context;
+
+// ---------------------------------------------------------------------------
+// 2MB-aligned buffer for expert data.
+//
+// Uses posix_memalign to get huge-page-friendly alignment, reducing TLB
+// misses when the kernel reads large expert tensors.  Supports move
+// semantics for efficient swap between prefetch and combo buffers.
+// ---------------------------------------------------------------------------
+struct bs_aligned_buffer {
+    static constexpr size_t ALIGNMENT = 2 * 1024 * 1024;  // 2MB
+
+    bs_aligned_buffer() = default;
+    ~bs_aligned_buffer() { if (ptr_) free(ptr_); }
+
+    // Move only — no copies (owns raw allocation)
+    bs_aligned_buffer(bs_aligned_buffer && o) noexcept
+        : ptr_(o.ptr_), size_(o.size_), capacity_(o.capacity_) {
+        o.ptr_ = nullptr; o.size_ = 0; o.capacity_ = 0;
+    }
+    bs_aligned_buffer & operator=(bs_aligned_buffer && o) noexcept {
+        if (this != &o) {
+            if (ptr_) free(ptr_);
+            ptr_ = o.ptr_; size_ = o.size_; capacity_ = o.capacity_;
+            o.ptr_ = nullptr; o.size_ = 0; o.capacity_ = 0;
+        }
+        return *this;
+    }
+    bs_aligned_buffer(const bs_aligned_buffer &) = delete;
+    bs_aligned_buffer & operator=(const bs_aligned_buffer &) = delete;
+
+    void resize(size_t n) {
+        if (n <= capacity_) { size_ = n; return; }
+        void * p = nullptr;
+        if (posix_memalign(&p, ALIGNMENT, n) != 0) {
+            throw std::bad_alloc();
+        }
+#ifndef _WIN32
+        // Hint the kernel to back this allocation with huge pages (2MB).
+        // Reduces TLB misses when reading/writing large expert tensors.
+        madvise(p, n, MADV_HUGEPAGE);
+#endif
+        if (ptr_) free(ptr_);
+        ptr_ = static_cast<uint8_t *>(p);
+        size_ = capacity_ = n;
+    }
+
+    uint8_t * data()             { return ptr_; }
+    const uint8_t * data() const { return ptr_; }
+    size_t size()    const       { return size_; }
+    bool   empty()   const       { return size_ == 0; }
+    void   clear()               { size_ = 0; }  // keeps allocation
+
+    // For compatibility with code that does assign(begin, end)
+    void assign(const uint8_t * begin, const uint8_t * end) {
+        size_t n = end - begin;
+        resize(n);
+        std::memcpy(ptr_, begin, n);
+    }
+
+private:
+    uint8_t * ptr_      = nullptr;
+    size_t    size_     = 0;
+    size_t    capacity_ = 0;
+};
 
 // ---------------------------------------------------------------------------
 // Per-layer state query result  (internal – used by get_layer_state)
@@ -437,7 +507,7 @@ struct llama_blurry_sharp_context {
     // One per concurrent expert tensor (gate, up, down).  Allocated lazily,
     // sized for the full tensor (160 experts × slice_size).  Only the
     // active expert slots are populated; untouched pages consume no RAM.
-    std::unordered_map<std::string, std::vector<uint8_t>> combo_buffers;
+    std::unordered_map<std::string, bs_aligned_buffer> combo_buffers;
 
     // ---- Async prefetch (double-buffered I/O) ----
     // While the MoE kernel computes layer N using combo_buffers, a background
@@ -449,7 +519,9 @@ struct llama_blurry_sharp_context {
         std::atomic<bool>          active{false};  // worker is running
         int                        layer_idx = -1;
         std::vector<int32_t>       expert_ids;
-        std::unordered_map<std::string, std::vector<uint8_t>> buffers;
+        std::unordered_map<std::string, bs_aligned_buffer> buffers;
+        int64_t                    n_hits = 0;     // prefetch buffer used (I/O saved)
+        int64_t                    n_misses = 0;   // prefetch missed, fell back to sync I/O
     } async_prefetch;
 
     // -- self-eviction guard --

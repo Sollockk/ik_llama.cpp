@@ -3493,9 +3493,26 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                         int64_t t_upload_end = now_us();
                         t_upload_us += (t_upload_end - t_upload_start);
 
-                        // Hint the OS page cache for upcoming layers.
+                        // Start async prefetch for next layer's experts.
+                        // While GPU computes this layer's MoE, a background
+                        // thread reads the next layer's expert slices from SSD
+                        // into prefetch buffers.  Uses same expert IDs as
+                        // prediction (~70% overlap between adjacent layers).
+                        // Only during generation — prompt disables parallel I/O.
                         int64_t t_hint_start = now_us();
-                        for (int pf = 1; pf <= 5; ++pf) {
+                        if (!is_prompt && lctx->jit_bsctx->params.parallel_expert_io) {
+                            int next_layer = layer_idx + 1;
+                            if (next_layer < (int)lctx->model.hparams.n_layer) {
+                                llama_blurry_sharp_async_prefetch_start(
+                                    lctx->jit_bsctx, next_layer,
+                                    expert_vec.data(), (int32_t)expert_vec.size());
+                            }
+                        }
+
+                        // Hint the OS page cache for layers further ahead.
+                        // Layer N+1 is handled by async prefetch above (actual
+                        // pread), so madvise hints start at N+2.
+                        for (int pf = 2; pf <= 5; ++pf) {
                             int pf_layer = layer_idx + pf;
                             if (pf_layer < (int)lctx->model.hparams.n_layer) {
                                 llama_blurry_sharp_prefetch_expert_slices(
@@ -3548,6 +3565,13 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                 (long long)rc.n_hits, (long long)rc.n_misses,
                                 rt > 0 ? 100.0 * rc.n_hits / rt : 0.0,
                                 rc.used_bytes / (1024.0 * 1024.0));
+                    }
+                    auto & ap = lctx->jit_bsctx->async_prefetch;
+                    int64_t apt = ap.n_hits + ap.n_misses;
+                    if (apt > 0) {
+                        fprintf(stderr, " | prefetch: hits=%lld misses=%lld (%.0f%%)",
+                                (long long)ap.n_hits, (long long)ap.n_misses,
+                                100.0 * ap.n_hits / apt);
                     }
                     fprintf(stderr, "\n");
                 }

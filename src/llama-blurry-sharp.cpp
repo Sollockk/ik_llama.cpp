@@ -3700,6 +3700,7 @@ static bool bs_async_prefetch_consume(
     // Swap prefetch buffer into combo_buffers
     bsctx->combo_buffers[tensor_name] = std::move(pf_it->second);
     pf_it->second.clear();
+    bsctx->async_prefetch.n_hits++;
     return true;
 }
 
@@ -4461,6 +4462,7 @@ static int64_t bs_overlay_expert_tensor(
                     base_tensor->data = bsctx->combo_buffers[sharp_info.name].data();
                     backup_out.zero_copy = true;
                 } else {
+                bsctx->async_prefetch.n_misses++;
 
                 // Check how many experts need file I/O vs RAM cache hits.
                 // Experts already in RAM cache are copied from anonymous
