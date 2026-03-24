@@ -439,6 +439,19 @@ struct llama_blurry_sharp_context {
     // active expert slots are populated; untouched pages consume no RAM.
     std::unordered_map<std::string, std::vector<uint8_t>> combo_buffers;
 
+    // ---- Async prefetch (double-buffered I/O) ----
+    // While the MoE kernel computes layer N using combo_buffers, a background
+    // thread reads layer N+1's predicted expert slices into prefetch_buffers.
+    // When layer N+1's callback fires, we swap prefetch→combo (no I/O).
+    struct {
+        std::thread                worker;
+        std::atomic<bool>          ready{false};
+        std::atomic<bool>          active{false};  // worker is running
+        int                        layer_idx = -1;
+        std::vector<int32_t>       expert_ids;
+        std::unordered_map<std::string, std::vector<uint8_t>> buffers;
+    } async_prefetch;
+
     // -- self-eviction guard --
     // During apply_layer / apply_experts, tensors are overlaid one at a time.
     // Each overlay may allocate a new device buffer and insert it into the

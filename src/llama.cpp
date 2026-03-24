@@ -3381,10 +3381,6 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                 }
                             }
 
-                            // Debug: track upload path progress
-                            static int n_upload_dbg = 0;
-                            int dbg_n_tensors = 0, dbg_n_dcpy = 0, dbg_n_uploaded = 0;
-
                             auto & gcache = lctx->jit_bsctx->gpu_cache;
                             auto lt_it = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
                             if (lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
@@ -3395,7 +3391,6 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                     if (si_it == lctx->jit_bsctx->sharp_index.end()) continue;
                                     ggml_tensor * bt = si_it->second.base_tensor;
                                     if (!bt || !bt->data) continue;
-                                    dbg_n_tensors++;
 
                                     for (int bi = 0; bi < n_be; ++bi) {
                                         ggml_backend_t be = ggml_backend_sched_get_backend(lctx->sched, bi);
@@ -3412,7 +3407,6 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                         ggml_tensor * dcpy = ggml_backend_sched_get_tensor_copy(
                                             lctx->sched, bt, be);
                                         if (!dcpy) continue;
-                                        dbg_n_dcpy++;
 
                                         // Sync device copy type/strides to sharp type
                                         dcpy->type = bt->type;
@@ -3455,32 +3449,20 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                                 ggml_backend_tensor_set(dcpy,
                                                     (const uint8_t *)bt->data + off, off, sz);
                                             }
-                                            dbg_n_uploaded++;
                                         }
                                     }
                                 }
-                            }
-
-                            if (n_upload_dbg++ < 10) {
-                                fprintf(stderr, "UPLOAD-DBG layer %d: inflated=%d tensors=%d dcpy=%d uploaded=%d eids=%d\n",
-                                        layer_idx, (int)inflated, dbg_n_tensors, dbg_n_dcpy, dbg_n_uploaded,
-                                        (int)active_eids.size());
-                            }
-                        } else {
-                            static int n_noinfl_dbg = 0;
-                            if (n_noinfl_dbg++ < 3) {
-                                fprintf(stderr, "UPLOAD-DBG layer %d: inflated=FALSE\n", layer_idx);
                             }
                         }
 
                         int64_t t_upload_end = now_us();
                         t_upload_us += (t_upload_end - t_upload_start);
 
-                        // Prefetch upcoming layers' expert slices into page
-                        // cache.  Use the current layer's active experts as
-                        // a prediction (expert routing has ~70% overlap
-                        // between adjacent layers).  Targeted prefetch: only
-                        // the needed slices, not the full 160-expert tensors.
+                        // Hint the OS page cache for upcoming layers.
+                        // madvise(WILLNEED) is non-blocking and zero-overhead
+                        // compared to the async prefetch threads which caused
+                        // memory pressure and thread-creation overhead at 60GB+
+                        // model scale.
                         for (int pf = 1; pf <= 5; ++pf) {
                             int pf_layer = layer_idx + pf;
                             if (pf_layer < (int)lctx->model.hparams.n_layer) {

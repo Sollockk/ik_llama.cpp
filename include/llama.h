@@ -1718,6 +1718,15 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             const int32_t                     * expert_ids,
             int32_t                             n_experts);
 
+    // Start async prefetch for the next layer's expert slices using parallel
+    // pread in a background thread.  When apply_experts is called for the
+    // prefetched layer, it consumes the pre-read data with zero I/O.
+    LLAMA_API void llama_blurry_sharp_async_prefetch_start(
+            struct llama_blurry_sharp_context * bsctx,
+            int32_t                             layer_idx,
+            const int32_t                     * expert_ids,
+            int32_t                             n_experts);
+
     // Prefetch multiple layers in parallel using n_threads worker threads.
     // Each worker reads its assigned layers' tensor data from mmap/file
     // into a staging cache concurrently.  The subsequent sequential apply

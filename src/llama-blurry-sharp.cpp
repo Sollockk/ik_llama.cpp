@@ -2858,6 +2858,25 @@ int32_t llama_blurry_sharp_apply_layer(
     // GPU memory → illegal memory access when the compute kernel runs.
     bsctx->building_layer_idx = layer_idx;
 
+    // Release combo_buffers from previous layers to prevent unbounded
+    // memory growth.  Each layer has unique tensor names so entries
+    // accumulate across layers (60 layers × 3 tensors × full tensor
+    // size = tens of GB).  Only keep buffers for the current layer.
+    {
+        auto lt_it = bsctx->layer_tensor_names.find(layer_idx);
+        std::unordered_set<std::string> current_layer_tensors;
+        if (lt_it != bsctx->layer_tensor_names.end()) {
+            current_layer_tensors.insert(lt_it->second.begin(), lt_it->second.end());
+        }
+        for (auto it = bsctx->combo_buffers.begin(); it != bsctx->combo_buffers.end(); ) {
+            if (current_layer_tensors.find(it->first) == current_layer_tensors.end()) {
+                it = bsctx->combo_buffers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     // Prefetch this layer's sharp data from disk into the page cache.
     // The madvise(WILLNEED) calls are non-blocking — the kernel starts
     // async I/O immediately.  By the time we iterate through the tensors
@@ -3546,6 +3565,142 @@ void llama_blurry_sharp_prefetch_expert_slices(
     GGML_UNUSED(expert_ids);
     GGML_UNUSED(n_experts);
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Async prefetch: read the NEXT layer's expert slices in the background
+// using parallel pread, so data is ready when the callback fires.
+//
+// Called from the JIT callback after applying layer N.  Fires a background
+// thread that reads layer N+1's predicted expert slices (same experts as
+// layer N — ~70% overlap) into prefetch_buffers via parallel pread.
+// When layer N+1's apply_experts runs, it checks prefetch_buffers first
+// and swaps them into combo_buffers if the prediction matches.
+// ---------------------------------------------------------------------------
+
+void llama_blurry_sharp_async_prefetch_start(
+        llama_blurry_sharp_context * bsctx,
+        int32_t                      layer_idx,
+        const int32_t              * expert_ids,
+        int32_t                      n_experts) {
+    if (!bsctx || !expert_ids || n_experts <= 0) return;
+    if (!bsctx->params.parallel_expert_io) return;
+
+    auto & ap = bsctx->async_prefetch;
+
+    // Wait for any previous prefetch to finish
+    if (ap.active.load()) {
+        if (ap.worker.joinable()) ap.worker.join();
+        ap.active = false;
+    }
+
+    // Save the prediction
+    ap.layer_idx = layer_idx;
+    ap.expert_ids.assign(expert_ids, expert_ids + n_experts);
+    ap.ready  = false;
+    ap.active = true;
+
+    // Clear old prefetch buffers to prevent unbounded memory growth.
+    // Each layer has unique tensor names, so old entries would accumulate
+    // (60 layers × 3 tensors × full-tensor-size = tens of GB).
+    ap.buffers.clear();
+
+    // Launch worker thread that does parallel pread into prefetch buffers
+    ap.worker = std::thread([bsctx, layer_idx, n_experts]() {
+        auto & ap = bsctx->async_prefetch;
+        auto lt_it = bsctx->layer_tensor_names.find(layer_idx);
+        if (lt_it == bsctx->layer_tensor_names.end()) {
+            ap.ready = true;
+            return;
+        }
+
+        for (const auto & tname : lt_it->second) {
+            if (!bs_is_expert_tensor(tname)) continue;
+
+            auto info_it = bsctx->sharp_index.find(tname);
+            if (info_it == bsctx->sharp_index.end()) continue;
+            const auto & si = info_it->second;
+            if (si.ne[2] <= 1) continue;
+
+            int split = si.split_idx;
+            bool have_file = (split >= 0 && split < (int)bsctx->sharp_files.size()
+                              && bsctx->sharp_files[split]);
+            if (!have_file) continue;
+            int fd = bsctx->sharp_files[split]->file_id();
+            if (fd < 0) continue;
+
+            size_t sharp_expert_slice = si.nbytes / (size_t)si.ne[2];
+
+            // Allocate prefetch buffer for this tensor only
+            auto & buf = ap.buffers[tname];
+            buf.resize(si.nbytes);
+#ifndef _WIN32
+            madvise(buf.data(), buf.size(), MADV_DONTNEED);
+#endif
+
+            // NOTE: Do NOT access ram_expert_cache from this worker thread —
+            // the main thread may be inserting into it concurrently (data race
+            // on std::unordered_map = UB).  Just do pread for all experts.
+            std::vector<bs_pread_task> tasks;
+            tasks.reserve(n_experts);
+
+            for (int32_t i = 0; i < n_experts; ++i) {
+                int32_t eid = ap.expert_ids[i];
+                if (eid < 0 || eid >= si.ne[2]) continue;
+                size_t off = (size_t)eid * sharp_expert_slice;
+
+                bs_pread_task t;
+                t.fd     = fd;
+                t.dst    = buf.data() + off;
+                t.offset = (off_t)(si.file_offset + off);
+                t.size   = sharp_expert_slice;
+                t.result = 0;
+                tasks.push_back(t);
+            }
+
+            if (!tasks.empty()) {
+                bs_parallel_pread(tasks.data(), (int)tasks.size());
+            }
+        }
+
+        ap.ready = true;
+    });
+}
+
+// Check if async prefetch has data for the given layer+tensor.
+// If yes, swap the prefetch buffer into combo_buffers and return true.
+// Called from bs_overlay_expert_tensor before doing any I/O.
+static bool bs_async_prefetch_consume(
+        llama_blurry_sharp_context * bsctx,
+        const std::string          & tensor_name,
+        int32_t                      layer_idx,
+        const int32_t              * expert_ids,
+        int32_t                      n_experts_req) {
+    auto & ap = bsctx->async_prefetch;
+    if (!ap.ready.load() || ap.layer_idx != layer_idx) return false;
+
+    // Wait for worker to finish (should already be done since ready=true)
+    if (ap.active.load()) {
+        if (ap.worker.joinable()) ap.worker.join();
+        ap.active = false;
+    }
+
+    auto pf_it = ap.buffers.find(tensor_name);
+    if (pf_it == ap.buffers.end() || pf_it->second.empty()) return false;
+
+    // Check that the prefetched experts cover what we need.
+    // Build a set of prefetched expert IDs for quick lookup.
+    std::unordered_set<int32_t> prefetched(ap.expert_ids.begin(), ap.expert_ids.end());
+    for (int32_t i = 0; i < n_experts_req; ++i) {
+        if (prefetched.find(expert_ids[i]) == prefetched.end()) {
+            return false;  // missing expert — can't use prefetch
+        }
+    }
+
+    // Swap prefetch buffer into combo_buffers
+    bsctx->combo_buffers[tensor_name] = std::move(pf_it->second);
+    pf_it->second.clear();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -4297,6 +4452,16 @@ static int64_t bs_overlay_expert_tensor(
                     bs_release_mmap_pages(bsctx, backup_out.original_data, old_nbytes);
                 }
 
+                // Try async prefetch first — if the previous layer's
+                // callback pre-read this layer's data, we can skip I/O.
+                if (bs_async_prefetch_consume(bsctx, sharp_info.name,
+                        bsctx->building_layer_idx, expert_ids, n_experts_req)) {
+                    // Prefetch buffer was swapped into combo_buffers —
+                    // data is already there, no I/O needed.
+                    base_tensor->data = bsctx->combo_buffers[sharp_info.name].data();
+                    backup_out.zero_copy = true;
+                } else {
+
                 // Check how many experts need file I/O vs RAM cache hits.
                 // Experts already in RAM cache are copied from anonymous
                 // memory (fast).  Only cache misses need file reads.
@@ -4403,6 +4568,7 @@ static int64_t bs_overlay_expert_tensor(
 
                 base_tensor->data = combo.data();
                 backup_out.zero_copy = true;
+                } // end else (no async prefetch hit)
             }
 
         } else if (!used_ram_cache && base_tensor->type == sharp_info.type && base_expert_slice == sharp_expert_slice) {
