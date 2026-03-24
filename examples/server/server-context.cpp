@@ -226,8 +226,9 @@ bool server_context::load_model(const gpt_params& params_) {
             bs_params.layer_denylist    = params_base.bs_layer_denylist.data();
             bs_params.n_layer_denylist  = (int32_t)params_base.bs_layer_denylist.size();
         }
-        bs_params.n_sharp_experts    = params_base.bs_sharp_experts;
-        bs_params.parallel_expert_io = params_base.bs_parallel_expert_io;
+        bs_params.n_sharp_experts_gpu = params_base.bs_sharp_experts_gpu;
+        bs_params.n_sharp_experts_cpu = params_base.bs_sharp_experts_cpu;
+        bs_params.parallel_expert_io  = params_base.bs_parallel_expert_io;
         bs_params.gpu_cache_bytes    = (int64_t)params_base.bs_gpu_cache_mb * 1024 * 1024;
         bs_params.ram_cache_bytes    = (int64_t)params_base.bs_ram_cache_mb * 1024 * 1024;
 

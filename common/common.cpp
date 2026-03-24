@@ -2359,9 +2359,14 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
-    if (arg == "--bs-sharp-experts") {
+    if (arg == "--bs-sharp-experts" || arg == "--bs-sharp-experts-gpu") {
         CHECK_ARG
-        params.bs_sharp_experts = std::stoi(argv[i]);
+        params.bs_sharp_experts_gpu = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-sharp-experts-cpu") {
+        CHECK_ARG
+        params.bs_sharp_experts_cpu = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--bs-no-parallel-io") {

@@ -3323,6 +3323,8 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
 
             // 3) Collect unique expert IDs for this layer, ranked by frequency
             {
+                const bool is_prompt = (n_tokens > (int64_t)lctx->model.hparams.n_expert_used);
+
                 // Count how many tokens selected each expert (frequency = importance)
                 std::unordered_map<int32_t, int> expert_freq;
                 for (size_t i = 0; i < n_ids; ++i) {
@@ -3338,8 +3340,15 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                     std::sort(sorted_experts.begin(), sorted_experts.end(),
                         [](const auto & a, const auto & b) { return a.second > b.second; });
 
-                    // Mixed-precision: only overlay top-N experts if configured
-                    int n_sharp = lctx->jit_bsctx->params.n_sharp_experts;
+                    // Mixed-precision: only overlay top-N experts if configured.
+                    // Use separate limits for GPU (generation) vs CPU (prompt).
+                    int n_sharp;
+                    if (is_prompt) {
+                        int cpu_limit = lctx->jit_bsctx->params.n_sharp_experts_cpu;
+                        n_sharp = (cpu_limit >= 0) ? cpu_limit : lctx->jit_bsctx->params.n_sharp_experts_gpu;
+                    } else {
+                        n_sharp = lctx->jit_bsctx->params.n_sharp_experts_gpu;
+                    }
                     int n_to_overlay = (int)sorted_experts.size();
                     if (n_sharp > 0 && n_sharp < n_to_overlay) {
                         n_to_overlay = n_sharp;
@@ -3352,12 +3361,22 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                     }
 
                     // 4) Sharpen this layer's expert weights
+                    //    Disable parallel pread during prompt — with many experts
+                    //    selected (up to 160), parallel I/O floods the SSD and
+                    //    hangs the system.  Sequential reads are fine for prompt
+                    //    since we're I/O bound anyway.  Keep parallel for generation
+                    //    (few experts, parallelism helps latency).
+                    bool saved_parallel_io = lctx->jit_bsctx->params.parallel_expert_io;
+                    if (is_prompt) {
+                        lctx->jit_bsctx->params.parallel_expert_io = false;
+                    }
                     int64_t t_pre_apply = now_us();
                     t_overhead_us += (t_pre_apply - t1); // time from restore-end to apply-start
                     int64_t t2 = t_pre_apply;
                     int32_t ret = llama_blurry_sharp_apply_experts(
                         lctx->jit_bsctx, layer_idx,
                         expert_vec.data(), (int32_t)expert_vec.size());
+                    lctx->jit_bsctx->params.parallel_expert_io = saved_parallel_io;
                     int64_t t3 = now_us();
                     t_apply_us += (t3 - t2);
 
@@ -4882,7 +4901,8 @@ struct llama_blurry_sharp_params llama_blurry_sharp_default_params() {
     params.permanent             = false;
     params.lazy_swap             = false;
     params.retain_mmap_pages     = false;
-    params.n_sharp_experts       = 0;
+    params.n_sharp_experts_gpu   = 0;
+    params.n_sharp_experts_cpu   = -1;  // -1 = use same as n_sharp_experts_gpu
     params.parallel_expert_io    = true;
     params.gpu_cache_bytes       = 0;
     params.ram_cache_bytes       = 0;  // 0 = auto (4 GiB), -1 = disabled
