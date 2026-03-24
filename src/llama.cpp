@@ -3493,20 +3493,26 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                         int64_t t_upload_end = now_us();
                         t_upload_us += (t_upload_end - t_upload_start);
 
-                        // NOTE: Async prefetch and madvise hints are disabled.
-                        //
-                        // The async prefetch worker runs sequentially (can't use
-                        // the shared IO pool from a background thread — deadlock).
-                        // Combined with the join() at the start of each new prefetch,
-                        // this serializes all I/O on the main thread, adding ~500ms
-                        // overhead with 0% hit rate (the consume check requires 100%
-                        // expert match between predicted and actual routing).
-                        //
-                        // The madvise(WILLNEED) hints for layers N+2..N+5 also add
-                        // measurable syscall overhead with no observed benefit.
-                        //
-                        // TODO: Re-enable when the IO pool supports concurrent
-                        // dispatch, and the consume check allows partial matches.
+                        // Start async prefetch for next layer's experts.
+                        // Uses a dedicated IO pool (separate from the main
+                        // thread's pool) to avoid dispatch() deadlock.
+                        // Consume supports partial matches — even if only
+                        // 5/8 experts overlap, those 5 skip I/O.
+                        // NOTE: Async prefetch disabled — causes heap corruption
+                        // ("double free or corruption (out)") from rapid alloc/free
+                        // of large 2MB-aligned buffers via posix_memalign.
+                        // Infrastructure (separate IO pool, partial consume) remains
+                        // for future use once buffer lifecycle is fixed.
+                        // int64_t t_hint_start = now_us();
+                        // if (!is_prompt && lctx->jit_bsctx->params.parallel_expert_io) {
+                        //     int next_layer = layer_idx + 1;
+                        //     if (next_layer < (int)lctx->model.hparams.n_layer) {
+                        //         llama_blurry_sharp_async_prefetch_start(
+                        //             lctx->jit_bsctx, next_layer,
+                        //             expert_vec.data(), (int32_t)expert_vec.size());
+                        //     }
+                        // }
+                        // t_overhead_us += (now_us() - t_hint_start);
                     }
 
                     // If sharpening fails, we fall through to jit_done

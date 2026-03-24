@@ -167,6 +167,16 @@ static bs_io_pool & bs_get_io_pool() {
     return pool;
 }
 
+// Separate IO pool for the async prefetch worker thread.
+// The main pool (bs_get_io_pool) is used by the eval callback on the main
+// thread.  dispatch() is not reentrant — two concurrent callers clobber
+// each other's task state → deadlock.  This second pool lets the prefetch
+// worker do parallel pread without contending with the main thread.
+static bs_io_pool & bs_get_prefetch_io_pool() {
+    static bs_io_pool pool;
+    return pool;
+}
+
 // Read n_tasks expert slices in parallel.  Falls back to sequential if n_tasks <= 1.
 static void bs_parallel_pread(bs_pread_task * tasks, int n_tasks) {
     if (n_tasks <= 0) return;
@@ -175,6 +185,17 @@ static void bs_parallel_pread(bs_pread_task * tasks, int n_tasks) {
         return;
     }
     bs_get_io_pool().dispatch(tasks, n_tasks);
+}
+
+// Same as bs_parallel_pread but uses the dedicated prefetch IO pool.
+// Safe to call from the async prefetch background thread.
+static void bs_prefetch_parallel_pread(bs_pread_task * tasks, int n_tasks) {
+    if (n_tasks <= 0) return;
+    if (n_tasks == 1) {
+        tasks[0].result = pread(tasks[0].fd, tasks[0].dst, tasks[0].size, tasks[0].offset);
+        return;
+    }
+    bs_get_prefetch_io_pool().dispatch(tasks, n_tasks);
 }
 
 // Check whether a tensor name corresponds to a merged expert tensor.
@@ -3600,13 +3621,27 @@ void llama_blurry_sharp_async_prefetch_start(
     ap.ready  = false;
     ap.active = true;
 
-    // Clear old prefetch buffers to prevent unbounded memory growth.
-    // Each layer has unique tensor names, so old entries would accumulate
-    // (60 layers × 3 tensors × full-tensor-size = tens of GB).
+    // Prefetch buffers are keyed by tensor name (includes layer number).
+    // To avoid accumulating 45 layers × 3 tensors × ~100MB of buffers,
+    // we clear the map BUT keep one set of pre-allocated buffers around
+    // by swapping into a reuse pool.  The worker then moves them back
+    // for the new layer's tensor names, avoiding alloc/free churn.
+    //
+    // Since all MoE layers have identical tensor shapes, the buffers
+    // from any layer fit any other layer's tensors.
+
+    // Collect reusable buffers from previous prefetch (avoid free+realloc)
+    std::vector<bs_aligned_buffer> reuse_pool;
+    for (auto & [name, buf] : ap.buffers) {
+        if (!buf.empty()) {
+            reuse_pool.push_back(std::move(buf));
+        }
+    }
     ap.buffers.clear();
 
     // Launch worker thread that does parallel pread into prefetch buffers
-    ap.worker = std::thread([bsctx, layer_idx, n_experts]() {
+    ap.worker = std::thread([bsctx, layer_idx, n_experts,
+                             reuse = std::move(reuse_pool)]() mutable {
         auto & ap = bsctx->async_prefetch;
         auto lt_it = bsctx->layer_tensor_names.find(layer_idx);
         if (lt_it == bsctx->layer_tensor_names.end()) {
@@ -3614,6 +3649,7 @@ void llama_blurry_sharp_async_prefetch_start(
             return;
         }
 
+        int reuse_idx = 0;
         for (const auto & tname : lt_it->second) {
             if (!bs_is_expert_tensor(tname)) continue;
 
@@ -3631,16 +3667,15 @@ void llama_blurry_sharp_async_prefetch_start(
 
             size_t sharp_expert_slice = si.nbytes / (size_t)si.ne[2];
 
-            // Allocate prefetch buffer for this tensor only
+            // Reuse buffer from pool or allocate new one
+            if (reuse_idx < (int)reuse.size() && reuse[reuse_idx].size() >= si.nbytes) {
+                ap.buffers[tname] = std::move(reuse[reuse_idx]);
+                reuse_idx++;
+            } else {
+                ap.buffers[tname].resize(si.nbytes);
+            }
             auto & buf = ap.buffers[tname];
-            buf.resize(si.nbytes);
-            // NOTE: Do NOT madvise(DONTNEED) here — bs_aligned_buffer uses
-            // anonymous heap pages, and MADV_DONTNEED on anonymous pages
-            // zeros them out on Linux, destroying any data.
 
-            // NOTE: Do NOT access ram_expert_cache from this worker thread —
-            // the main thread may be inserting into it concurrently (data race
-            // on std::unordered_map = UB).  Just do pread for all experts.
             std::vector<bs_pread_task> tasks;
             tasks.reserve(n_experts);
 
@@ -3658,14 +3693,10 @@ void llama_blurry_sharp_async_prefetch_start(
                 tasks.push_back(t);
             }
 
-            // NOTE: Do NOT use bs_parallel_pread here — it uses the
-            // shared bs_io_pool, and the main thread's eval callback also
-            // uses it concurrently.  The pool's dispatch() is not reentrant,
-            // causing a deadlock.  Sequential pread is fine for background
-            // prefetch (no latency sensitivity).
-            for (auto & t : tasks) {
-                t.result = pread(t.fd, t.dst, t.size, t.offset);
-            }
+            // Use the dedicated prefetch IO pool (not the main one —
+            // dispatch() is not reentrant and the main thread uses
+            // bs_get_io_pool() concurrently from the eval callback).
+            bs_prefetch_parallel_pread(tasks.data(), (int)tasks.size());
         }
 
         ap.ready = true;
@@ -3673,16 +3704,19 @@ void llama_blurry_sharp_async_prefetch_start(
 }
 
 // Check if async prefetch has data for the given layer+tensor.
-// If yes, swap the prefetch buffer into combo_buffers and return true.
-// Called from bs_overlay_expert_tensor before doing any I/O.
-static bool bs_async_prefetch_consume(
+// Copies matching expert slices from the prefetch buffer into combo_buffers.
+// Returns the number of experts consumed (0 = no match).
+// consumed_out[i] is set to true for each expert_ids[i] found in prefetch.
+// The caller only needs sync I/O for experts where consumed_out[i] is false.
+static int bs_async_prefetch_consume(
         llama_blurry_sharp_context * bsctx,
         const std::string          & tensor_name,
         int32_t                      layer_idx,
         const int32_t              * expert_ids,
-        int32_t                      n_experts_req) {
+        int32_t                      n_experts_req,
+        bool                       * consumed_out) {
     auto & ap = bsctx->async_prefetch;
-    if (!ap.ready.load() || ap.layer_idx != layer_idx) return false;
+    if (!ap.ready.load() || ap.layer_idx != layer_idx) return 0;
 
     // Wait for worker to finish (should already be done since ready=true)
     if (ap.active.load()) {
@@ -3691,22 +3725,47 @@ static bool bs_async_prefetch_consume(
     }
 
     auto pf_it = ap.buffers.find(tensor_name);
-    if (pf_it == ap.buffers.end() || pf_it->second.empty()) return false;
+    if (pf_it == ap.buffers.end() || pf_it->second.empty()) return 0;
 
-    // Check that the prefetched experts cover what we need.
-    // Build a set of prefetched expert IDs for quick lookup.
+    // Look up tensor info for slice size calculation
+    auto info_it = bsctx->sharp_index.find(tensor_name);
+    if (info_it == bsctx->sharp_index.end()) return 0;
+    const auto & si = info_it->second;
+    if (si.ne[2] <= 1) return 0;
+    size_t sharp_expert_slice = si.nbytes / (size_t)si.ne[2];
+
+    // Build set of prefetched expert IDs
     std::unordered_set<int32_t> prefetched(ap.expert_ids.begin(), ap.expert_ids.end());
+
+    // Ensure combo buffer is allocated
+    auto & combo = bsctx->combo_buffers[tensor_name];
+    if (combo.size() < si.nbytes) {
+        combo.resize(si.nbytes);
+    }
+
+    int n_consumed = 0;
     for (int32_t i = 0; i < n_experts_req; ++i) {
-        if (prefetched.find(expert_ids[i]) == prefetched.end()) {
-            return false;  // missing expert — can't use prefetch
+        consumed_out[i] = false;
+        int32_t eid = expert_ids[i];
+        if (prefetched.find(eid) != prefetched.end()) {
+            size_t off = (size_t)eid * sharp_expert_slice;
+            if (off + sharp_expert_slice <= si.nbytes &&
+                off + sharp_expert_slice <= pf_it->second.size()) {
+                std::memcpy(combo.data() + off,
+                            pf_it->second.data() + off,
+                            sharp_expert_slice);
+                consumed_out[i] = true;
+                n_consumed++;
+            }
         }
     }
 
-    // Swap prefetch buffer into combo_buffers
-    bsctx->combo_buffers[tensor_name] = std::move(pf_it->second);
-    pf_it->second.clear();
-    bsctx->async_prefetch.n_hits++;
-    return true;
+    if (n_consumed > 0) {
+        ap.n_hits += n_consumed;
+    }
+    ap.n_misses += (n_experts_req - n_consumed);
+
+    return n_consumed;
 }
 
 // ---------------------------------------------------------------------------
@@ -4457,123 +4516,125 @@ static int64_t bs_overlay_expert_tensor(
                     bs_release_mmap_pages(bsctx, backup_out.original_data, old_nbytes);
                 }
 
-                // Try async prefetch first — if the previous layer's
-                // callback pre-read this layer's data, we can skip I/O.
-                if (bs_async_prefetch_consume(bsctx, sharp_info.name,
-                        bsctx->building_layer_idx, expert_ids, n_experts_req)) {
-                    // Prefetch buffer was swapped into combo_buffers —
-                    // data is already there, no I/O needed.
-                    base_tensor->data = bsctx->combo_buffers[sharp_info.name].data();
-                    backup_out.zero_copy = true;
-                } else {
-                bsctx->async_prefetch.n_misses++;
+                // Try async prefetch — partial match OK.  Copies matched
+                // expert slices from prefetch buffer into combo_buffers.
+                // Only experts NOT consumed need sync I/O below.
+                bool prefetch_consumed[256] = {};  // max experts per request
+                int n_prefetched = 0;
+                if (n_experts_req <= 256) {
+                    n_prefetched = bs_async_prefetch_consume(bsctx, sharp_info.name,
+                            bsctx->building_layer_idx, expert_ids, n_experts_req,
+                            prefetch_consumed);
+                }
 
-                // Check how many experts need file I/O vs RAM cache hits.
-                // Experts already in RAM cache are copied from anonymous
-                // memory (fast).  Only cache misses need file reads.
-                std::vector<int> file_miss_indices;
-                file_miss_indices.reserve(n_experts_req);
-
+                // Ensure combo buffer is allocated (consume may have done
+                // this already for partial hits, but not for zero hits).
                 auto & combo = bsctx->combo_buffers[sharp_info.name];
                 if (combo.size() < sharp_info.nbytes) {
                     combo.resize(sharp_info.nbytes);
                 }
-                // NOTE: No MADV_DONTNEED — combo uses bs_aligned_buffer (heap).
-                // MADV_DONTNEED on anonymous pages zeros them on Linux.
 
-                for (int32_t i = 0; i < n_experts_req; ++i) {
-                    int32_t eid = expert_ids[i];
-                    size_t off = (size_t)eid * sharp_expert_slice;
-                    if (off + sharp_expert_slice > sharp_info.nbytes) continue;
-
-                    // Try RAM expert cache first
-                    if (rcache.enabled) {
-                        uint64_t key = bs_gpu_cache_key(sharp_info.name, eid);
-                        auto it = rcache.entries.find(key);
-                        if (it != rcache.entries.end()) {
-                            std::memcpy(combo.data() + off, it->second.data.data(), sharp_expert_slice);
-                            it->second.last_access = ++rcache.access_counter;
-                            rcache.n_hits++;
-                            continue;
-                        }
-                    }
-                    file_miss_indices.push_back(i);
-                }
-
-                // Read cache misses — parallel pread or mmap fallback
-                bool have_file = (si >= 0 && si < (int)bsctx->sharp_files.size()
-                                  && bsctx->sharp_files[si]);
-                int file_fd = have_file ? bsctx->sharp_files[si]->file_id() : -1;
-
-                if (!file_miss_indices.empty() && file_fd >= 0 &&
-                    bsctx->params.parallel_expert_io && (int)file_miss_indices.size() > 1) {
-                    // Parallel pread: read all cache-miss slices simultaneously
-                    std::vector<bs_pread_task> tasks(file_miss_indices.size());
-                    for (size_t m = 0; m < file_miss_indices.size(); ++m) {
-                        int32_t eid = expert_ids[file_miss_indices[m]];
-                        tasks[m].fd     = file_fd;
-                        tasks[m].dst    = combo.data() + (size_t)eid * sharp_expert_slice;
-                        tasks[m].offset = (off_t)(sharp_info.file_offset + (size_t)eid * sharp_expert_slice);
-                        tasks[m].size   = sharp_expert_slice;
-                        tasks[m].result = 0;
-                    }
-                    bs_parallel_pread(tasks.data(), (int)tasks.size());
+                if (n_prefetched == n_experts_req) {
+                    // Full prefetch hit — no further I/O needed.
+                    base_tensor->data = combo.data();
+                    backup_out.zero_copy = true;
                 } else {
-                    // Sequential fallback: mmap page access or single pread
-                    for (int idx : file_miss_indices) {
-                        int32_t eid = expert_ids[idx];
-                        size_t off = (size_t)eid * sharp_expert_slice;
-                        if (file_fd >= 0) {
-                            pread(file_fd, combo.data() + off, sharp_expert_slice,
-                                  (off_t)(sharp_info.file_offset + off));
-                        } else {
-                            // mmap fallback — memcpy from sharp mmap
-                            std::memcpy(combo.data() + off,
-                                        sharp_data + off, sharp_expert_slice);
-                        }
-                    }
-                }
+                    // Partial or no prefetch hit — check RAM cache and
+                    // do file I/O for remaining experts.
+                    std::vector<int> file_miss_indices;
+                    file_miss_indices.reserve(n_experts_req);
 
-                // Populate RAM expert cache with newly-read slices
-                if (rcache.enabled && rcache.budget_bytes > 0) {
-                    for (int idx : file_miss_indices) {
-                        int32_t eid = expert_ids[idx];
+                    for (int32_t i = 0; i < n_experts_req; ++i) {
+                        if (prefetch_consumed[i]) continue;  // already from prefetch
+
+                        int32_t eid = expert_ids[i];
                         size_t off = (size_t)eid * sharp_expert_slice;
                         if (off + sharp_expert_slice > sharp_info.nbytes) continue;
 
-                        rcache.n_misses++;
-                        uint64_t key = bs_gpu_cache_key(sharp_info.name, eid);
-
-                        // Evict LRU entries if over budget
-                        while (rcache.used_bytes + sharp_expert_slice > rcache.budget_bytes
-                               && !rcache.entries.empty()) {
-                            uint64_t lru_key = 0;
-                            int64_t lru_access = INT64_MAX;
-                            for (auto & [k, e] : rcache.entries) {
-                                if (e.last_access < lru_access) {
-                                    lru_access = e.last_access;
-                                    lru_key = k;
-                                }
-                            }
-                            auto evict_it = rcache.entries.find(lru_key);
-                            if (evict_it != rcache.entries.end()) {
-                                rcache.used_bytes -= evict_it->second.data.size();
-                                rcache.entries.erase(evict_it);
+                        // Try RAM expert cache
+                        if (rcache.enabled) {
+                            uint64_t key = bs_gpu_cache_key(sharp_info.name, eid);
+                            auto it = rcache.entries.find(key);
+                            if (it != rcache.entries.end()) {
+                                std::memcpy(combo.data() + off, it->second.data.data(), sharp_expert_slice);
+                                it->second.last_access = ++rcache.access_counter;
+                                rcache.n_hits++;
+                                continue;
                             }
                         }
-                        if (rcache.used_bytes + sharp_expert_slice <= rcache.budget_bytes) {
-                            llama_blurry_sharp_context::ram_expert_cache::entry e;
-                            e.data.assign(combo.data() + off, combo.data() + off + sharp_expert_slice);
-                            e.last_access = ++rcache.access_counter;
-                            rcache.used_bytes += sharp_expert_slice;
-                            rcache.entries[key] = std::move(e);
+                        file_miss_indices.push_back(i);
+                    }
+
+                    // Read cache misses — parallel pread or mmap fallback
+                    bool have_file = (si >= 0 && si < (int)bsctx->sharp_files.size()
+                                      && bsctx->sharp_files[si]);
+                    int file_fd = have_file ? bsctx->sharp_files[si]->file_id() : -1;
+
+                    if (!file_miss_indices.empty() && file_fd >= 0 &&
+                        bsctx->params.parallel_expert_io && (int)file_miss_indices.size() > 1) {
+                        std::vector<bs_pread_task> tasks(file_miss_indices.size());
+                        for (size_t m = 0; m < file_miss_indices.size(); ++m) {
+                            int32_t eid = expert_ids[file_miss_indices[m]];
+                            tasks[m].fd     = file_fd;
+                            tasks[m].dst    = combo.data() + (size_t)eid * sharp_expert_slice;
+                            tasks[m].offset = (off_t)(sharp_info.file_offset + (size_t)eid * sharp_expert_slice);
+                            tasks[m].size   = sharp_expert_slice;
+                            tasks[m].result = 0;
+                        }
+                        bs_parallel_pread(tasks.data(), (int)tasks.size());
+                    } else {
+                        for (int idx : file_miss_indices) {
+                            int32_t eid = expert_ids[idx];
+                            size_t off = (size_t)eid * sharp_expert_slice;
+                            if (file_fd >= 0) {
+                                pread(file_fd, combo.data() + off, sharp_expert_slice,
+                                      (off_t)(sharp_info.file_offset + off));
+                            } else {
+                                std::memcpy(combo.data() + off,
+                                            sharp_data + off, sharp_expert_slice);
+                            }
                         }
                     }
-                }
 
-                base_tensor->data = combo.data();
-                backup_out.zero_copy = true;
-                } // end else (no async prefetch hit)
+                    // Populate RAM expert cache with newly-read slices
+                    if (rcache.enabled && rcache.budget_bytes > 0) {
+                        for (int idx : file_miss_indices) {
+                            int32_t eid = expert_ids[idx];
+                            size_t off = (size_t)eid * sharp_expert_slice;
+                            if (off + sharp_expert_slice > sharp_info.nbytes) continue;
+
+                            rcache.n_misses++;
+                            uint64_t key = bs_gpu_cache_key(sharp_info.name, eid);
+
+                            while (rcache.used_bytes + sharp_expert_slice > rcache.budget_bytes
+                                   && !rcache.entries.empty()) {
+                                uint64_t lru_key = 0;
+                                int64_t lru_access = INT64_MAX;
+                                for (auto & [k, e] : rcache.entries) {
+                                    if (e.last_access < lru_access) {
+                                        lru_access = e.last_access;
+                                        lru_key = k;
+                                    }
+                                }
+                                auto evict_it = rcache.entries.find(lru_key);
+                                if (evict_it != rcache.entries.end()) {
+                                    rcache.used_bytes -= evict_it->second.data.size();
+                                    rcache.entries.erase(evict_it);
+                                }
+                            }
+                            if (rcache.used_bytes + sharp_expert_slice <= rcache.budget_bytes) {
+                                llama_blurry_sharp_context::ram_expert_cache::entry e;
+                                e.data.assign(combo.data() + off, combo.data() + off + sharp_expert_slice);
+                                e.last_access = ++rcache.access_counter;
+                                rcache.used_bytes += sharp_expert_slice;
+                                rcache.entries[key] = std::move(e);
+                            }
+                        }
+                    }
+
+                    base_tensor->data = combo.data();
+                    backup_out.zero_copy = true;
+                }
             }
 
         } else if (!used_ram_cache && base_tensor->type == sharp_info.type && base_expert_slice == sharp_expert_slice) {
