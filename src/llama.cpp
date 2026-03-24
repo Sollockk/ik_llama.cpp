@@ -3493,35 +3493,22 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                         int64_t t_upload_end = now_us();
                         t_upload_us += (t_upload_end - t_upload_start);
 
-                        // Start async prefetch for next layer's experts.
-                        // While GPU computes this layer's MoE, a background
-                        // thread reads the next layer's expert slices from SSD
-                        // into prefetch buffers.  Uses same expert IDs as
-                        // prediction (~70% overlap between adjacent layers).
-                        // Only during generation — prompt disables parallel I/O.
-                        int64_t t_hint_start = now_us();
-                        if (!is_prompt && lctx->jit_bsctx->params.parallel_expert_io) {
-                            int next_layer = layer_idx + 1;
-                            if (next_layer < (int)lctx->model.hparams.n_layer) {
-                                llama_blurry_sharp_async_prefetch_start(
-                                    lctx->jit_bsctx, next_layer,
-                                    expert_vec.data(), (int32_t)expert_vec.size());
-                            }
-                        }
-
-                        // Hint the OS page cache for layers further ahead.
-                        // Layer N+1 is handled by async prefetch above (actual
-                        // pread), so madvise hints start at N+2.
-                        for (int pf = 2; pf <= 5; ++pf) {
-                            int pf_layer = layer_idx + pf;
-                            if (pf_layer < (int)lctx->model.hparams.n_layer) {
-                                llama_blurry_sharp_prefetch_expert_slices(
-                                    lctx->jit_bsctx, pf_layer,
-                                    expert_vec.data(), (int32_t)expert_vec.size());
-                            }
-                        }
-                        t_overhead_us += (now_us() - t_hint_start);
+                        // NOTE: Async prefetch and madvise hints are disabled.
+                        //
+                        // The async prefetch worker runs sequentially (can't use
+                        // the shared IO pool from a background thread — deadlock).
+                        // Combined with the join() at the start of each new prefetch,
+                        // this serializes all I/O on the main thread, adding ~500ms
+                        // overhead with 0% hit rate (the consume check requires 100%
+                        // expert match between predicted and actual routing).
+                        //
+                        // The madvise(WILLNEED) hints for layers N+2..N+5 also add
+                        // measurable syscall overhead with no observed benefit.
+                        //
+                        // TODO: Re-enable when the IO pool supports concurrent
+                        // dispatch, and the consume check allows partial matches.
                     }
+
                     // If sharpening fails, we fall through to jit_done
                     // which uploads TQ1_0 data as fallback.
                 }

@@ -3634,9 +3634,9 @@ void llama_blurry_sharp_async_prefetch_start(
             // Allocate prefetch buffer for this tensor only
             auto & buf = ap.buffers[tname];
             buf.resize(si.nbytes);
-#ifndef _WIN32
-            madvise(buf.data(), buf.size(), MADV_DONTNEED);
-#endif
+            // NOTE: Do NOT madvise(DONTNEED) here — bs_aligned_buffer uses
+            // anonymous heap pages, and MADV_DONTNEED on anonymous pages
+            // zeros them out on Linux, destroying any data.
 
             // NOTE: Do NOT access ram_expert_cache from this worker thread —
             // the main thread may be inserting into it concurrently (data race
@@ -3658,8 +3658,13 @@ void llama_blurry_sharp_async_prefetch_start(
                 tasks.push_back(t);
             }
 
-            if (!tasks.empty()) {
-                bs_parallel_pread(tasks.data(), (int)tasks.size());
+            // NOTE: Do NOT use bs_parallel_pread here — it uses the
+            // shared bs_io_pool, and the main thread's eval callback also
+            // uses it concurrently.  The pool's dispatch() is not reentrant,
+            // causing a deadlock.  Sequential pread is fine for background
+            // prefetch (no latency sensitivity).
+            for (auto & t : tasks) {
+                t.result = pread(t.fd, t.dst, t.size, t.offset);
             }
         }
 
@@ -4424,9 +4429,8 @@ static int64_t bs_overlay_expert_tensor(
                 if (combo.size() < sharp_info.nbytes) {
                     combo.resize(sharp_info.nbytes);
                 }
-#ifndef _WIN32
-                madvise(combo.data(), combo.size(), MADV_DONTNEED);
-#endif
+                // NOTE: No MADV_DONTNEED — combo uses bs_aligned_buffer (heap).
+                // MADV_DONTNEED on anonymous pages zeros them on Linux.
                 for (int32_t i = 0; i < n_experts_req; ++i) {
                     int32_t eid = expert_ids[i];
                     size_t off = (size_t)eid * sharp_expert_slice;
@@ -4474,9 +4478,8 @@ static int64_t bs_overlay_expert_tensor(
                 if (combo.size() < sharp_info.nbytes) {
                     combo.resize(sharp_info.nbytes);
                 }
-#ifndef _WIN32
-                madvise(combo.data(), combo.size(), MADV_DONTNEED);
-#endif
+                // NOTE: No MADV_DONTNEED — combo uses bs_aligned_buffer (heap).
+                // MADV_DONTNEED on anonymous pages zeros them on Linux.
 
                 for (int32_t i = 0; i < n_experts_req; ++i) {
                     int32_t eid = expert_ids[i];
