@@ -1596,13 +1596,19 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
                                                 // overlays the 4 most frequently selected experts
                                                 // and leaves the rest at blurry quality.
 
-        int32_t  n_sharp_experts_cpu;           // mixed-precision MoE (CPU/prompt): same as above
-                                                // but used during prompt processing when MoE runs
-                                                // on CPU.  CPU has more memory headroom so this can
-                                                // be higher than n_sharp_experts_gpu.
+        int32_t  n_sharp_experts_cpu;           // mixed-precision MoE (CPU/generation when gpu=0):
                                                 // -1 = overlay all selected experts (default).
+                                                //  0 = skip JIT overlay entirely.
+                                                // -2 = use same value as n_sharp_experts_gpu.
+
+        int32_t  n_sharp_experts_cpu_prompt;   // mixed-precision MoE (CPU/prompt): how many experts
+                                                // to overlay with sharp data during prompt processing.
+                                                // Prompt processes many tokens so fewer sharp experts
+                                                // = much faster.
+                                                // -1 = overlay all selected experts.
                                                 //  0 = skip JIT overlay entirely during prompt.
                                                 // -2 = use same value as n_sharp_experts_gpu.
+                                                // -3 = use same value as n_sharp_experts_cpu (default).
 
         bool     parallel_expert_io;            // use parallel pread threads for expert slice I/O
                                                 // instead of sequential reads.  Improves throughput

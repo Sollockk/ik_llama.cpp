@@ -3350,14 +3350,18 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                     // overlay on CPU.  cpu=0 means "don't overlay at all."
                     int n_sharp;
                     if (is_prompt) {
-                        int cpu_limit = lctx->jit_bsctx->params.n_sharp_experts_cpu;
-                        if (cpu_limit == -2) {
+                        int prompt_limit = lctx->jit_bsctx->params.n_sharp_experts_cpu_prompt;
+                        if (prompt_limit == -3) {
+                            // Inherit from n_sharp_experts_cpu
+                            prompt_limit = lctx->jit_bsctx->params.n_sharp_experts_cpu;
+                        }
+                        if (prompt_limit == -2) {
                             // Inherit from GPU, but gpu=0 means "no GPU uploads"
                             // not "skip overlay" — default to all for CPU.
                             int gpu_val = lctx->jit_bsctx->params.n_sharp_experts_gpu;
                             n_sharp = (gpu_val == 0) ? -1 : gpu_val;
                         } else {
-                            n_sharp = cpu_limit;
+                            n_sharp = prompt_limit;
                         }
                     } else {
                         // Generation: gpu setting controls GPU upload count,
@@ -4950,6 +4954,7 @@ struct llama_blurry_sharp_params llama_blurry_sharp_default_params() {
     params.retain_mmap_pages     = false;
     params.n_sharp_experts_gpu   = -1;  // -1 = all selected experts
     params.n_sharp_experts_cpu   = -2;  // -2 = use same as n_sharp_experts_gpu
+    params.n_sharp_experts_cpu_prompt = -3;  // -3 = use same as n_sharp_experts_cpu
     params.parallel_expert_io    = true;
     params.gpu_cache_bytes       = 0;
     params.ram_cache_bytes       = 0;  // 0 = auto (4 GiB), -1 = disabled

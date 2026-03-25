@@ -2369,6 +2369,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.bs_sharp_experts_cpu = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--bs-sharp-experts-cpu-prompt") {
+        CHECK_ARG
+        params.bs_sharp_experts_cpu_prompt = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--bs-no-parallel-io") {
         params.bs_parallel_expert_io = false;
         return true;
