@@ -1589,19 +1589,20 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
 
         int32_t  n_sharp_experts_gpu;           // mixed-precision MoE (GPU/generation): only overlay
                                                 // the top-N most-used experts per layer with sharp data.
-                                                // 0 = overlay all selected experts (default).
+                                                // -1 = overlay all selected experts (default).
+                                                //  0 = no GPU expert uploads (CPU-only JIT overlay).
+                                                // >0 = overlay only top-N most frequently selected.
                                                 // E.g. with top-8 routing, n_sharp_experts_gpu=4
                                                 // overlays the 4 most frequently selected experts
                                                 // and leaves the rest at blurry quality.
-                                                // Reduces I/O and GPU memory while preserving quality
-                                                // for the experts that contribute most to the output.
 
         int32_t  n_sharp_experts_cpu;           // mixed-precision MoE (CPU/prompt): same as above
                                                 // but used during prompt processing when MoE runs
                                                 // on CPU.  CPU has more memory headroom so this can
                                                 // be higher than n_sharp_experts_gpu.
-                                                // 0 = overlay all selected experts (default).
-                                                // -1 = use same value as n_sharp_experts_gpu.
+                                                // -1 = overlay all selected experts (default).
+                                                //  0 = skip JIT overlay entirely during prompt.
+                                                // -2 = use same value as n_sharp_experts_gpu.
 
         bool     parallel_expert_io;            // use parallel pread threads for expert slice I/O
                                                 // instead of sequential reads.  Improves throughput
@@ -1619,6 +1620,17 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
                                                 // to SSD swap instead of dropping them.  Swap-backed
                                                 // pages are faster to recover than re-faulting from
                                                 // a GGUF mmap.  Set -1 to disable.
+
+        bool     flash_experts;                 // flash-moe style expert streaming: instead of loading
+                                                // blurry expert weights into RAM and overlaying sharp
+                                                // data on top, stream Q4_K_M expert slices directly
+                                                // from SSD on demand.  Only the K active experts are
+                                                // read per layer (via pread), and the OS page cache
+                                                // naturally caches hot experts.  Benefits:
+                                                //  - All expert compute at Q4_K_M quality (faster dequant)
+                                                //  - No backup/restore overhead
+                                                //  - Blurry expert data never loaded → ~14GB less RAM
+                                                //  - Freed RAM becomes OS page cache for expert reads
     };
 
     struct llama_blurry_sharp_state {

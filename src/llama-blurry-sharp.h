@@ -206,6 +206,12 @@ struct blurry_sharp_tensor_backup {
     //                     (n_experts_req × expert_slice_bytes)
     std::vector<int32_t>   expert_backup_ids;         // expert indices that were overwritten
     std::vector<uint8_t>   expert_backup_data;        // saved blurry data for those expert slices
+
+    // --- Flash-expert mode ---
+    // When true, the overlay used a shared scratch buffer and the original
+    // tensor data is irrelevant (never loaded).  Restore only needs to
+    // swap pointers back — no data copy needed.
+    bool                   flash_expert = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -508,6 +514,14 @@ struct llama_blurry_sharp_context {
     // sized for the full tensor (160 experts × slice_size).  Only the
     // active expert slots are populated; untouched pages consume no RAM.
     std::unordered_map<std::string, bs_aligned_buffer> combo_buffers;
+
+    // Flash-expert scratch buffers (shared across layers).
+    // When flash_experts is active, expert tensors are NOT loaded from the
+    // blurry GGUF.  Instead, Q4_K_M expert slices are streamed from SSD
+    // into these buffers on demand.  Keyed by tensor suffix (e.g.,
+    // "ffn_gate_exps.weight") so all layers share the same 3 buffers.
+    // Each buffer holds n_expert_used expert slots at Q4_K_M size.
+    std::unordered_map<std::string, bs_aligned_buffer> flash_scratch;
 
     // ---- Async prefetch (double-buffered I/O) ----
     // While the MoE kernel computes layer N using combo_buffers, a background

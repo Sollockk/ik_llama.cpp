@@ -3341,18 +3341,47 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                         [](const auto & a, const auto & b) { return a.second > b.second; });
 
                     // Mixed-precision: only overlay top-N experts if configured.
-                    // Use separate limits for GPU (generation) vs CPU (prompt).
+                    //
+                    // n_sharp_experts_gpu:  -1 = all, 0 = no GPU uploads (CPU-only), >0 = top-N
+                    // n_sharp_experts_cpu:  -1 = all, 0 = skip overlay entirely, >0 = top-N
+                    //                      -2 = inherit from gpu (but if gpu=0, treat as -1)
+                    //
+                    // Key distinction: gpu=0 means "don't upload to GPU" but still
+                    // overlay on CPU.  cpu=0 means "don't overlay at all."
                     int n_sharp;
                     if (is_prompt) {
                         int cpu_limit = lctx->jit_bsctx->params.n_sharp_experts_cpu;
-                        n_sharp = (cpu_limit >= 0) ? cpu_limit : lctx->jit_bsctx->params.n_sharp_experts_gpu;
+                        if (cpu_limit == -2) {
+                            // Inherit from GPU, but gpu=0 means "no GPU uploads"
+                            // not "skip overlay" — default to all for CPU.
+                            int gpu_val = lctx->jit_bsctx->params.n_sharp_experts_gpu;
+                            n_sharp = (gpu_val == 0) ? -1 : gpu_val;
+                        } else {
+                            n_sharp = cpu_limit;
+                        }
                     } else {
-                        n_sharp = lctx->jit_bsctx->params.n_sharp_experts_gpu;
+                        // Generation: gpu setting controls GPU upload count,
+                        // but overlay still happens on CPU when gpu=0.
+                        int gpu_val = lctx->jit_bsctx->params.n_sharp_experts_gpu;
+                        if (gpu_val == 0) {
+                            // No GPU uploads — overlay all on CPU
+                            int cpu_limit = lctx->jit_bsctx->params.n_sharp_experts_cpu;
+                            n_sharp = (cpu_limit == -2) ? -1 : cpu_limit;
+                        } else {
+                            n_sharp = gpu_val;
+                        }
                     }
+
+                    // n_sharp == 0 means skip overlay entirely for this path
+                    if (n_sharp == 0) {
+                        goto jit_done;
+                    }
+
                     int n_to_overlay = (int)sorted_experts.size();
                     if (n_sharp > 0 && n_sharp < n_to_overlay) {
                         n_to_overlay = n_sharp;
                     }
+                    // n_sharp == -1 → n_to_overlay stays at full count (all experts)
 
                     std::vector<int32_t> expert_vec;
                     expert_vec.reserve(n_to_overlay);
@@ -3399,7 +3428,8 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                         //      since inflate ensures device copies are Q4_K_M sized.
                         int64_t t_upload_start = now_us();
                         const bool is_generation = (n_tokens <= (int64_t)lctx->model.hparams.n_expert_used);
-                        if (is_generation && lctx->jit_bsctx->inflate_shrunk_ne2) {
+                        const bool gpu_uploads_enabled = (lctx->jit_bsctx->params.n_sharp_experts_gpu != 0);
+                        if (is_generation && lctx->jit_bsctx->inflate_shrunk_ne2 && gpu_uploads_enabled) {
                             // Collect unique active expert IDs
                             std::vector<int32_t> active_eids;
                             {
@@ -4918,11 +4948,12 @@ struct llama_blurry_sharp_params llama_blurry_sharp_default_params() {
     params.permanent             = false;
     params.lazy_swap             = false;
     params.retain_mmap_pages     = false;
-    params.n_sharp_experts_gpu   = 0;
-    params.n_sharp_experts_cpu   = -1;  // -1 = use same as n_sharp_experts_gpu
+    params.n_sharp_experts_gpu   = -1;  // -1 = all selected experts
+    params.n_sharp_experts_cpu   = -2;  // -2 = use same as n_sharp_experts_gpu
     params.parallel_expert_io    = true;
     params.gpu_cache_bytes       = 0;
     params.ram_cache_bytes       = 0;  // 0 = auto (4 GiB), -1 = disabled
+    params.flash_experts         = false;
     return params;
 }
 

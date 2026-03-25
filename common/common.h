@@ -538,14 +538,15 @@ struct gpt_params {
     int         bs_cpu_skip_pct        = 0;            // % of CPU layers to skip (0=disabled)
     std::vector<int> bs_cpu_skip_list;                  // explicit list of CPU layers to skip
 
-    // --bs-sharp-experts-gpu N   only overlay top-N experts per layer on GPU (0=all)
-    // --bs-sharp-experts-cpu N   only overlay top-N experts per layer on CPU (0=all, -1=same as GPU)
+    // --bs-sharp-experts-gpu N   overlay top-N experts per layer on GPU (-1=all, 0=none/CPU-only)
+    // --bs-sharp-experts-cpu N   overlay top-N experts per layer on CPU (-1=all, 0=skip, -2=same as GPU)
     // --bs-no-parallel-io        disable parallel pread for expert slices
-    int         bs_sharp_experts_gpu   = 0;            // 0 = overlay all selected experts (GPU/generation)
-    int         bs_sharp_experts_cpu   = -1;           // CPU/prompt limit (-1 = same as GPU, 0 = all)
+    int         bs_sharp_experts_gpu   = -1;           // -1 = all, 0 = no GPU uploads (CPU-only JIT)
+    int         bs_sharp_experts_cpu   = -2;           // -2 = same as GPU, -1 = all, 0 = skip overlay
     bool        bs_parallel_expert_io  = true;         // parallel pread for expert slices
     int         bs_gpu_cache_mb        = 0;            // GPU expert cache size in MiB (0 = disabled)
     int         bs_ram_cache_mb        = 0;            // RAM expert cache in MiB (0 = auto 4096, -1 = off)
+    bool        bs_flash_experts       = false;         // flash-moe style: stream Q4_K_M experts from SSD
 };
 
 

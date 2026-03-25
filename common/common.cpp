@@ -2383,6 +2383,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.bs_ram_cache_mb = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--bs-flash-experts" || arg == "--flash-experts") {
+        params.bs_flash_experts = true;
+        return true;
+    }
 
 #ifndef LOG_DISABLE_LOGS
     // Parse args for logging parameters

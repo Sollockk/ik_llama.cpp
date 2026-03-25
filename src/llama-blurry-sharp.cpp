@@ -912,6 +912,12 @@ llama_blurry_sharp_context * llama_blurry_sharp_init(
         LLAMA_LOG_INFO("%s:   different-type GPU tensors: new buffer, no backup\n", __func__);
         LLAMA_LOG_INFO("%s:   CPU tensors: pointer-swap to sharp mmap, release blurry pages\n", __func__);
     }
+    if (params.flash_experts) {
+        LLAMA_LOG_INFO("%s: FLASH-EXPERT mode enabled — stream Q4_K_M experts from SSD on demand\n", __func__);
+        LLAMA_LOG_INFO("%s:   blurry expert data will be released (MADV_DONTNEED)\n", __func__);
+        LLAMA_LOG_INFO("%s:   all expert compute at sharp (Q4_K_M) quality\n", __func__);
+        LLAMA_LOG_INFO("%s:   no backup/restore overhead — OS page cache handles caching\n", __func__);
+    }
 
     auto * bsctx = new llama_blurry_sharp_context();
     bsctx->model  = model;
@@ -1501,6 +1507,40 @@ llama_blurry_sharp_context * llama_blurry_sharp_init(
         } else {
             LLAMA_LOG_INFO("%s: RAM expert cache disabled\n", __func__);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Flash-expert mode: release blurry expert tensor pages.
+    //
+    // The model loader has already read TQ1_0 data into the expert tensor
+    // buffers (heap-allocated by --n-cpu-moe).  In flash mode, this data is
+    // never used — the eval callback streams Q4_K_M from SSD instead.
+    // Release the physical pages back to the OS so they can be used as
+    // page cache for the Q4_K_M reads.
+    //
+    // MADV_DONTNEED on anonymous (heap) pages zeros them — that's fine here
+    // since the data is irrelevant.  The virtual address space is preserved.
+    // -----------------------------------------------------------------------
+    if (params.flash_experts) {
+        LLAMA_LOG_INFO("%s: flash-expert mode: releasing blurry expert tensor pages\n", __func__);
+        int64_t released_bytes = 0;
+        for (auto & [name, info] : bsctx->sharp_index) {
+            if (!bs_is_expert_tensor(name)) continue;
+            ggml_tensor * t = bs_find_model_tensor(bsctx->model, name.c_str());
+            if (!t || !t->data) continue;
+
+            // Only release plain CPU buffers (heap-allocated by --n-cpu-moe).
+            // mmap'd buffers are file-backed and would just drop clean pages.
+            bool is_plain_cpu = t->buffer &&
+                ggml_backend_buffer_get_type(t->buffer) == ggml_backend_cpu_buffer_type();
+            if (is_plain_cpu) {
+                size_t nbytes = ggml_nbytes(t);
+                madvise(t->data, nbytes, MADV_DONTNEED);
+                released_bytes += (int64_t)nbytes;
+            }
+        }
+        LLAMA_LOG_INFO("%s: flash-expert mode: released %.1f GiB of blurry expert pages\n",
+                       __func__, released_bytes / (1024.0 * 1024.0 * 1024.0));
     }
 
     return bsctx;
@@ -2510,6 +2550,21 @@ static bool bs_restore_single_tensor(
         LLAMA_LOG_ERROR("%s: cannot find tensor '%s' for restoration\n",
                        __func__, backup.tensor_name.c_str());
         return false;
+    }
+
+    // ---- Flash-expert restore: pointer-only, no data copy ----
+    // In flash mode, the original tensor data is irrelevant (never loaded).
+    // Just restore the pointer, type, and strides so the graph builder sees
+    // correct metadata for the next token.
+    if (backup.flash_expert) {
+        base_tensor->data     = backup.original_data;
+        base_tensor->type     = backup.original_type;
+        base_tensor->view_src = backup.original_view_src;
+        base_tensor->extra    = backup.original_extra;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            base_tensor->nb[d] = backup.original_nb[d];
+        }
+        return true;
     }
 
     // ---- In-place expert slice restore (host or device) ----
@@ -4349,12 +4404,15 @@ static int64_t bs_overlay_expert_tensor(
     // JIT SAFETY CHECK: cross-type overlays on pinned/host buffers are unsafe
     // (scheduler device copies pre-allocated at blurry size).  But plain CPU
     // buffers (from --n-cpu-moe) have no device copies — safe to overlay.
+    // Flash-expert mode always uses combo_buffer swap (never in-place), so
+    // the original buffer is never written to — safe regardless of buffer type.
     {
         bool tensor_is_host = true;
         if (base_tensor->buffer) {
             tensor_is_host = ggml_backend_buffer_is_host(base_tensor->buffer);
         }
-        if (tensor_is_host && bsctx->jit_active && base_tensor->type != sharp_info.type) {
+        if (tensor_is_host && bsctx->jit_active && base_tensor->type != sharp_info.type
+            && !bsctx->params.flash_experts) {
             bool is_plain_cpu = base_tensor->buffer &&
                 ggml_backend_buffer_get_type(base_tensor->buffer) == ggml_backend_cpu_buffer_type();
             if (!is_plain_cpu) {
@@ -4434,6 +4492,88 @@ static int64_t bs_overlay_expert_tensor(
         //      AND the types differ.
         // ================================================================
         backup_out.is_device = false;
+
+        // ============================================================
+        // FLASH-EXPERT PATH: stream Q4_K_M experts from SSD on demand.
+        //
+        // No blurry data exists — expert tensors are empty placeholders.
+        // Read only the K active expert slices from the sharp GGUF via
+        // pread() into a shared scratch buffer.  The OS page cache
+        // naturally caches hot experts (~40-50 GB/s for cache hits).
+        //
+        // Benefits over standard overlay:
+        //  - No backup/restore of blurry data (no blurry data loaded)
+        //  - All compute at Q4_K_M quality (faster dequant than TQ1_0)
+        //  - Freed RAM → OS page cache for expert reads
+        //  - Simpler code path: pread → swap → compute
+        // ============================================================
+        if (bsctx->params.flash_experts) {
+            int si_f = sharp_info.split_idx;
+            bool have_file = (si_f >= 0 && si_f < (int)bsctx->sharp_files.size()
+                              && bsctx->sharp_files[si_f]);
+            int file_fd = have_file ? bsctx->sharp_files[si_f]->file_id() : -1;
+
+            if (file_fd < 0) {
+                LLAMA_LOG_ERROR("%s: flash-experts: no file descriptor for split %d (tensor '%s')\n",
+                               __func__, si_f, sharp_info.name.c_str());
+                return -1;
+            }
+
+            // Use combo_buffer as scratch (per-layer cleanup keeps only current layer).
+            auto & scratch = bsctx->combo_buffers[sharp_info.name];
+            if (scratch.size() < sharp_info.nbytes) {
+                scratch.resize(sharp_info.nbytes);
+            }
+
+            // Read active expert slices via parallel pread
+            if (bsctx->params.parallel_expert_io && n_experts_req > 1) {
+                std::vector<bs_pread_task> tasks(n_experts_req);
+                for (int32_t i = 0; i < n_experts_req; ++i) {
+                    int32_t eid = expert_ids[i];
+                    tasks[i].fd     = file_fd;
+                    tasks[i].dst    = scratch.data() + (size_t)eid * sharp_expert_slice;
+                    tasks[i].offset = (off_t)(sharp_info.file_offset + (size_t)eid * sharp_expert_slice);
+                    tasks[i].size   = sharp_expert_slice;
+                    tasks[i].result = 0;
+                }
+                bs_parallel_pread(tasks.data(), n_experts_req);
+            } else {
+                for (int32_t i = 0; i < n_experts_req; ++i) {
+                    int32_t eid = expert_ids[i];
+                    size_t off = (size_t)eid * sharp_expert_slice;
+                    pread(file_fd, scratch.data() + off, sharp_expert_slice,
+                          (off_t)(sharp_info.file_offset + off));
+                }
+            }
+
+            // Pointer-swap to scratch buffer
+            base_tensor->data = scratch.data();
+            backup_out.zero_copy = true;
+            backup_out.flash_expert = true;
+
+            // Update type/strides to Q4_K_M
+            if (base_tensor->type != sharp_info.type) {
+                base_tensor->type  = sharp_info.type;
+                base_tensor->nb[0] = ggml_type_size(sharp_info.type);
+                base_tensor->nb[1] = base_tensor->nb[0] * (base_tensor->ne[0] / ggml_blck_size(sharp_info.type));
+                base_tensor->nb[2] = base_tensor->nb[1] * base_tensor->ne[1];
+                base_tensor->nb[3] = base_tensor->nb[2] * base_tensor->ne[2];
+            }
+            base_tensor->view_src = nullptr;
+
+            bsctx->metrics.n_direct_copies++;
+
+            int64_t total_bytes = (int64_t)sharp_expert_slice * n_experts_req;
+            if (bsctx->params.verbose) {
+                LLAMA_LOG_INFO("%s: flash-expert overlay '%s': %d/%d experts, "
+                              "read %" PRId64 " bytes (%.1f%% of full tensor)\n",
+                              __func__, sharp_info.name.c_str(),
+                              n_experts_req, n_expert_total,
+                              total_bytes, 100.0 * total_bytes / sharp_info.nbytes);
+            }
+
+            return total_bytes;
+        }
 
         int si = sharp_info.split_idx;
         bool have_mmap = (si >= 0 && si < (int)bsctx->sharp_mmaps.size()

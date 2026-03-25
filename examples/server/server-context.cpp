@@ -231,6 +231,7 @@ bool server_context::load_model(const gpt_params& params_) {
         bs_params.parallel_expert_io  = params_base.bs_parallel_expert_io;
         bs_params.gpu_cache_bytes    = (int64_t)params_base.bs_gpu_cache_mb * 1024 * 1024;
         bs_params.ram_cache_bytes    = (int64_t)params_base.bs_ram_cache_mb * 1024 * 1024;
+        bs_params.flash_experts      = params_base.bs_flash_experts;
 
         bsctx = llama_blurry_sharp_init(model, bs_params);
 
@@ -3770,6 +3771,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             {"is_generation", is_generation},
             {"turbo_active", turbo_active},
             {"jit_active", jit_this_batch},
+            {"flash_experts", params_base.bs_flash_experts},
             {"n_skip_layers", (turbo_active && !is_generation) ? (int)turbo_skip_layers_prompt.size() : 0},
         });
 
