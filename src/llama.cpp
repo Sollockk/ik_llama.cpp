@@ -3253,6 +3253,16 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
             }
         }
 
+        // record into heatmap
+        if (lctx->jit_bsctx && lctx->jit_bsctx->heatmap_collecting) {
+            for (int64_t tok = 0; tok < n_tokens; ++tok) {
+                for (int64_t k = 0; k < n_expert_used; ++k) {
+                    int32_t eid = ids[tok * n_expert_used + k];
+                    lctx->jit_bsctx->prompt_heatmap.record(layer_idx, (int)eid);
+                }
+            }
+        }
+
         // ----- JIT per-layer sharpening -----
         // This is the core of the "hot-swap one layer at a time" approach.
         // Only one layer is ever sharpened simultaneously.

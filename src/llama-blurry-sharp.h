@@ -33,6 +33,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -232,6 +233,60 @@ struct blurry_sharp_device_cache_entry {
     uint64_t               use_sequence = 0;    // incremented each time this entry is used (for LRU eviction)
     int                    layer_idx = -1;      // which layer this tensor belongs to (for layer-level eviction)
     // The tensor name is the map key, not stored here.
+};
+
+// ---------------------------------------------------------------------------
+// Prompt heatmap — expert routing statistics collected during prompt processing.
+//
+// Records how many tokens activated each (layer, expert) pair.
+// High activation count = this expert heavily influenced the KV cache.
+// Used to prioritize which experts to sharpen in a second pass.
+// ---------------------------------------------------------------------------
+struct bs_prompt_heatmap {
+    struct expert_heat {
+        int32_t n_activations = 0;
+    };
+
+    // per_layer[layer_idx][expert_idx]
+    std::unordered_map<int, std::vector<expert_heat>> per_layer;
+    int n_experts_total = 0;
+
+    void init(int n_experts) {
+        n_experts_total = n_experts;
+        per_layer.clear();
+    }
+
+    void record(int layer_idx, int expert_idx) {
+        if (n_experts_total <= 0 || expert_idx < 0 || expert_idx >= n_experts_total) return;
+        auto & layer = per_layer[layer_idx];
+        if ((int)layer.size() != n_experts_total) layer.resize(n_experts_total);
+        layer[expert_idx].n_activations++;
+    }
+
+    int activations(int layer_idx, int expert_idx) const {
+        auto it = per_layer.find(layer_idx);
+        if (it == per_layer.end()) return 0;
+        if (expert_idx >= (int)it->second.size()) return 0;
+        return it->second[expert_idx].n_activations;
+    }
+
+    // Returns (layer_idx, expert_idx) pairs sorted hottest first.
+    std::vector<std::pair<int,int>> sorted_hottest() const {
+        std::vector<std::tuple<int,int,int>> items;
+        for (auto & [li, layer] : per_layer) {
+            for (int ei = 0; ei < (int)layer.size(); ++ei) {
+                if (layer[ei].n_activations > 0)
+                    items.push_back({layer[ei].n_activations, li, ei});
+            }
+        }
+        std::sort(items.begin(), items.end(), std::greater<>());
+        std::vector<std::pair<int,int>> result;
+        result.reserve(items.size());
+        for (auto & [cnt, li, ei] : items) result.push_back({li, ei});
+        return result;
+    }
+
+    void clear() { per_layer.clear(); }
 };
 
 // ---------------------------------------------------------------------------
@@ -537,6 +592,12 @@ struct llama_blurry_sharp_context {
         int64_t                    n_hits = 0;     // prefetch buffer used (I/O saved)
         int64_t                    n_misses = 0;   // prefetch missed, fell back to sync I/O
     } async_prefetch;
+
+    // Heatmap — populated passively during prompt processing.
+    // Records per-(layer, expert) activation frequency for two-pass analysis.
+    // Set heatmap_collecting = true before a prompt to enable recording.
+    bs_prompt_heatmap prompt_heatmap;
+    bool heatmap_collecting = false;
 
     // -- self-eviction guard --
     // During apply_layer / apply_experts, tensors are overlaid one at a time.
