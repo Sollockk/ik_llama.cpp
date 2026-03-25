@@ -2298,6 +2298,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.bs_spec_draft = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--bs-prompt-repair") {
+        CHECK_ARG
+        params.bs_prompt_repair = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--bs-retain-buffers" || arg == "--retain-buffers") {
         params.bs_retain_buffers = true;
         return true;
@@ -2800,6 +2805,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "Result: sharp-level quality at a fraction of the compute cost" });
     options.push_back({ "*",           "       --bs-combined-probe-stride N",
                                                                         "within a draft, probe with sharp every N tokens to detect errors early (default: %d)", params.bs_combined_probe_stride });
+    options.push_back({ "*",           "       --bs-prompt-repair N",    "two-pass prompt: blurry pass with gate entropy scoring, then repair\n"
+                                                                        "the N most difficult tokens with JIT sharp overlay. Also repairs\n"
+                                                                        "first 3 + last 10%% tokens (position heuristic). 0 = disabled" });
     options.push_back({ "*",           "       --bs-moe-combination",   "MoE combination expert mode: for MoE models, only sharpen the\n"
                                                                         "experts activated by the router instead of all experts in a layer.\n"
                                                                         "Creates 'combination tensors' that are mostly blurry with selected\n"

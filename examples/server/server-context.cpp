@@ -3569,6 +3569,121 @@ void server_context::speculative_decoding_accept() {
 }
 
 
+void server_context::prompt_kv_repair(server_slot & slot) {
+    slot.needs_kv_repair = false;
+
+    const int32_t n_prompt = slot.n_prompt_tokens;
+    const int32_t n_repair_budget = params_base.bs_prompt_repair;
+
+    // Get recorded entropy scores
+    std::vector<float> entropy(n_prompt, 0.0f);
+    const int32_t n_entropy = llama_router_get_token_entropy(
+        ctx, entropy.data(), n_prompt);
+
+    // Position heuristic: boost first 3 + last 10% (min 32) tokens
+    const int32_t n_suffix = std::max(32, n_prompt / 10);
+    const float position_boost = 100.0f;
+    for (int32_t p = 0; p < std::min(3, n_prompt); p++) {
+        entropy[p] += position_boost;
+    }
+    for (int32_t p = std::max(0, n_prompt - n_suffix); p < n_prompt; p++) {
+        entropy[p] += position_boost;
+    }
+
+    // Sort token indices by entropy (descending) and select top N
+    std::vector<int32_t> indices(n_prompt);
+    for (int32_t p = 0; p < n_prompt; p++) indices[p] = p;
+    std::sort(indices.begin(), indices.end(), [&](int a, int b) {
+        return entropy[a] > entropy[b];
+    });
+
+    const int32_t n_repair = std::min(n_repair_budget, n_prompt);
+    std::vector<int32_t> repair_positions(indices.begin(),
+                                          indices.begin() + n_repair);
+    std::sort(repair_positions.begin(), repair_positions.end());
+
+    // Always include last prompt token (need logits for first-token sampling)
+    bool has_last_token = false;
+    for (int32_t rp : repair_positions) {
+        if (rp == n_prompt - 1) { has_last_token = true; break; }
+    }
+    if (!has_last_token) {
+        repair_positions.push_back(n_prompt - 1);
+        std::sort(repair_positions.begin(), repair_positions.end());
+    }
+    const int32_t n_repair_final = (int32_t)repair_positions.size();
+
+    // Diagnostics
+    float max_ent = 0.0f, sum_ent = 0.0f;
+    for (int32_t p = 0; p < n_entropy; p++) {
+        max_ent = std::max(max_ent, entropy[p]);
+        sum_ent += entropy[p];
+    }
+    LOG_INFO("prompt KV repair: scoring", {
+        {"n_prompt",    n_prompt},
+        {"n_entropy",   n_entropy},
+        {"n_repair",    n_repair_final},
+        {"entropy_max", max_ent},
+        {"entropy_avg", n_entropy > 0 ? sum_ent / n_entropy : 0.0f},
+    });
+
+    LOG_INFO("prompt KV repair: starting JIT decode (one-at-a-time)", {
+        {"n_repair",  n_repair_final},
+        {"positions", repair_positions},
+    });
+
+    // Decode repair tokens one at a time — same code path as generation.
+    const llama_pos prompt_offset = (llama_pos)system_tokens.size();
+    const int64_t t_repair_start = ggml_time_us();
+    llama_batch repair_batch = llama_batch_init(1, 0, 1);
+    int n_repaired = 0;
+
+    for (int32_t ri = 0; ri < n_repair_final; ri++) {
+        const int32_t rp = repair_positions[ri];
+        const llama_token tok = slot.prompt_tokens[rp];
+        const llama_pos abs_pos = prompt_offset + rp;
+        const bool need_logits = (rp == n_prompt - 1);
+
+        // Clear this position's KV entry
+        llama_kv_cache_seq_rm(ctx, slot.id, abs_pos, abs_pos + 1);
+
+        // Build single-token batch
+        common_batch_clear(repair_batch);
+        common_batch_add(repair_batch, tok, abs_pos, { slot.id }, need_logits);
+
+        // Decode with JIT sharp overlay
+        llama_blurry_sharp_start_jit(bsctx, ctx, /*host_only=*/ false);
+        const int ret = llama_decode(ctx, repair_batch);
+        llama_blurry_sharp_stop_jit(bsctx, ctx);
+        llama_router_clear(ctx);
+
+        if (ret != 0) {
+            LOG_WARNING("prompt KV repair: decode failed", {
+                {"position", rp}, {"ret", ret}});
+            break;
+        }
+        n_repaired++;
+
+        const double elapsed_ms = (ggml_time_us() - t_repair_start) / 1000.0;
+        LOG_INFO("prompt KV repair progress", {
+            {"repaired", n_repaired},
+            {"total",    n_repair_final},
+            {"position", rp},
+            {"t_ms",     elapsed_ms},
+        });
+    }
+
+    llama_batch_free(repair_batch);
+
+    const double t_repair_ms = (ggml_time_us() - t_repair_start) / 1000.0;
+    LOG_INFO("prompt KV repair complete", {
+        {"n_repaired",  n_repaired},
+        {"n_requested", n_repair_final},
+        {"t_ms",        t_repair_ms},
+        {"t_per_tok",   t_repair_ms / std::max(1, n_repaired)},
+    });
+}
+
 bool server_context::accept_special_token(const server_slot& slot, const  llama_token token) {
     return params_base.special || slot.sparams.preserved_tokens.find(token) != slot.sparams.preserved_tokens.end();
 }
@@ -3750,44 +3865,55 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // ---------------------------------------------------------------
         // Decode strategy:
         //
-        //   Prompt processing (large batch):
-        //     Layer-skip blurry decode, no JIT.  Layer-skip cuts compute
-        //     roughly in half.  JIT is disabled because all experts
-        //     activate across many tokens, negating selective I/O.
+        //   Prompt with --bs-prompt-repair N:
+        //     ALL prompt chunks: blurry (no JIT) + layer-skip.
+        //     Entropy recording captures gate difficulty per token.
+        //     After prompt completes, repair N most-difficult tokens
+        //     with JIT sharp (separate pass, see slot loop below).
+        //
+        //   Prompt processing (default, no repair):
+        //     Layer-skip blurry decode + JIT.
         //
         //   Token generation (small batch, ≤4 tokens):
         //     ALL layers evaluated (no skip) + JIT sharp overlay.
-        //     Every layer gets sharp expert weights for maximum quality.
-        //     Only 8/160 expert slices read per layer (~150 MiB vs 2.3 GiB).
-        //
-        //   Turbo-only (layer-skip, no sharp model):
-        //     Layer-skip decode for speed, no JIT overlay.
         //
         //   Speculative verify (--bs-speculative):
         //     Full blurry decode with router recording, then sharp
         //     re-decode for comparison (handled in Tier 3 below).
         // ---------------------------------------------------------------
 
-        // Layer-skip only during prompt processing (not generation).
-        // Generation runs all layers with JIT sharp for maximum quality.
+        const bool prompt_repair_active = (params_base.bs_prompt_repair > 0
+                                           && bs_moe_active && !is_generation);
+
+        // Layer-skip during prompt (not generation).
         if (turbo_active && !bs_spec_verify && !is_generation) {
             llama_set_skip_layers(ctx, turbo_skip_layers_prompt.data(), (int32_t)turbo_skip_layers_prompt.size());
         }
 
-        // Enable JIT sharp overlay for all decodes (prompt + generation).
-        // During prompt: host_only=true — only CPU MoE layers are sharpened,
-        //   preserving CUDA graph capture on GPU splits.
-        // During generation: host_only=false — all layers sharpened (batch=1, safe).
-        // Enable JIT sharp overlay for all decodes (prompt + generation).
-        // During prompt: host_only=true — only CPU MoE layers are sharpened,
-        //   preserving CUDA graph capture on GPU splits.
-        // During generation: host_only=false — all layers sharpened (batch=1, safe).
-        // JIT sharp overlay for both prompt and generation.
-        // MoE results are forced to GPU, so the scheduler creates device copies
-        // for CPU expert weights.  The JIT callback uploads sharp data to GPU.
-        const bool jit_this_batch = bs_moe_active && !bs_spec_verify;
+        // JIT sharp overlay:
+        //   - Generation: always ON
+        //   - Prompt with --bs-prompt-repair: OFF (repair pass handles it)
+        //   - Prompt without --bs-prompt-repair: ON (original behavior)
+        //   - Speculative verify: OFF (handled separately in Tier 3)
+        bool jit_this_batch = false;
+        if (bs_moe_active && !bs_spec_verify) {
+            if (is_generation) {
+                jit_this_batch = true;
+            } else if (!prompt_repair_active) {
+                jit_this_batch = true;  // original behavior: JIT all prompt
+            }
+            // else: prompt with repair → no JIT (blurry only)
+        }
         if (jit_this_batch) {
             llama_blurry_sharp_start_jit(bsctx, ctx, /*host_only=*/ false);
+        }
+
+        // Enable entropy recording during prompt when repair is active.
+        // Only start recording on the first prompt chunk (don't clear
+        // entropy accumulated from previous chunks).
+        if (prompt_repair_active && !llama_router_is_recording(ctx)) {
+            llama_router_start_recording(ctx);
+            llama_router_set_entropy_recording(ctx, true);
         }
 
         // Speculative verify: record router data during blurry pass
@@ -3803,6 +3929,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             {"jit_active", jit_this_batch},
             {"flash_experts", params_base.bs_flash_experts},
             {"n_skip_layers", (turbo_active && !is_generation) ? (int)turbo_skip_layers_prompt.size() : 0},
+            {"prompt_repair", prompt_repair_active},
         });
 
         const int ret = llama_decode(ctx, batch_view);
@@ -3868,6 +3995,12 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         // Disable layer skipping after decode (only set for prompt)
         if (turbo_active && !bs_spec_verify && !is_generation) {
             llama_set_skip_layers(ctx, nullptr, 0);
+        }
+
+        // Advance entropy offset after each prompt chunk so the next
+        // chunk's tokens get appended (not overwritten) in the entropy vector.
+        if (prompt_repair_active) {
+            llama_router_advance_entropy_offset(ctx, batch_view.n_tokens);
         }
 
         // ---------------------------------------------------------------
@@ -4083,6 +4216,15 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 common_speculative_begin(slot.spec, slot.cache_tokens.get_text_tokens());
             }
 
+            // Flag deferred KV repair — runs as its own decode cycle in update_slots
+            // to avoid CUDA state conflicts with the current decode.
+            if (slot.n_decoded == 0 && params_base.bs_prompt_repair > 0
+                && bs_moe_dynamic && bsctx) {
+                llama_router_stop_recording(ctx);
+                llama_router_set_entropy_recording(ctx, false);
+                slot.needs_kv_repair = true;
+            }
+
             if (slot.i_batch_dft.size() > 0) {
                 continue; // sample using speculative decoding
             }
@@ -4214,6 +4356,15 @@ void server_context::update_slots() {
     // TODO: simplify and improve
     context_shift();
     
+    // Deferred KV repair: wait until a few generation tokens have been decoded
+    // so that normal JIT generation warms the SSD page cache for the sharp file.
+    // Without this, the repair hits a completely cold Q3_K_M file and thrashes.
+    for (auto & slot : slots) {
+        if (slot.needs_kv_repair && slot.n_decoded >= 3) {
+            prompt_kv_repair(slot);
+        }
+    }
+
     // start populating the batch for this iteration
     common_batch_clear(batch);
 

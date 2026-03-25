@@ -1971,6 +1971,28 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // Clear all recorded router data without stopping recording.
     LLAMA_API void llama_router_clear(struct llama_context * ctx);
 
+    // Enable/disable gate entropy recording during router recording.
+    // When enabled, the eval callback intercepts "ffn_moe_probs" tensors
+    // and computes per-token gate entropy (max across layers).
+    LLAMA_API void llama_router_set_entropy_recording(
+            struct llama_context * ctx,
+            bool                   enable);
+
+    // Advance the entropy recording offset by n_tokens.
+    // Call after each llama_decode() during multi-chunk prompt processing
+    // so that subsequent chunks append to (rather than overwrite) the entropy vector.
+    LLAMA_API void llama_router_advance_entropy_offset(
+            struct llama_context * ctx,
+            int32_t                n_tokens);
+
+    // Get recorded per-token gate entropy scores.
+    // out_scores: output array, filled with max-across-layers entropy per token.
+    // Returns the number of tokens with recorded entropy.
+    LLAMA_API int32_t llama_router_get_token_entropy(
+            const struct llama_context * ctx,
+            float                      * out_scores,
+            int32_t                      max_tokens);
+
     // Get the number of recorded token positions for a layer.
     // Returns 0 if no per-token data exists for this layer.
     LLAMA_API int32_t llama_router_n_tokens_for_layer(

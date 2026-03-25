@@ -3179,7 +3179,15 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
     const size_t prefix_len = 13;
     const bool is_topk = (strncmp(t->name, prefix, prefix_len) == 0);
 
+    static const char * probs_prefix = "ffn_moe_probs-";
+    static const size_t probs_prefix_len = 14;
+    const bool is_probs = (!is_topk && lctx->router_record_entropy
+                           && strncmp(t->name, probs_prefix, probs_prefix_len) == 0);
+
     if (ask) {
+        if (is_probs) {
+            return true; // we want gate probability data for entropy scoring
+        }
         if (is_topk) {
             // In host-only JIT mode, skip layers whose expert tensors are on
             // GPU to avoid breaking CUDA graph capture.  We check expert
@@ -3217,6 +3225,76 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
     }
 
     // --- data phase ---
+
+    // Gate entropy scoring: read ffn_moe_probs and compute per-token entropy
+    if (is_probs) {
+        LLAMA_LOG_DEBUG("entropy callback: tensor=%s type=%d ne=[%lld,%lld,%lld,%lld] nbytes=%zu\n",
+            t->name, (int)t->type, (long long)t->ne[0], (long long)t->ne[1],
+            (long long)t->ne[2], (long long)t->ne[3], ggml_nbytes(t));
+
+        // Only process F32 tensors (softmax output should be F32)
+        if (t->type != GGML_TYPE_F32) {
+            if (lctx->cparams.cb_eval) {
+                return lctx->cparams.cb_eval(t, false, lctx->cparams.cb_eval_user_data);
+            }
+            return true;
+        }
+
+        // Shape: [n_expert, n_tokens]
+        const int64_t n_expert = t->ne[0];
+        const int64_t n_tokens = t->ne[1];
+        const size_t  nbytes   = ggml_nbytes(t);
+
+        std::vector<float> probs(n_expert * n_tokens);
+        const size_t read_bytes = (size_t)(n_expert * n_tokens) * sizeof(float);
+
+        // Safety: don't read more than tensor actually holds
+        if (read_bytes > nbytes) {
+            if (lctx->cparams.cb_eval) {
+                return lctx->cparams.cb_eval(t, false, lctx->cparams.cb_eval_user_data);
+            }
+            return true;
+        }
+
+        if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+            ggml_backend_tensor_get(t, probs.data(), 0, read_bytes);
+        } else if (t->data) {
+            memcpy(probs.data(), t->data, read_bytes);
+        }
+
+        // Ensure entropy vector is large enough (with multi-chunk offset)
+        auto & entropy = lctx->router_token_entropy;
+        const int32_t offset = lctx->router_entropy_offset;
+        const size_t needed = (size_t)(offset + n_tokens);
+        if (entropy.size() < needed) {
+            entropy.resize(needed, 0.0f);
+        }
+
+        // Compute entropy per token: H = -sum(p * log(p + eps))
+        // Store max across layers (worst-case difficulty)
+        const float eps = 1e-10f;
+        for (int64_t tok = 0; tok < n_tokens; ++tok) {
+            const float * p = probs.data() + tok * n_expert;
+            float h = 0.0f;
+            for (int64_t e = 0; e < n_expert; ++e) {
+                if (p[e] > eps) {
+                    h -= p[e] * logf(p[e]);
+                }
+            }
+            // Max across layers (with offset for multi-chunk)
+            const size_t idx = (size_t)(offset + tok);
+            if (h > entropy[idx]) {
+                entropy[idx] = h;
+            }
+        }
+
+        // Chain to user callback if set
+        if (lctx->cparams.cb_eval) {
+            return lctx->cparams.cb_eval(t, false, lctx->cparams.cb_eval_user_data);
+        }
+        return true;
+    }
+
     if (is_topk) {
         // parse layer index from "ffn_moe_topk-42"
         int layer_idx = atoi(t->name + prefix_len);
@@ -7852,6 +7930,8 @@ void llama_router_start_recording(struct llama_context * ctx) {
     if (!ctx) return;
     ctx->router_expert_sets.clear();
     ctx->router_per_token_experts.clear();
+    ctx->router_token_entropy.clear();
+    ctx->router_entropy_offset = 0;
     ctx->router_recording = true;
 }
 
@@ -7901,6 +7981,35 @@ void llama_router_clear(struct llama_context * ctx) {
     if (!ctx) return;
     ctx->router_expert_sets.clear();
     ctx->router_per_token_experts.clear();
+    ctx->router_token_entropy.clear();
+    ctx->router_entropy_offset = 0;
+}
+
+void llama_router_set_entropy_recording(struct llama_context * ctx, bool enable) {
+    if (!ctx) return;
+    ctx->router_record_entropy = enable;
+    if (enable) {
+        ctx->router_token_entropy.clear();
+        ctx->router_entropy_offset = 0;
+    }
+}
+
+void llama_router_advance_entropy_offset(struct llama_context * ctx, int32_t n_tokens) {
+    if (!ctx) return;
+    ctx->router_entropy_offset += n_tokens;
+}
+
+int32_t llama_router_get_token_entropy(
+        const struct llama_context * ctx,
+        float                      * out_scores,
+        int32_t                      max_tokens) {
+    if (!ctx) return 0;
+    const auto & entropy = ctx->router_token_entropy;
+    const int32_t n = std::min((int32_t)entropy.size(), max_tokens);
+    if (out_scores && n > 0) {
+        memcpy(out_scores, entropy.data(), n * sizeof(float));
+    }
+    return n;
 }
 
 int32_t llama_router_n_tokens_for_layer(const struct llama_context * ctx, int32_t layer_idx) {

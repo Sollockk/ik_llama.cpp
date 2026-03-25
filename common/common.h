@@ -549,6 +549,14 @@ struct gpt_params {
     int         bs_ram_cache_mb        = 0;            // RAM expert cache in MiB (0 = auto 4096, -1 = off)
     bool        bs_flash_experts       = false;         // flash-moe style: stream Q4_K_M experts from SSD
     bool        bs_no_sharp_attn       = false;         // keep blurry attention/norm weights (skip non-expert overlay)
+
+    // Two-pass prompt with entropy-guided KV repair.
+    // Pass 1: fast blurry prompt (+ layer-skip).  Gate entropy recorded per token.
+    // Pass 2: re-decode the N most "difficult" tokens (highest gate entropy) with
+    //         JIT sharp overlay, patching their KV cache entries.
+    // Also always repairs first 3 + last min(32, 10%) tokens (position heuristic).
+    // 0 = disabled (all prompt gets JIT as before).
+    int         bs_prompt_repair       = 0;
 };
 
 

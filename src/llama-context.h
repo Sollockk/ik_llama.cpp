@@ -216,6 +216,15 @@ struct llama_context {
     // Entries are appended in decode order (token 0 first, then 1, ...).
     std::unordered_map<int32_t, std::vector<std::vector<int32_t>>> router_per_token_experts;
 
+    // Per-token gate entropy for difficulty scoring (prompt repair).
+    // When router_recording is active, the eval callback also intercepts
+    // "ffn_moe_probs-{il}" tensors and computes per-token entropy of the
+    // gate softmax distribution.  Stored as max entropy across all layers
+    // (worst-case difficulty).  Index = decode-order token position.
+    bool                router_record_entropy = false;
+    std::vector<float>  router_token_entropy;  // [n_tokens], max over layers
+    int32_t             router_entropy_offset = 0; // offset for multi-chunk accumulation
+
     // -----------------------------------------------------------------------
     // JIT (just-in-time) per-layer sharpening
     //

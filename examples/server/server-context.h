@@ -147,6 +147,7 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
 
+    bool    needs_kv_repair = false; // deferred entropy-guided KV repair
     int32_t n_past_se = 0; // self-extend
 
     // stats
@@ -358,6 +359,10 @@ struct server_context {
     void extend_context(const int32_t n_tokens);
 
     void speculative_decoding_accept();
+
+    // Entropy-guided KV repair: re-decode difficult prompt tokens with JIT.
+    // Called from update_slots when a slot has needs_kv_repair set.
+    void prompt_kv_repair(server_slot & slot);
 
     bool accept_special_token(const server_slot& slot, const llama_token token);
 
