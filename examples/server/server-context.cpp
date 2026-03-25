@@ -391,6 +391,18 @@ bool server_context::load_model(const gpt_params& params_) {
                 // This is critical for quality — attention projections on GPU at TQ1_0
                 // degrade KV cache quality significantly.
                 // Use --bs-no-sharp-attn to skip (keeps blurry, saves VRAM on huge models).
+                // Always sharpen gate/router tensors — they're tiny (~59 MiB)
+                // and ensure correct expert routing even with blurry experts.
+                {
+                    const auto t0_g = ggml_time_us();
+                    int32_t n_gates = llama_blurry_sharp_apply_gates_permanent(bsctx);
+                    const auto t1_g = ggml_time_us();
+                    LOG_INFO("Gate/router tensors permanently upgraded to sharp quality", {
+                        {"n_tensors", n_gates},
+                        {"time_ms", (t1_g - t0_g) / 1000.0},
+                    });
+                }
+
                 if (!params_base.bs_no_sharp_attn) {
                     const auto t0_ne = ggml_time_us();
                     int32_t n_upgraded = llama_blurry_sharp_apply_non_expert_permanent(bsctx);

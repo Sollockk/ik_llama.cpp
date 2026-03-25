@@ -1718,6 +1718,13 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API int32_t llama_blurry_sharp_apply_non_expert_permanent(
             struct llama_blurry_sharp_context * bsctx);
 
+    // Permanently overlay only the MoE gate/router tensors (ffn_gate_inp)
+    // with sharp data.  These are tiny (~59 MiB total) and ensure correct
+    // expert routing even when expert weights remain blurry.
+    // Always called at startup regardless of --bs-no-sharp-attn.
+    LLAMA_API int32_t llama_blurry_sharp_apply_gates_permanent(
+            struct llama_blurry_sharp_context * bsctx);
+
     // Prefetch live zero-copy tensor pages into the page cache (RAM).
     // After sharpening, CPU zero-copy tensors point at mmap pages that may
     // not be resident in RAM yet.  This tells the kernel to pull them in

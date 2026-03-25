@@ -203,6 +203,10 @@ static void bs_prefetch_parallel_pread(bs_pread_task * tasks, int n_tasks) {
 //   blk.N.ffn_gate_exps, blk.N.ffn_up_exps, blk.N.ffn_down_exps
 //   blk.N.ffn_norm_exps
 // These are 3D tensors where ne[2] = n_expert.
+static bool bs_is_gate_tensor(const std::string & name) {
+    return name.find("ffn_gate_inp") != std::string::npos;
+}
+
 static bool bs_is_expert_tensor(const std::string & name) {
     // Match tensor names ending with "_exps" (the merged expert format)
     // but NOT "_shexp" (shared expert) or "_inp" (gate input)
@@ -3516,6 +3520,11 @@ int32_t llama_blurry_sharp_apply_non_expert_permanent(
             ++n_skipped;
             continue;
         }
+        // Skip gate tensors — handled by apply_gates_permanent
+        if (bs_is_gate_tensor(name)) {
+            ++n_skipped;
+            continue;
+        }
 
         ggml_tensor * base_tensor = sharp_info.base_tensor;
         if (!base_tensor) {
@@ -3566,6 +3575,53 @@ int32_t llama_blurry_sharp_apply_non_expert_permanent(
                   n_overlaid_cpu, total_bytes_cpu / (1024.0 * 1024.0),
                   n_skipped, n_failed, (t_end - t_start) / 1000.0);
 
+    return n_overlaid;
+}
+
+// ---------------------------------------------------------------------------
+// Permanently overlay gate/router tensors only
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_apply_gates_permanent(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->initialized) return 0;
+
+    int n_overlaid = 0;
+    int n_failed   = 0;
+
+    LLAMA_LOG_INFO("%s: permanently overlaying gate/router tensors with sharp data\n", __func__);
+
+    for (auto & [name, sharp_info] : bsctx->sharp_index) {
+        if (!bs_is_gate_tensor(name)) continue;
+
+        ggml_tensor * base_tensor = sharp_info.base_tensor;
+        if (!base_tensor) {
+            base_tensor = bs_find_model_tensor(bsctx->model, name.c_str());
+        }
+        if (!base_tensor) {
+            ++n_failed;
+            continue;
+        }
+
+        bool is_gpu = base_tensor->buffer && !ggml_backend_buffer_is_host(base_tensor->buffer);
+        ggml_type old_type = base_tensor->type;
+        int64_t sharp_bytes = bs_overlay_single_tensor_permanent(bsctx, sharp_info, base_tensor);
+        if (sharp_bytes < 0) {
+            LLAMA_LOG_WARN("%s: failed for '%s'\n", __func__, name.c_str());
+            ++n_failed;
+            continue;
+        }
+
+        ++n_overlaid;
+        LLAMA_LOG_INFO("%s: %s '%s' (%s -> %s, %.1f MiB)\n",
+                      __func__, is_gpu ? "GPU" : "CPU", name.c_str(),
+                      ggml_type_name(old_type),
+                      ggml_type_name(sharp_info.type),
+                      sharp_info.nbytes / (1024.0 * 1024.0));
+    }
+
+    LLAMA_LOG_INFO("%s: done — %d gate tensors overlaid, %d failed\n",
+                  __func__, n_overlaid, n_failed);
     return n_overlaid;
 }
 
