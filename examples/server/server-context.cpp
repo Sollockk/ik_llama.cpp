@@ -3690,11 +3690,16 @@ void server_context::prompt_kv_repair(server_slot & slot) {
         n_repaired++;
 
         const double elapsed_ms = (ggml_time_us() - t_repair_start) / 1000.0;
+        const std::string tok_str = common_token_to_piece(ctx, tok, true);
         LOG_INFO("prompt KV repair progress", {
-            {"repaired", n_repaired},
-            {"total",    n_repair_final},
-            {"position", rp},
-            {"t_ms",     elapsed_ms},
+            {"repaired",    n_repaired},
+            {"total",       n_repair_final},
+            {"pct",         100.0f * n_repaired / n_repair_final},
+            {"prompt_pct",  100.0f * n_repaired / n_prompt},
+            {"position",    rp},
+            {"token",       tok_str},
+            {"entropy",     (rp < (int32_t)entropy.size()) ? entropy[rp] : 0.0f},
+            {"t_ms",        elapsed_ms},
         });
     }
 
@@ -3704,6 +3709,7 @@ void server_context::prompt_kv_repair(server_slot & slot) {
     LOG_INFO("prompt KV repair complete", {
         {"n_repaired",  n_repaired},
         {"n_requested", n_repair_final},
+        {"prompt_pct",  100.0f * n_repaired / std::max(1, n_prompt)},
         {"t_ms",        t_repair_ms},
         {"t_per_tok",   t_repair_ms / std::max(1, n_repaired)},
     });
