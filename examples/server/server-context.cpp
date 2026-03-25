@@ -3573,58 +3573,83 @@ void server_context::prompt_kv_repair(server_slot & slot) {
     slot.needs_kv_repair = false;
 
     const int32_t n_prompt = slot.n_prompt_tokens;
-    const int32_t n_repair_budget = params_base.bs_prompt_repair;
+    const int32_t repair_pct = params_base.bs_prompt_repair; // top N% by entropy
 
-    // Get recorded entropy scores
-    std::vector<float> entropy(n_prompt, 0.0f);
-    const int32_t n_entropy = llama_router_get_token_entropy(
-        ctx, entropy.data(), n_prompt);
+    // Use saved entropy (context's copy was cleared by generation JIT)
+    std::vector<float> & entropy = slot.repair_entropy;
+    const int32_t n_entropy = (int32_t)entropy.size();
+    entropy.resize(n_prompt, 0.0f); // pad if shorter
 
-    // Position heuristic: boost first 3 + last 10% (min 32) tokens
-    const int32_t n_suffix = std::max(32, n_prompt / 10);
-    const float position_boost = 100.0f;
-    for (int32_t p = 0; p < std::min(3, n_prompt); p++) {
-        entropy[p] += position_boost;
+    // Compute threshold: mean + 1 stddev of non-zero entropy values
+    float sum_ent = 0.0f, sum_sq = 0.0f, max_ent = 0.0f;
+    int32_t n_nonzero = 0;
+    for (int32_t p = 0; p < n_prompt; p++) {
+        if (entropy[p] > 0.0f) {
+            sum_ent += entropy[p];
+            sum_sq += entropy[p] * entropy[p];
+            max_ent = std::max(max_ent, entropy[p]);
+            n_nonzero++;
+        }
     }
-    for (int32_t p = std::max(0, n_prompt - n_suffix); p < n_prompt; p++) {
-        entropy[p] += position_boost;
+    const float mean_ent = n_nonzero > 0 ? sum_ent / n_nonzero : 0.0f;
+    const float var_ent = n_nonzero > 1
+        ? (sum_sq - sum_ent * sum_ent / n_nonzero) / (n_nonzero - 1) : 0.0f;
+    const float stddev_ent = sqrtf(std::max(0.0f, var_ent));
+
+    // Dynamic threshold: repair tokens above mean + 1 stddev
+    const float entropy_threshold = mean_ent + stddev_ent;
+
+    // Select tokens above entropy threshold
+    std::vector<int32_t> repair_positions;
+    for (int32_t p = 0; p < n_prompt; p++) {
+        if (entropy[p] > entropy_threshold) {
+            repair_positions.push_back(p);
+        }
     }
 
-    // Sort token indices by entropy (descending) and select top N
-    std::vector<int32_t> indices(n_prompt);
-    for (int32_t p = 0; p < n_prompt; p++) indices[p] = p;
-    std::sort(indices.begin(), indices.end(), [&](int a, int b) {
-        return entropy[a] > entropy[b];
-    });
-
-    const int32_t n_repair = std::min(n_repair_budget, n_prompt);
-    std::vector<int32_t> repair_positions(indices.begin(),
-                                          indices.begin() + n_repair);
-    std::sort(repair_positions.begin(), repair_positions.end());
-
-    // Always include last prompt token (need logits for first-token sampling)
-    bool has_last_token = false;
-    for (int32_t rp : repair_positions) {
-        if (rp == n_prompt - 1) { has_last_token = true; break; }
-    }
-    if (!has_last_token) {
-        repair_positions.push_back(n_prompt - 1);
+    // Cap at repair_pct% of prompt to avoid excessive repair
+    const int32_t max_repair = std::max(1, n_prompt * repair_pct / 100);
+    if ((int32_t)repair_positions.size() > max_repair) {
+        // Keep only the highest-entropy ones
+        std::sort(repair_positions.begin(), repair_positions.end(),
+                  [&](int a, int b) { return entropy[a] > entropy[b]; });
+        repair_positions.resize(max_repair);
         std::sort(repair_positions.begin(), repair_positions.end());
     }
-    const int32_t n_repair_final = (int32_t)repair_positions.size();
 
-    // Diagnostics
-    float max_ent = 0.0f, sum_ent = 0.0f;
-    for (int32_t p = 0; p < n_entropy; p++) {
-        max_ent = std::max(max_ent, entropy[p]);
-        sum_ent += entropy[p];
+    // Position heuristic: always include first 3 + last 32 tokens
+    auto add_if_missing = [&](int32_t p) {
+        if (p >= 0 && p < n_prompt) {
+            if (std::find(repair_positions.begin(), repair_positions.end(), p) == repair_positions.end()) {
+                repair_positions.push_back(p);
+            }
+        }
+    };
+    for (int32_t p = 0; p < std::min(3, n_prompt); p++) add_if_missing(p);
+    for (int32_t p = std::max(0, n_prompt - 32); p < n_prompt; p++) add_if_missing(p);
+    std::sort(repair_positions.begin(), repair_positions.end());
+
+    const int32_t n_repair_final = (int32_t)repair_positions.size();
+    // Count how many tokens were selected by entropy vs position heuristic
+    int32_t n_by_entropy = 0;
+    for (int32_t rp : repair_positions) {
+        if (entropy[rp] > entropy_threshold && rp >= 3 && rp < n_prompt - 32) {
+            n_by_entropy++;
+        }
     }
+
     LOG_INFO("prompt KV repair: scoring", {
-        {"n_prompt",    n_prompt},
-        {"n_entropy",   n_entropy},
-        {"n_repair",    n_repair_final},
-        {"entropy_max", max_ent},
-        {"entropy_avg", n_entropy > 0 ? sum_ent / n_entropy : 0.0f},
+        {"n_prompt",          n_prompt},
+        {"n_entropy_recorded", n_entropy},
+        {"n_nonzero",         n_nonzero},
+        {"entropy_mean",      mean_ent},
+        {"entropy_stddev",    stddev_ent},
+        {"entropy_threshold", entropy_threshold},
+        {"entropy_max",       max_ent},
+        {"n_repair_total",    n_repair_final},
+        {"n_by_entropy",      n_by_entropy},
+        {"n_by_position",     n_repair_final - n_by_entropy},
+        {"max_repair_pct",    repair_pct},
     });
 
     LOG_INFO("prompt KV repair: starting JIT decode (one-at-a-time)", {
@@ -4222,6 +4247,12 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 && bs_moe_dynamic && bsctx) {
                 llama_router_stop_recording(ctx);
                 llama_router_set_entropy_recording(ctx, false);
+
+                // Save entropy scores NOW — generation JIT will call
+                // llama_router_clear() which destroys them.
+                const int32_t n_prompt = slot.n_prompt_tokens;
+                slot.repair_entropy.resize(n_prompt, 0.0f);
+                llama_router_get_token_entropy(ctx, slot.repair_entropy.data(), n_prompt);
                 slot.needs_kv_repair = true;
             }
 

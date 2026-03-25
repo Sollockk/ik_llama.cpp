@@ -147,7 +147,8 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
 
-    bool    needs_kv_repair = false; // deferred entropy-guided KV repair
+    bool    needs_kv_repair = false;          // deferred entropy-guided KV repair
+    std::vector<float> repair_entropy;      // saved entropy scores (cleared by generation JIT)
     int32_t n_past_se = 0; // self-extend
 
     // stats
