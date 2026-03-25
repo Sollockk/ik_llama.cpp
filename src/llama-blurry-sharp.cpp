@@ -3487,6 +3487,89 @@ int32_t llama_blurry_sharp_apply_all(
 }
 
 // ---------------------------------------------------------------------------
+// Permanently overlay non-expert tensors (attention, norms, etc.)
+//
+// MoE expert tensors (_exps) are handled by JIT overlay during graph execution.
+// All other tensors (attention Q/K/V/O projections, layer norms, embeddings,
+// output head) are always used and can be permanently upgraded to sharp quality
+// at startup.  This is especially important for GPU tensors — they hold
+// attention weights that directly affect KV cache quality.
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_apply_non_expert_permanent(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->initialized) return 0;
+
+    int64_t t_start = bs_time_us();
+    int n_overlaid_gpu = 0;
+    int n_overlaid_cpu = 0;
+    int n_skipped  = 0;
+    int n_failed   = 0;
+    int64_t total_bytes_gpu = 0;
+    int64_t total_bytes_cpu = 0;
+
+    LLAMA_LOG_INFO("%s: permanently overlaying non-expert tensors with sharp data\n", __func__);
+
+    for (auto & [name, sharp_info] : bsctx->sharp_index) {
+        // Skip expert tensors — those are handled by JIT
+        if (bs_is_expert_tensor(name)) {
+            ++n_skipped;
+            continue;
+        }
+
+        ggml_tensor * base_tensor = sharp_info.base_tensor;
+        if (!base_tensor) {
+            base_tensor = bs_find_model_tensor(bsctx->model, name.c_str());
+        }
+        if (!base_tensor) {
+            if (bsctx->params.verbose) {
+                LLAMA_LOG_WARN("%s: base tensor '%s' not found, skipping\n",
+                              __func__, name.c_str());
+            }
+            ++n_failed;
+            continue;
+        }
+
+        bool is_gpu = base_tensor->buffer && !ggml_backend_buffer_is_host(base_tensor->buffer);
+        ggml_type old_type = base_tensor->type;
+        int64_t sharp_bytes = bs_overlay_single_tensor_permanent(bsctx, sharp_info, base_tensor);
+        if (sharp_bytes < 0) {
+            LLAMA_LOG_WARN("%s: permanent overlay failed for '%s' (%s, %s)\n",
+                          __func__, name.c_str(),
+                          is_gpu ? "GPU" : "CPU",
+                          ggml_type_name(old_type));
+            ++n_failed;
+            continue;
+        }
+
+        if (is_gpu) {
+            ++n_overlaid_gpu;
+            total_bytes_gpu += sharp_bytes;
+        } else {
+            ++n_overlaid_cpu;
+            total_bytes_cpu += sharp_bytes;
+        }
+
+        LLAMA_LOG_INFO("%s: %s '%s' (%s → %s, %.1f MiB)\n",
+                      __func__, is_gpu ? "GPU" : "CPU", name.c_str(),
+                      ggml_type_name(old_type),
+                      ggml_type_name(sharp_info.type),
+                      sharp_info.nbytes / (1024.0 * 1024.0));
+    }
+
+    int64_t t_end = bs_time_us();
+    int n_overlaid = n_overlaid_gpu + n_overlaid_cpu;
+    LLAMA_LOG_INFO("%s: done — %d GPU tensors (%.1f MiB), %d CPU tensors (%.1f MiB), "
+                  "%d expert tensors skipped, %d failed, %.2f ms\n",
+                  __func__,
+                  n_overlaid_gpu, total_bytes_gpu / (1024.0 * 1024.0),
+                  n_overlaid_cpu, total_bytes_cpu / (1024.0 * 1024.0),
+                  n_skipped, n_failed, (t_end - t_start) / 1000.0);
+
+    return n_overlaid;
+}
+
+// ---------------------------------------------------------------------------
 // Warm live pages into RAM
 // ---------------------------------------------------------------------------
 

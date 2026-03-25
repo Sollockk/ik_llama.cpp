@@ -1705,6 +1705,13 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API int32_t llama_blurry_sharp_apply_all(
             struct llama_blurry_sharp_context * bsctx);
 
+    // Permanently overlay all non-expert tensors (attention, norms, embeddings)
+    // with sharp data.  Expert tensors are skipped (handled by JIT).
+    // Call once at startup after init to upgrade GPU attention quality.
+    // Returns the number of tensors successfully overlaid.
+    LLAMA_API int32_t llama_blurry_sharp_apply_non_expert_permanent(
+            struct llama_blurry_sharp_context * bsctx);
+
     // Prefetch live zero-copy tensor pages into the page cache (RAM).
     // After sharpening, CPU zero-copy tensors point at mmap pages that may
     // not be resident in RAM yet.  This tells the kernel to pull them in

@@ -384,6 +384,23 @@ bool server_context::load_model(const gpt_params& params_) {
                     {"memory_tier", (do_precache || params_base.bs_lazy_swap) ? "VRAM > RAM > Swap > Disk" : "VRAM > Disk"},
                     {"lazy_swap", params_base.bs_lazy_swap},
                 });
+
+                // Permanently upgrade non-expert tensors (attention, norms, embeddings)
+                // to sharp quality.  Expert tensors are handled by JIT during compute.
+                // This is critical for quality — attention projections on GPU at TQ1_0
+                // degrade KV cache quality significantly.
+                // Use --bs-no-sharp-attn to skip (keeps blurry, saves VRAM on huge models).
+                if (!params_base.bs_no_sharp_attn) {
+                    const auto t0_ne = ggml_time_us();
+                    int32_t n_upgraded = llama_blurry_sharp_apply_non_expert_permanent(bsctx);
+                    const auto t1_ne = ggml_time_us();
+                    LOG_INFO("Non-expert tensors permanently upgraded to sharp quality", {
+                        {"n_tensors", n_upgraded},
+                        {"time_ms", (t1_ne - t0_ne) / 1000.0},
+                    });
+                } else {
+                    LOG_INFO("Non-expert sharp overlay skipped (--bs-no-sharp-attn)", {});
+                }
             } else {
                 // ---- Static overlay mode (permanent) ----
                 // Apply all sharp layers now with permanent=true.  This overwrites

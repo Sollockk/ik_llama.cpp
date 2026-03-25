@@ -2387,6 +2387,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.bs_flash_experts = true;
         return true;
     }
+    if (arg == "--bs-no-sharp-attn" || arg == "--bs-blurry-attn") {
+        params.bs_no_sharp_attn = true;
+        return true;
+    }
 
 #ifndef LOG_DISABLE_LOGS
     // Parse args for logging parameters
