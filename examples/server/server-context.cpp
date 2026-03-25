@@ -3573,7 +3573,7 @@ void server_context::prompt_kv_repair(server_slot & slot) {
     slot.needs_kv_repair = false;
 
     const int32_t n_prompt = slot.n_prompt_tokens;
-    const int32_t repair_pct = params_base.bs_prompt_repair; // top N% by entropy
+    const int32_t max_repair_tokens = params_base.bs_prompt_repair; // cap
 
     // Use saved entropy (context's copy was cleared by generation JIT)
     std::vector<float> & entropy = slot.repair_entropy;
@@ -3599,21 +3599,20 @@ void server_context::prompt_kv_repair(server_slot & slot) {
     // Dynamic threshold: repair tokens above mean + 1 stddev
     const float entropy_threshold = mean_ent + stddev_ent;
 
-    // Select tokens above entropy threshold
+    // Select tokens above entropy threshold (skip tokens with no entropy data)
     std::vector<int32_t> repair_positions;
     for (int32_t p = 0; p < n_prompt; p++) {
-        if (entropy[p] > entropy_threshold) {
+        if (entropy[p] > 0.0f && entropy[p] > entropy_threshold) {
             repair_positions.push_back(p);
         }
     }
 
-    // Cap at repair_pct% of prompt to avoid excessive repair
-    const int32_t max_repair = std::max(1, n_prompt * repair_pct / 100);
-    if ((int32_t)repair_positions.size() > max_repair) {
+    // Cap at N tokens to avoid excessive repair
+    if ((int32_t)repair_positions.size() > max_repair_tokens) {
         // Keep only the highest-entropy ones
         std::sort(repair_positions.begin(), repair_positions.end(),
                   [&](int a, int b) { return entropy[a] > entropy[b]; });
-        repair_positions.resize(max_repair);
+        repair_positions.resize(max_repair_tokens);
         std::sort(repair_positions.begin(), repair_positions.end());
     }
 
@@ -3649,7 +3648,7 @@ void server_context::prompt_kv_repair(server_slot & slot) {
         {"n_repair_total",    n_repair_final},
         {"n_by_entropy",      n_by_entropy},
         {"n_by_position",     n_repair_final - n_by_entropy},
-        {"max_repair_pct",    repair_pct},
+        {"max_repair_tokens", max_repair_tokens},
     });
 
     LOG_INFO("prompt KV repair: starting JIT decode (one-at-a-time)", {

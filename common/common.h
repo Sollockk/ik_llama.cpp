@@ -553,8 +553,7 @@ struct gpt_params {
     // Two-pass prompt with entropy-guided KV repair.
     // Pass 1: fast blurry prompt (+ layer-skip).  Gate entropy recorded per token.
     // Pass 2: re-decode difficult tokens (entropy > mean + 1 stddev) with JIT,
-    //         capped at N% of prompt.  Also always repairs first 3 + last 32 tokens.
-    // Value is max repair percentage (e.g. 10 = up to 10% of prompt tokens).
+    //         capped at N tokens.  Also always repairs first 3 + last 32 tokens.
     // 0 = disabled (all prompt gets JIT as before).
     int         bs_prompt_repair       = 0;
 };
