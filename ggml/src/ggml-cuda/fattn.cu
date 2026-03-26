@@ -72,6 +72,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
+    // TQ3_0: always use MMA/WMMA path which converts TQ3_0→f16 first
+    // (the vec kernel has issues when both K and V are TQ3_0 simultaneously)
+
     if (!fp16_mma_available(cc)) {
         if (precision == GGML_PREC_DEFAULT) {
             if (Q->ne[1] <= 8 || Q->ne[0] == 256) {
@@ -153,6 +156,11 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
     if (cc >= CC_OFFSET_AMD) {
         return precision == GGML_PREC_DEFAULT ? ggml_cuda_fattn_vec_f16_is_supported(ctx, dst)
                                               : ggml_cuda_fattn_vec_f32_is_supported(ctx, dst);
+    }
+
+    // TQ3_0: always use MMA/WMMA path with TQ3_0→f16 conversion
+    if (K->type == GGML_TYPE_TQ3_0 || V->type == GGML_TYPE_TQ3_0) {
+        return true; // bulk TQ3_0→f16 converter is registered
     }
 
     if (!fast_fp16_available(cc)) {

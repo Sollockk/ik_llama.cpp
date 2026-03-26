@@ -606,11 +606,89 @@ static __device__ __forceinline__ T dequantize_1_q8_0(const void * __restrict__ 
     return ((float) d)*((float) q);
 }
 
+// Warp-cooperative TQ3_0 dequantize using __shfl_xor_sync for inverse WHT
+template <typename T>
+static __device__ __noinline__ T dequantize_1_tq3_0(const void * __restrict__ vx, const int64_t i) {
+    const float centroids[8] = {
+        -2.1519f, -1.3439f, -0.7560f, -0.2451f,
+         0.2451f,  0.7560f,  1.3439f,  2.1519f
+    };
+    const float signs[32] = {
+        +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+        -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+        -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+        -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    };
+
+    const block_tq3_0 * x = (const block_tq3_0 *) vx;
+    const int64_t ib = i / QK_TQ3_0;
+    const int     t  = i % QK_TQ3_0;
+
+    const float d = __half2float(x[ib].d);
+
+    const int g = t / 8;
+    const int p = t % 8;
+    const uint8_t * qp = x[ib].qs + g * 3;
+
+    uint8_t qi;
+    switch (p) {
+        case 0: qi =  qp[0]                             & 7; break;
+        case 1: qi = (qp[0] >> 3)                        & 7; break;
+        case 2: qi = ((qp[0] >> 6) | (qp[1] << 2))      & 7; break;
+        case 3: qi = (qp[1] >> 1)                        & 7; break;
+        case 4: qi = (qp[1] >> 4)                        & 7; break;
+        case 5: qi = ((qp[1] >> 7) | (qp[2] << 1))      & 7; break;
+        case 6: qi = (qp[2] >> 2)                        & 7; break;
+        default: qi = (qp[2] >> 5)                       & 7; break;
+    }
+
+    float val = centroids[qi];
+
+#pragma unroll
+    for (int step = 1; step < 32; step <<= 1) {
+        float other = __shfl_xor_sync(0xffffffff, val, step);
+        val = (t & step) ? (other - val) : (val + other);
+    }
+
+    val *= (1.0f / 5.656854249f) * signs[t] * d;
+
+    return (T)val;
+}
+
 template <typename T>
 static __device__ __forceinline__ T dequantize_1_f16(const void * __restrict__ vx, const int64_t i) {
     const half * x = (const half *) vx;
 
     return x[i];
+}
+
+template <typename T, int Dk>
+static __device__ __noinline__ T vec_dot_fattn_vec_KQ_tq3_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < Dk; k_KQ_0 += WARP_SIZE) {
+        const int k_KQ = k_KQ_0 + threadIdx.x;
+        float k_val = dequantize_1_tq3_0<float>(K_c, k_KQ);
+
+        const int q_pair_idx = k_KQ / 2;
+        const int q_h2_array = q_pair_idx / WARP_SIZE;
+        const int q_src_thread = q_pair_idx % WARP_SIZE;
+        const int q_is_high = k_KQ % 2;
+
+        const half2 * Q_h2 = (const half2 *) Q_v;
+        half2 q_pair = __shfl_sync(0xffffffff, Q_h2[q_h2_array], q_src_thread);
+        float q_val = q_is_high ? __high2float(q_pair) : __low2float(q_pair);
+
+        sum += k_val * q_val;
+    }
+
+    return (T) sum;
 }
 
 template <int Dk>
@@ -622,6 +700,7 @@ constexpr __device__ vec_dot_KQ_f16_t get_vec_dot_KQ_f16(ggml_type type_K) {
            type_K == GGML_TYPE_Q5_1   ? vec_dot_fattn_vec_KQ_q5_1<half, Dk>   :
            type_K == GGML_TYPE_Q6_0   ? vec_dot_fattn_vec_KQ_q6_0<half, Dk>   :
            type_K == GGML_TYPE_Q8_0   ? vec_dot_fattn_vec_KQ_q8_0<half, Dk>   :
+           type_K == GGML_TYPE_TQ3_0  ? vec_dot_fattn_vec_KQ_tq3_0<half, Dk>  :
            type_K == GGML_TYPE_F16    ? vec_dot_fattn_vec_KQ_f16<half, Dk>    :
            nullptr;
 }
@@ -635,6 +714,7 @@ constexpr __device__ vec_dot_KQ_f32_t get_vec_dot_KQ_f32(ggml_type type_K) {
            type_K == GGML_TYPE_Q5_1   ? vec_dot_fattn_vec_KQ_q5_1<float, Dk>   :
            type_K == GGML_TYPE_Q6_0   ? vec_dot_fattn_vec_KQ_q6_0<float, Dk>   :
            type_K == GGML_TYPE_Q8_0   ? vec_dot_fattn_vec_KQ_q8_0<float, Dk>   :
+           type_K == GGML_TYPE_TQ3_0  ? vec_dot_fattn_vec_KQ_tq3_0<float, Dk>  :
            type_K == GGML_TYPE_F16    ? vec_dot_fattn_vec_KQ_f16<float, Dk>    :
            nullptr;
 }
@@ -647,6 +727,7 @@ constexpr __device__ dequantize_1_f16_t get_dequantize_1_f16(ggml_type type_V) {
            type_V == GGML_TYPE_Q6_0   ? dequantize_1_q6_0<half> :
            type_V == GGML_TYPE_Q8_0   ? dequantize_1_q8_0<half> :
            type_V == GGML_TYPE_IQ4_NL ? dequantize_1_iq4_nl<half> :
+           type_V == GGML_TYPE_TQ3_0  ? dequantize_1_tq3_0<half> :
            type_V == GGML_TYPE_F16    ? dequantize_1_f16<half> :
            nullptr;
 }
@@ -659,6 +740,7 @@ constexpr __device__ dequantize_1_f32_t get_dequantize_1_f32(ggml_type type_V) {
            type_V == GGML_TYPE_Q6_0   ? dequantize_1_q6_0<float> :
            type_V == GGML_TYPE_Q8_0   ? dequantize_1_q8_0<float> :
            type_V == GGML_TYPE_IQ4_NL ? dequantize_1_iq4_nl<float> :
+           type_V == GGML_TYPE_TQ3_0  ? dequantize_1_tq3_0<float> :
            type_V == GGML_TYPE_F16    ? dequantize_1_f16<float> :
            nullptr;
 }

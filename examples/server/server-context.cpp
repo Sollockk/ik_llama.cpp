@@ -480,9 +480,9 @@ bool server_context::load_model(const gpt_params& params_) {
                         "with no sharp KV repair. Quality may be poor.", {});
         }
         if (params_base.bs_sharp_experts_gpu == 0 && params_base.bs_gpu_cache_mb > 0) {
-            LOG_WARNING("--bs-gpu-cache %d with --bs-sharp-experts-gpu 0: GPU expert cache is "
-                        "allocated (%d MiB VRAM) but never used. Set --bs-gpu-cache 0 to free VRAM.",
-                        params_base.bs_gpu_cache_mb, params_base.bs_gpu_cache_mb);
+            LOG_WARNING("--bs-gpu-cache with --bs-sharp-experts-gpu 0: GPU expert cache is "
+                        "allocated but never used. Set --bs-gpu-cache 0 to free VRAM.",
+                        {{"bs_gpu_cache_mb", params_base.bs_gpu_cache_mb}});
         }
     }
 
