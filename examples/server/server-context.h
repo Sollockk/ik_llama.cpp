@@ -150,6 +150,7 @@ struct server_slot {
     bool    needs_kv_repair = false;          // deferred entropy-guided KV repair
     int32_t repair_cache_start = 0;         // prompt position where new decoding started
     std::vector<float> repair_entropy;      // saved entropy scores (cleared by generation JIT)
+    std::vector<int32_t> repair_skip_layers_importance;  // layers sorted by importance (least first)
     int32_t n_past_se = 0; // self-extend
 
     // stats
@@ -242,6 +243,7 @@ struct server_context {
     // expert-selective sharpening happens per-decode step (requires -np 1).
     llama_blurry_sharp_context * bsctx = nullptr;
     bool bs_moe_dynamic = false;  // true when MoE combination mode is active
+    int32_t original_n_expert_used = 0; // saved at init for prompt top-k restore
 
     // Layer skipping for "turbo" draft tier in 3-tier blurry-sharp.
     // Generation skip: moderate (every other middle layer skipped).

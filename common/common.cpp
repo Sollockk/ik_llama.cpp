@@ -2303,6 +2303,15 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.bs_prompt_repair = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--bs-repair-skip-pct") {
+        CHECK_ARG
+        params.bs_repair_skip_pct = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-no-jit-gen") {
+        params.bs_no_jit_gen = true;
+        return true;
+    }
     if (arg == "--bs-retain-buffers" || arg == "--retain-buffers") {
         params.bs_retain_buffers = true;
         return true;
@@ -2323,6 +2332,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--bs-moe-top-k") {
         CHECK_ARG
         params.bs_moe_top_k_override = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--bs-moe-top-k-prompt") {
+        CHECK_ARG
+        params.bs_moe_top_k_prompt = std::stoi(argv[i]);
         return true;
     }
     if (arg == "--bs-deny-layers" || arg == "--deny-layers") {
@@ -2812,12 +2826,18 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --bs-prompt-repair N",    "two-pass prompt: blurry pass with gate entropy scoring, then repair\n"
                                                                         "up to N difficult tokens (entropy > mean+stddev) with JIT sharp.\n"
                                                                         "Also always repairs first 3 + last 32 tokens. 0 = disabled" });
+    options.push_back({ "*",           "       --bs-repair-skip-pct N",  "layer-skip %% during KV repair (default: 0 = no skip/full quality,\n"
+                                                                        "-1 = same as --bs-cpu-skip-pct)" });
+    options.push_back({ "*",           "       --bs-no-jit-gen",         "disable JIT during generation. Relies on repaired KV cache for quality.\n"
+                                                                        "Generation runs blurry-only (~2-3x faster). Best with --bs-prompt-repair" });
     options.push_back({ "*",           "       --bs-moe-combination",   "MoE combination expert mode: for MoE models, only sharpen the\n"
                                                                         "experts activated by the router instead of all experts in a layer.\n"
                                                                         "Creates 'combination tensors' that are mostly blurry with selected\n"
                                                                         "expert slices replaced by sharp data. Reduces I/O by n_expert/n_used" });
     options.push_back({ "*",           "       --bs-moe-top-k N",       "override the number of active experts per token for MoE combination\n"
                                                                         "mode (default: 0 = use model's n_expert_used)" });
+    options.push_back({ "*",           "       --bs-moe-top-k-prompt N", "override n_expert_used for prompt only (0 = same as --bs-moe-top-k).\n"
+                                                                        "Use fewer experts during prompt for speed, full count for generation" });
     options.push_back({ "*",           "       --bs-cpu-skip-pct N",    "skip N%% of CPU MoE layers (evenly distributed, keeps first/last 3).\n"
                                                                         "Only skips layers on CPU (host) — GPU layers are never skipped.\n"
                                                                         "Creates fast tier for 3-tier inference:\n"
@@ -2826,6 +2846,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --bs-cpu-skip-list L1,L2,...",
                                                                         "explicit comma-separated list of CPU layer indices to skip\n"
                                                                         "overrides --bs-cpu-skip-pct auto-generation" });
+    options.push_back({ "*",           "       --bs-no-sharp-attn",      "skip non-expert permanent overlay entirely (gates still sharpened).\n"
+                                                                        "keeps all attention/norm weights at blurry quality" });
+    options.push_back({ "*",           "       --bs-no-sharp-attn-gpu",  "skip non-expert overlay on GPU tensors only (CPU tensors still sharp).\n"
+                                                                        "saves ~2-3 GB VRAM while keeping CPU attention/norm at sharp quality" });
 
     options.push_back({ "retrieval" });
     options.push_back({ "retrieval",   "       --context-file FNAME",   "file to load context from (repeat to specify multiple files)" });

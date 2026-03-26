@@ -313,6 +313,10 @@ bool server_context::load_model(const gpt_params& params_) {
                 // (bounded by --bs-gpu-budget-mb).
                 bs_moe_dynamic = true;
 
+                // Save the current n_expert_used (after any --bs-moe-top-k override)
+                // so we can restore it after prompt-specific top-k changes.
+                original_n_expert_used = llama_blurry_sharp_n_experts_used(bsctx);
+
                 // ---- Memory-tier initialization (VRAM > RAM > Swap > Disk) ----
                 // --bs-stage-swap implies --bs-precache-ram.
                 // Pre-read sharp tensor data into anonymous heap buffers so that
@@ -447,6 +451,38 @@ bool server_context::load_model(const gpt_params& params_) {
                     });
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Validate blurry-sharp flag combinations
+    // -----------------------------------------------------------------------
+    if (bsctx && bs_moe_dynamic) {
+        if (params_base.bs_sharp_experts_gpu == 0 && params_base.bs_sharp_experts_cpu == 0) {
+            LOG_ERROR("invalid config: --bs-sharp-experts-gpu 0 + --bs-sharp-experts-cpu 0 "
+                      "means JIT overlays zero experts. This will produce NaN logits. "
+                      "Set --bs-sharp-experts-cpu to at least 1.", {});
+            return false;
+        }
+        const int eff_cpu = (params_base.bs_sharp_experts_cpu == -2)
+            ? params_base.bs_sharp_experts_gpu
+            : params_base.bs_sharp_experts_cpu;
+        if (params_base.bs_sharp_experts_gpu == 0 && eff_cpu == 0) {
+            LOG_ERROR("invalid config: effective expert overlay count is 0 on both GPU and CPU. "
+                      "JIT will produce NaN logits.", {});
+            return false;
+        }
+        if (params_base.bs_prompt_repair > 0 && !params_base.bs_moe_combination) {
+            LOG_WARNING("--bs-prompt-repair requires --bs-moe-combination, ignoring", {});
+        }
+        if (params_base.bs_no_jit_gen && params_base.bs_prompt_repair == 0) {
+            LOG_WARNING("--bs-no-jit-gen without --bs-prompt-repair: generation will use blurry-only "
+                        "with no sharp KV repair. Quality may be poor.", {});
+        }
+        if (params_base.bs_sharp_experts_gpu == 0 && params_base.bs_gpu_cache_mb > 0) {
+            LOG_WARNING("--bs-gpu-cache %d with --bs-sharp-experts-gpu 0: GPU expert cache is "
+                        "allocated (%d MiB VRAM) but never used. Set --bs-gpu-cache 0 to free VRAM.",
+                        params_base.bs_gpu_cache_mb, params_base.bs_gpu_cache_mb);
         }
     }
 
@@ -3664,63 +3700,150 @@ void server_context::prompt_kv_repair(server_slot & slot) {
         {"max_repair_tokens", max_repair_tokens},
     });
 
-    LOG_INFO("prompt KV repair: starting JIT decode (one-at-a-time)", {
-        {"n_repair",  n_repair_final},
-        {"positions", repair_positions},
+    // Group repair positions into contiguous runs for batched decode.
+    // Contiguous tokens can be decoded in one llama_decode call (same as prompt),
+    // saving ~N-1 forward passes per run.  Isolated tokens decode one-at-a-time.
+    struct repair_run {
+        int32_t start_idx;  // index into repair_positions
+        int32_t count;      // number of contiguous positions
+    };
+    std::vector<repair_run> runs;
+    {
+        int32_t ri = 0;
+        while (ri < n_repair_final) {
+            int32_t run_start = ri;
+            while (ri + 1 < n_repair_final &&
+                   repair_positions[ri + 1] == repair_positions[ri] + 1) {
+                ri++;
+            }
+            runs.push_back({ run_start, ri - run_start + 1 });
+            ri++;
+        }
+    }
+
+    LOG_INFO("prompt KV repair: starting JIT decode", {
+        {"n_repair",    n_repair_final},
+        {"n_runs",      (int)runs.size()},
+        {"positions",   repair_positions},
     });
 
-    // Decode repair tokens one at a time — same code path as generation.
+    // Layer-skip during repair: reduces compute per repair token.
+    // When importance data is available, skip the LEAST important layers
+    // (lowest average entropy) instead of evenly distributed.
+    // --bs-repair-skip-pct: 0 = no skip (default), -1 = same as cpu-skip-pct, N = skip N%
+    const int repair_skip_pct = params_base.bs_repair_skip_pct;
+    bool repair_skip = false;
+    std::vector<int32_t> repair_skip_layers;
+
+    if (repair_skip_pct == -1 && !turbo_skip_layers.empty()) {
+        repair_skip_layers = turbo_skip_layers;
+        repair_skip = true;
+    } else if (repair_skip_pct > 0) {
+        const int n_layers_total = llama_n_layer(model);
+
+        if (!slot.repair_skip_layers_importance.empty()) {
+            // Importance-based: skip the least important layers (sorted ascending)
+            const int n_available = (int)slot.repair_skip_layers_importance.size();
+            const int n_skip = std::min(n_available, n_layers_total * repair_skip_pct / 100);
+            // repair_skip_layers_importance is already sorted least-important first
+            for (int j = 0; j < n_skip; j++) {
+                int32_t layer = slot.repair_skip_layers_importance[j];
+                // Keep first 3 and last 3 layers (critical for quality)
+                if (layer >= 3 && layer < n_layers_total - 3) {
+                    repair_skip_layers.push_back(layer);
+                }
+            }
+            std::sort(repair_skip_layers.begin(), repair_skip_layers.end());
+            repair_skip = !repair_skip_layers.empty();
+        } else {
+            // Fallback: evenly distributed skip
+            std::vector<int> cpu_layers;
+            for (int il = 3; il < n_layers_total - 3; il++) {
+                cpu_layers.push_back(il);
+            }
+            const int n_cpu = (int)cpu_layers.size();
+            const int n_skip = n_cpu * repair_skip_pct / 100;
+            if (n_skip > 0 && n_cpu > 0) {
+                for (int j = 0; j < n_skip; j++) {
+                    int idx = (int)((int64_t)j * n_cpu / n_skip);
+                    repair_skip_layers.push_back(cpu_layers[idx]);
+                }
+                std::sort(repair_skip_layers.begin(), repair_skip_layers.end());
+                repair_skip = true;
+            }
+        }
+    }
+
+    if (repair_skip) {
+        LOG_INFO("prompt KV repair: importance-based layer skip", {
+            {"n_skip", (int)repair_skip_layers.size()},
+            {"importance_data", !slot.repair_skip_layers_importance.empty()},
+        });
+        llama_set_skip_layers(ctx, repair_skip_layers.data(), (int32_t)repair_skip_layers.size());
+    }
+
     const llama_pos prompt_offset = (llama_pos)system_tokens.size();
     const int64_t t_repair_start = ggml_time_us();
-    llama_batch repair_batch = llama_batch_init(1, 0, 1);
     int n_repaired = 0;
 
-    for (int32_t ri = 0; ri < n_repair_final; ri++) {
-        const int32_t rp = repair_positions[ri];
-        const llama_token tok = slot.prompt_tokens[rp];
-        const llama_pos abs_pos = prompt_offset + rp;
-        const bool need_logits = (rp == n_prompt - 1);
+    for (const auto & run : runs) {
+        const int32_t run_count = run.count;
+        const int32_t first_pos = repair_positions[run.start_idx];
+        const int32_t last_pos  = repair_positions[run.start_idx + run_count - 1];
 
-        // Clear this position's KV entry
-        llama_kv_cache_seq_rm(ctx, slot.id, abs_pos, abs_pos + 1);
+        // Clear KV entries for this contiguous range
+        const llama_pos abs_start = prompt_offset + first_pos;
+        const llama_pos abs_end   = prompt_offset + last_pos + 1;
+        llama_kv_cache_seq_rm(ctx, slot.id, abs_start, abs_end);
 
-        // Build single-token batch
+        // Build batch for the run
+        llama_batch repair_batch = llama_batch_init(run_count, 0, 1);
         common_batch_clear(repair_batch);
-        common_batch_add(repair_batch, tok, abs_pos, { slot.id }, need_logits);
+        for (int32_t j = 0; j < run_count; j++) {
+            const int32_t rp = repair_positions[run.start_idx + j];
+            const llama_token tok = slot.prompt_tokens[rp];
+            const llama_pos abs_pos = prompt_offset + rp;
+            const bool need_logits = (rp == n_prompt - 1);
+            common_batch_add(repair_batch, tok, abs_pos, { slot.id }, need_logits);
+        }
 
-        // Decode with JIT sharp overlay
+        // Decode with JIT + layer-skip
         llama_blurry_sharp_start_jit(bsctx, ctx, /*host_only=*/ false);
         const int ret = llama_decode(ctx, repair_batch);
         llama_blurry_sharp_stop_jit(bsctx, ctx);
         llama_router_clear(ctx);
+        llama_batch_free(repair_batch);
 
         if (ret != 0) {
-            LOG_WARNING("prompt KV repair: decode failed", {
-                {"position", rp}, {"ret", ret}});
+            LOG_WARNING("prompt KV repair: batch decode failed", {
+                {"first_pos", first_pos}, {"count", run_count}, {"ret", ret}});
             break;
         }
-        n_repaired++;
+        n_repaired += run_count;
 
         const double elapsed_ms = (ggml_time_us() - t_repair_start) / 1000.0;
-        const std::string tok_str = common_token_to_piece(ctx, tok, true);
         LOG_INFO("prompt KV repair progress", {
             {"repaired",    n_repaired},
             {"total",       n_repair_final},
             {"pct",         100.0f * n_repaired / n_repair_final},
             {"prompt_pct",  100.0f * n_repaired / n_prompt},
-            {"position",    rp},
-            {"token",       tok_str},
-            {"entropy",     (rp < (int32_t)entropy.size()) ? entropy[rp] : 0.0f},
+            {"run_start",   first_pos},
+            {"run_count",   run_count},
             {"t_ms",        elapsed_ms},
         });
     }
 
-    llama_batch_free(repair_batch);
+    // Clear layer-skip after repair
+    if (repair_skip) {
+        llama_set_skip_layers(ctx, nullptr, 0);
+    }
 
     const double t_repair_ms = (ggml_time_us() - t_repair_start) / 1000.0;
     LOG_INFO("prompt KV repair complete", {
         {"n_repaired",  n_repaired},
         {"n_requested", n_repair_final},
+        {"n_runs",      (int)runs.size()},
+        {"layer_skip",  repair_skip},
         {"prompt_pct",  100.0f * n_repaired / std::max(1, n_prompt)},
         {"t_ms",        t_repair_ms},
         {"t_per_tok",   t_repair_ms / std::max(1, n_repaired)},
@@ -3928,6 +4051,14 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         const bool prompt_repair_active = (params_base.bs_prompt_repair > 0
                                            && bs_moe_active && !is_generation);
 
+        // Switch to prompt-specific top-k for faster prompt MoE compute
+        const int prompt_top_k = params_base.bs_moe_top_k_prompt;
+        const bool top_k_switched = (!is_generation && prompt_top_k > 0
+                                     && prompt_top_k != params_base.bs_moe_top_k_override);
+        if (top_k_switched) {
+            llama_model_set_n_expert_used(model, prompt_top_k);
+        }
+
         // Layer-skip during prompt (not generation).
         if (turbo_active && !bs_spec_verify && !is_generation) {
             llama_set_skip_layers(ctx, turbo_skip_layers_prompt.data(), (int32_t)turbo_skip_layers_prompt.size());
@@ -3940,12 +4071,13 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         //   - Speculative verify: OFF (handled separately in Tier 3)
         bool jit_this_batch = false;
         if (bs_moe_active && !bs_spec_verify) {
-            if (is_generation) {
+            if (is_generation && !params_base.bs_no_jit_gen) {
                 jit_this_batch = true;
-            } else if (!prompt_repair_active) {
+            } else if (!is_generation && !prompt_repair_active) {
                 jit_this_batch = true;  // original behavior: JIT all prompt
             }
             // else: prompt with repair → no JIT (blurry only)
+            // else: generation with --bs-no-jit-gen → no JIT (rely on repaired KV)
         }
         if (jit_this_batch) {
             llama_blurry_sharp_start_jit(bsctx, ctx, /*host_only=*/ false);
@@ -4046,10 +4178,48 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             llama_set_skip_layers(ctx, nullptr, 0);
         }
 
+        // Restore generation top-k after prompt chunk.
+        if (top_k_switched) {
+            llama_model_set_n_expert_used(model, original_n_expert_used);
+        }
+
         // Advance entropy offset after each prompt chunk so the next
         // chunk's tokens get appended (not overwritten) in the entropy vector.
         if (prompt_repair_active) {
             llama_router_advance_entropy_offset(ctx, batch_view.n_tokens);
+
+            // After the first prompt chunk, rebuild the skip pattern using
+            // actual layer importance data instead of evenly-distributed.
+            // Subsequent chunks skip the LEAST important layers.
+            if (turbo_active && !turbo_skip_layers_prompt.empty()) {
+                const int n_layers_total = llama_n_layer(model);
+                std::vector<int32_t> imp_layers(n_layers_total);
+                std::vector<float>   imp_scores(n_layers_total);
+                const int32_t n_imp = llama_router_get_layer_importance(
+                    ctx, imp_layers.data(), imp_scores.data(), n_layers_total);
+
+                if (n_imp > 0) {
+                    // Skip the same NUMBER of layers as before, but pick the
+                    // least important ones (imp_layers is sorted ascending).
+                    const int n_to_skip = (int)turbo_skip_layers_prompt.size();
+                    std::vector<int32_t> new_skip;
+                    for (int j = 0; j < n_imp && (int)new_skip.size() < n_to_skip; j++) {
+                        int32_t layer = imp_layers[j];
+                        if (layer >= 3 && layer < n_layers_total - 3) {
+                            new_skip.push_back(layer);
+                        }
+                    }
+                    if (!new_skip.empty()) {
+                        std::sort(new_skip.begin(), new_skip.end());
+                        turbo_skip_layers_prompt = new_skip;
+                        LOG_INFO("prompt skip refined by layer importance", {
+                            {"n_skip", (int)new_skip.size()},
+                            {"least_important_layer", new_skip[0]},
+                            {"most_important_kept", imp_layers[n_imp - 1]},
+                        });
+                    }
+                }
+            }
         }
 
         // ---------------------------------------------------------------
@@ -4277,6 +4447,14 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 const int32_t n_prompt = slot.n_prompt_tokens;
                 slot.repair_entropy.resize(n_prompt, 0.0f);
                 llama_router_get_token_entropy(ctx, slot.repair_entropy.data(), n_prompt);
+
+                // Save per-layer importance for importance-based skip
+                const int32_t n_model_layers = llama_n_layer(model);
+                slot.repair_skip_layers_importance.resize(n_model_layers);
+                const int32_t n_imp = llama_router_get_layer_importance(
+                    ctx, slot.repair_skip_layers_importance.data(), nullptr, n_model_layers);
+                slot.repair_skip_layers_importance.resize(n_imp);
+
                 slot.needs_kv_repair = true;
             }
 
@@ -4411,12 +4589,15 @@ void server_context::update_slots() {
     // TODO: simplify and improve
     context_shift();
     
-    // Deferred KV repair: wait until a few generation tokens have been decoded
-    // so that normal JIT generation warms the SSD page cache for the sharp file.
-    // Without this, the repair hits a completely cold Q3_K_M file and thrashes.
+    // Deferred KV repair: when generation uses JIT, wait for 3 tokens to warm
+    // the SSD cache.  When --bs-no-jit-gen, run repair immediately (generation
+    // won't warm the cache, and we need sharp KV ASAP).
     for (auto & slot : slots) {
-        if (slot.needs_kv_repair && slot.n_decoded >= 3) {
-            prompt_kv_repair(slot);
+        if (slot.needs_kv_repair) {
+            const int warmup = params_base.bs_no_jit_gen ? 0 : 3;
+            if (slot.n_decoded >= warmup) {
+                prompt_kv_repair(slot);
+            }
         }
     }
 

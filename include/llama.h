@@ -1999,6 +1999,15 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             float                      * out_scores,
             int32_t                      max_tokens);
 
+    // Get per-layer average entropy (importance score).
+    // Fills out_layers and out_avg_entropy sorted by entropy ascending
+    // (least important first).  Returns number of layers with data.
+    LLAMA_API int32_t llama_router_get_layer_importance(
+            const struct llama_context * ctx,
+            int32_t                    * out_layers,
+            float                      * out_avg_entropy,
+            int32_t                      max_layers);
+
     // Get the number of recorded token positions for a layer.
     // Returns 0 if no per-token data exists for this layer.
     LLAMA_API int32_t llama_router_n_tokens_for_layer(

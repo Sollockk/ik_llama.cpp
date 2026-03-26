@@ -524,6 +524,7 @@ struct gpt_params {
     // then verifies by sharpening only those experts.
     bool        bs_moe_combination     = false;       // enable MoE combination expert mode
     int         bs_moe_top_k_override  = 0;           // override n_expert_used (0=use model default)
+    int         bs_moe_top_k_prompt    = 0;           // override n_expert_used for prompt only (0=same as top_k_override)
 
     std::vector<int> bs_layer_allowlist;               // only sharpen these layers (empty=all)
     std::vector<int> bs_layer_denylist;                // never sharpen these layers (empty=none)
@@ -557,6 +558,8 @@ struct gpt_params {
     //         capped at N tokens.  Also always repairs first 3 + last 32 tokens.
     // 0 = disabled (all prompt gets JIT as before).
     int         bs_prompt_repair       = 0;
+    int         bs_repair_skip_pct     = 0;             // layer-skip % during repair (0 = no skip, -1 = same as cpu-skip-pct)
+    bool        bs_no_jit_gen          = false;         // disable JIT during generation (rely on repaired KV cache)
 };
 
 

@@ -3270,9 +3270,13 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
             entropy.resize(needed, 0.0f);
         }
 
+        // Parse layer index from tensor name "ffn_moe_probs-42"
+        const int layer_idx = atoi(t->name + probs_prefix_len);
+
         // Compute entropy per token: H = -sum(p * log(p + eps))
         // Store max across layers (worst-case difficulty)
         const float eps = 1e-10f;
+        float layer_entropy_sum = 0.0f;
         for (int64_t tok = 0; tok < n_tokens; ++tok) {
             const float * p = probs.data() + tok * n_expert;
             float h = 0.0f;
@@ -3281,12 +3285,18 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                     h -= p[e] * logf(p[e]);
                 }
             }
+            layer_entropy_sum += h;
             // Max across layers (with offset for multi-chunk)
             const size_t idx = (size_t)(offset + tok);
             if (h > entropy[idx]) {
                 entropy[idx] = h;
             }
         }
+
+        // Accumulate per-layer average entropy (for importance-based skip)
+        auto & le = lctx->router_layer_entropy[layer_idx];
+        le.first  += layer_entropy_sum;
+        le.second += (int32_t)n_tokens;
 
         // Chain to user callback if set
         if (lctx->cparams.cb_eval) {
@@ -7932,6 +7942,7 @@ void llama_router_start_recording(struct llama_context * ctx) {
     ctx->router_per_token_experts.clear();
     ctx->router_token_entropy.clear();
     ctx->router_entropy_offset = 0;
+    ctx->router_layer_entropy.clear();
     ctx->router_recording = true;
 }
 
@@ -7977,12 +7988,41 @@ int32_t llama_router_n_recorded_layers(const struct llama_context * ctx) {
     return (int32_t)ctx->router_expert_sets.size();
 }
 
+int32_t llama_router_get_layer_importance(
+        const struct llama_context * ctx,
+        int32_t                    * out_layers,
+        float                      * out_avg_entropy,
+        int32_t                      max_layers) {
+    if (!ctx) return 0;
+    const auto & le = ctx->router_layer_entropy;
+
+    // Build sortable list
+    struct entry { int32_t layer; float avg; };
+    std::vector<entry> entries;
+    entries.reserve(le.size());
+    for (const auto & [layer, pair] : le) {
+        float avg = pair.second > 0 ? pair.first / pair.second : 0.0f;
+        entries.push_back({ layer, avg });
+    }
+    // Sort ascending by average entropy (least important first)
+    std::sort(entries.begin(), entries.end(),
+              [](const entry & a, const entry & b) { return a.avg < b.avg; });
+
+    const int32_t n = std::min((int32_t)entries.size(), max_layers);
+    for (int32_t i = 0; i < n; i++) {
+        if (out_layers)      out_layers[i]      = entries[i].layer;
+        if (out_avg_entropy) out_avg_entropy[i]  = entries[i].avg;
+    }
+    return n;
+}
+
 void llama_router_clear(struct llama_context * ctx) {
     if (!ctx) return;
     ctx->router_expert_sets.clear();
     ctx->router_per_token_experts.clear();
     ctx->router_token_entropy.clear();
     ctx->router_entropy_offset = 0;
+    ctx->router_layer_entropy.clear();
 }
 
 void llama_router_set_entropy_recording(struct llama_context * ctx, bool enable) {

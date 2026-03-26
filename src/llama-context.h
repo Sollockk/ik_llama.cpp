@@ -225,6 +225,10 @@ struct llama_context {
     std::vector<float>  router_token_entropy;  // [n_tokens], max over layers
     int32_t             router_entropy_offset = 0; // offset for multi-chunk accumulation
 
+    // Per-layer average entropy (for importance-based layer-skip).
+    // key = layer index, value = {sum_entropy, n_tokens}
+    std::unordered_map<int32_t, std::pair<float, int32_t>> router_layer_entropy;
+
     // -----------------------------------------------------------------------
     // JIT (just-in-time) per-layer sharpening
     //
