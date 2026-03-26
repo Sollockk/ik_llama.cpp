@@ -622,6 +622,9 @@ struct llama_blurry_sharp_context {
 
     // -- lifecycle --
     bool initialized = false;
+
+    // Skip GPU tensors in apply_non_expert_permanent (saves VRAM)
+    bool skip_non_expert_gpu = false;
 };
 
 // ---------------------------------------------------------------------------

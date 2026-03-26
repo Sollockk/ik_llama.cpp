@@ -404,6 +404,9 @@ bool server_context::load_model(const gpt_params& params_) {
                 }
 
                 if (!params_base.bs_no_sharp_attn) {
+                    if (params_base.bs_no_sharp_attn_gpu) {
+                        llama_blurry_sharp_set_skip_non_expert_gpu(bsctx, true);
+                    }
                     const auto t0_ne = ggml_time_us();
                     int32_t n_upgraded = llama_blurry_sharp_apply_non_expert_permanent(bsctx);
                     const auto t1_ne = ggml_time_us();

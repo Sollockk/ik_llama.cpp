@@ -3500,6 +3500,12 @@ int32_t llama_blurry_sharp_apply_all(
 // attention weights that directly affect KV cache quality.
 // ---------------------------------------------------------------------------
 
+void llama_blurry_sharp_set_skip_non_expert_gpu(
+        llama_blurry_sharp_context * bsctx, bool skip_gpu) {
+    if (!bsctx) return;
+    bsctx->skip_non_expert_gpu = skip_gpu;
+}
+
 int32_t llama_blurry_sharp_apply_non_expert_permanent(
         llama_blurry_sharp_context * bsctx) {
     if (!bsctx || !bsctx->initialized) return 0;
@@ -3540,6 +3546,13 @@ int32_t llama_blurry_sharp_apply_non_expert_permanent(
         }
 
         bool is_gpu = base_tensor->buffer && !ggml_backend_buffer_is_host(base_tensor->buffer);
+
+        // Skip GPU tensors if requested (saves VRAM for constrained setups)
+        if (is_gpu && bsctx->skip_non_expert_gpu) {
+            ++n_skipped;
+            continue;
+        }
+
         ggml_type old_type = base_tensor->type;
         int64_t sharp_bytes = bs_overlay_single_tensor_permanent(bsctx, sharp_info, base_tensor);
         if (sharp_bytes < 0) {

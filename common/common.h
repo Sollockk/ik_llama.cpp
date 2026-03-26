@@ -549,6 +549,7 @@ struct gpt_params {
     int         bs_ram_cache_mb        = 0;            // RAM expert cache in MiB (0 = auto 4096, -1 = off)
     bool        bs_flash_experts       = false;         // flash-moe style: stream Q4_K_M experts from SSD
     bool        bs_no_sharp_attn       = false;         // keep blurry attention/norm weights (skip non-expert overlay)
+    bool        bs_no_sharp_attn_gpu   = false;         // skip non-expert overlay on GPU tensors only (save VRAM)
 
     // Two-pass prompt with entropy-guided KV repair.
     // Pass 1: fast blurry prompt (+ layer-skip).  Gate entropy recorded per token.

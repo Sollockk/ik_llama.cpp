@@ -1715,6 +1715,12 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // with sharp data.  Expert tensors are skipped (handled by JIT).
     // Call once at startup after init to upgrade GPU attention quality.
     // Returns the number of tensors successfully overlaid.
+    // When skip_gpu is true, apply_non_expert_permanent skips GPU-resident
+    // tensors, only sharpening CPU tensors.  Saves VRAM on constrained setups.
+    LLAMA_API void llama_blurry_sharp_set_skip_non_expert_gpu(
+            struct llama_blurry_sharp_context * bsctx,
+            bool                                skip_gpu);
+
     LLAMA_API int32_t llama_blurry_sharp_apply_non_expert_permanent(
             struct llama_blurry_sharp_context * bsctx);
 
