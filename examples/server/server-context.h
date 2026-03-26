@@ -148,6 +148,7 @@ struct server_slot {
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
 
     bool    needs_kv_repair = false;          // deferred entropy-guided KV repair
+    int32_t repair_cache_start = 0;         // prompt position where new decoding started
     std::vector<float> repair_entropy;      // saved entropy scores (cleared by generation JIT)
     int32_t n_past_se = 0; // self-extend
 

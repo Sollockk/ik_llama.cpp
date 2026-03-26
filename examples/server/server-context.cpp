@@ -2899,6 +2899,12 @@ void server_context::context_shift() {
                     discard_n_kv_and_cache_tokens(ctx, slot, n_kept, n_discard_cache);
                     slot.n_past -= n_discard_cache;
                     slot.truncated = true;
+
+                    // After context shift, reset repair boundary so next prompt
+                    // repair considers the full surviving context.  Some previously
+                    // repaired tokens may have been evicted; any tokens that get
+                    // re-decoded will be candidates for repair again.
+                    slot.repair_cache_start = 0;
                 }
 
             }
@@ -3574,16 +3580,17 @@ void server_context::prompt_kv_repair(server_slot & slot) {
 
     const int32_t n_prompt = slot.n_prompt_tokens;
     const int32_t max_repair_tokens = params_base.bs_prompt_repair; // cap
+    const int32_t new_start = slot.repair_cache_start; // tokens before this are cache hits
 
     // Use saved entropy (context's copy was cleared by generation JIT)
     std::vector<float> & entropy = slot.repair_entropy;
     const int32_t n_entropy = (int32_t)entropy.size();
     entropy.resize(n_prompt, 0.0f); // pad if shorter
 
-    // Compute threshold: mean + 1 stddev of non-zero entropy values
+    // Compute threshold from entropy of NEWLY DECODED tokens only
     float sum_ent = 0.0f, sum_sq = 0.0f, max_ent = 0.0f;
     int32_t n_nonzero = 0;
-    for (int32_t p = 0; p < n_prompt; p++) {
+    for (int32_t p = new_start; p < n_prompt; p++) {
         if (entropy[p] > 0.0f) {
             sum_ent += entropy[p];
             sum_sq += entropy[p] * entropy[p];
@@ -3599,9 +3606,9 @@ void server_context::prompt_kv_repair(server_slot & slot) {
     // Dynamic threshold: repair tokens above mean + 1 stddev
     const float entropy_threshold = mean_ent + stddev_ent;
 
-    // Select tokens above entropy threshold (skip tokens with no entropy data)
+    // Select tokens above entropy threshold — only from newly decoded range
     std::vector<int32_t> repair_positions;
-    for (int32_t p = 0; p < n_prompt; p++) {
+    for (int32_t p = new_start; p < n_prompt; p++) {
         if (entropy[p] > 0.0f && entropy[p] > entropy_threshold) {
             repair_positions.push_back(p);
         }
@@ -3616,29 +3623,32 @@ void server_context::prompt_kv_repair(server_slot & slot) {
         std::sort(repair_positions.begin(), repair_positions.end());
     }
 
-    // Position heuristic: always include first 3 + last 32 tokens
+    // Position heuristic: first 3 + last 32 of the NEW range only.
+    // Tokens before new_start are cache hits from previous turns (already repaired).
     auto add_if_missing = [&](int32_t p) {
-        if (p >= 0 && p < n_prompt) {
+        if (p >= new_start && p < n_prompt) {
             if (std::find(repair_positions.begin(), repair_positions.end(), p) == repair_positions.end()) {
                 repair_positions.push_back(p);
             }
         }
     };
-    for (int32_t p = 0; p < std::min(3, n_prompt); p++) add_if_missing(p);
-    for (int32_t p = std::max(0, n_prompt - 32); p < n_prompt; p++) add_if_missing(p);
+    for (int32_t p = new_start; p < std::min(new_start + 3, n_prompt); p++) add_if_missing(p);
+    for (int32_t p = std::max(new_start, n_prompt - 32); p < n_prompt; p++) add_if_missing(p);
     std::sort(repair_positions.begin(), repair_positions.end());
 
     const int32_t n_repair_final = (int32_t)repair_positions.size();
     // Count how many tokens were selected by entropy vs position heuristic
     int32_t n_by_entropy = 0;
     for (int32_t rp : repair_positions) {
-        if (entropy[rp] > entropy_threshold && rp >= 3 && rp < n_prompt - 32) {
+        if (entropy[rp] > entropy_threshold && rp >= new_start + 3 && rp < n_prompt - 32) {
             n_by_entropy++;
         }
     }
 
     LOG_INFO("prompt KV repair: scoring", {
         {"n_prompt",          n_prompt},
+        {"new_start",         new_start},
+        {"n_new_tokens",      n_prompt - new_start},
         {"n_entropy_recorded", n_entropy},
         {"n_nonzero",         n_nonzero},
         {"entropy_mean",      mean_ent},
@@ -3944,6 +3954,12 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         if (prompt_repair_active && !llama_router_is_recording(ctx)) {
             llama_router_start_recording(ctx);
             llama_router_set_entropy_recording(ctx, true);
+            // Record where new decoding starts — everything before is cache hits
+            // and already has good KV from previous turns.
+            const llama_pos prompt_offset = (llama_pos)system_tokens.size();
+            for (auto & s : slots) {
+                s.repair_cache_start = (int32_t)(batch_view.pos[0] - prompt_offset);
+            }
         }
 
         // Speculative verify: record router data during blurry pass
