@@ -847,6 +847,7 @@ extern "C" {
         int size;
         int n_nodes;
         int n_leafs;
+        int n_batch;
 
         struct ggml_tensor ** nodes;
         struct ggml_tensor ** grads;

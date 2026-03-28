@@ -39,7 +39,7 @@ static inline const char * llm_expert_gating_func_name(llm_expert_gating_func_ty
 
 void llm_load_hparams(
         llama_model_loader & ml,
-        llama_model & model) {
+        llama_model & model, bool ignore_vocab) {
     auto & hparams = model.hparams;
     const gguf_context * ctx = ml.meta;
 
@@ -54,11 +54,13 @@ void llm_load_hparams(
         model.gguf_kv.emplace(name, value);
     }
 
+    ml.get_key(LLM_KV_BLOCK_COUNT,       hparams.n_layer);
+
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, model.name, false);
 
     // get hparams kv
-    ml.get_key(LLM_KV_VOCAB_SIZE, hparams.n_vocab, false) || ml.get_arr_n(LLM_KV_TOKENIZER_LIST, hparams.n_vocab);
+    ml.get_key(LLM_KV_VOCAB_SIZE, hparams.n_vocab, false) || ml.get_arr_n(LLM_KV_TOKENIZER_LIST, hparams.n_vocab, !ignore_vocab);
 
     // everything past this point is not vocab-related
     if (hparams.vocab_only) {
@@ -67,7 +69,6 @@ void llm_load_hparams(
 
     ml.get_key(LLM_KV_CONTEXT_LENGTH,    hparams.n_ctx_train);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,  hparams.n_embd);
-    ml.get_key(LLM_KV_BLOCK_COUNT,       hparams.n_layer);
     ml.get_key(LLM_KV_EXPERT_COUNT,      hparams.n_expert,      false);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used, false);
 
@@ -501,8 +502,8 @@ void llm_load_hparams(
                 }
 
                 switch (hparams.n_layer) {
-                    case 28: model.type = e_model::MODEL_80B_A3B; break;
-                    case 48: model.type = e_model::MODEL_80B_A3B; break;
+                    case 40: model.type = e_model::MODEL_35B_A3B; break;
+                    case 48: model.type = e_model::MODEL_122B_A10B; break;
                     case 60: model.type = e_model::MODEL_397B_A17B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
@@ -529,7 +530,8 @@ void llm_load_hparams(
                 }
 
                 switch (hparams.n_layer) {
-                    case 24: model.type = e_model::MODEL_2B; break;
+                    case 24: model.type = hparams.n_embd == 1024 ? e_model::MODEL_0_8B : e_model::MODEL_2B; break;
+                    case 32: model.type = hparams.n_embd == 2560 ? e_model::MODEL_4B   : e_model::MODEL_9B; break;
                     case 64: model.type = e_model::MODEL_27B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
@@ -835,11 +837,14 @@ void llm_load_hparams(
                     model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_DEEPSEEK2:
             {
+                int expected_head_size_k = model.arch == LLM_ARCH_DEEPSEEK2 ? 576 : 320;
+                int expected_head_size_v = model.arch == LLM_ARCH_DEEPSEEK2 ? 512 : 256;
                 if (hparams.n_head_kv() == 1) {
                     int n_nead_kv = hparams.n_gqa();
-                    if (n_nead_kv%4 != 0 || hparams.n_embd_head_k != 576 || hparams.n_embd_head_v != 512 ||
+                    if (n_nead_kv%4 != 0 || hparams.n_embd_head_k != expected_head_size_k || hparams.n_embd_head_v != expected_head_size_v ||
                         hparams.n_rot != 64) {
                         printf("==========================================================================\n");
                         printf("Detected incompatible DeepSeek model without a known way to fix it.\n");
@@ -856,7 +861,7 @@ void llm_load_hparams(
                     ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   hparams.n_embd_head_k);
                     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, hparams.n_embd_head_v);
                 }
-                bool is_lite = (hparams.n_layer == 27 || hparams.n_layer == 26);
+                bool is_lite = (hparams.n_layer == 27 || hparams.n_layer == 26) || (hparams.n_layer == 48 && hparams.n_vocab == 128256);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
                 ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT, hparams.n_layer_dense_lead);
                 if (!is_lite) {
@@ -886,6 +891,7 @@ void llm_load_hparams(
 
                 switch (hparams.n_layer) {
                     case 27: model.type = e_model::MODEL_16B; break;
+                    case 36: model.type = e_model::MODEL_119B_A6B; break;
                     case 47: model.type = e_model::MODEL_30B_A3B; break; // GLM-4.7-Flash
                     case 60: model.type = e_model::MODEL_236B; break;
                     case 61: model.type = e_model::MODEL_671B; break;

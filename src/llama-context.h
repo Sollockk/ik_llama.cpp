@@ -49,6 +49,9 @@ struct llama_kv_cache {
     uint32_t size = 0;
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
+    // Track's main model's head position for MTP KV cache operations
+    uint32_t mtp_kv_head_hint = 0;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -63,6 +66,7 @@ struct llama_kv_cache {
 
     std::vector<llama_split_tensor> split_k_l;
     std::vector<llama_split_tensor> split_v_l;
+    std::vector<llama_split_tensor> split_s_l;
 
     std::vector<struct ggml_context *> ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -300,7 +304,9 @@ struct llama_context {
     std::vector<CacheCopy> cache_copies;
 
     bool update_cache_copies();
+
     bool prepare_mtp_graph_inputs(
         struct llama_context & lctx);
     void set_mtp_op_type(llama_mtp_op_type value);
+
 };

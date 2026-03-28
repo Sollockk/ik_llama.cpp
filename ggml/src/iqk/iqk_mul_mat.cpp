@@ -503,10 +503,36 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         int typeB, const void * B, long strideB,
         float * C, long stride_C, int ith, int nth) {
 
+    constexpr int k_min_step = 32;
+
     MulMat mm;
 
+    size_t row_size_qx = strideA; //*ggml_type_size(ggml_type(typeA));
+    size_t row_size_qy = strideB; //*ggml_type_size(ggml_type(typeB));
+
+    if (Nx/nth < k_min_step) {
+        if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
+            return false;
+        }
+        const int min_step = Ny <= 16 ? 16 : 32;
+        int ntile_x = (Nx + min_step - 1)/min_step;
+        int ntile_y = (Ny + min_step - 1)/min_step;
+        int ntile   = ntile_x * ntile_y;
+        for (int itile = ith; itile < ntile; itile += nth) {
+            int iy = (itile / ntile_x) * min_step;
+            int ix = (itile % ntile_x) * min_step;
+            int nrc_x = std::min<int>(min_step, Nx - ix);
+            int nrc_y = std::min<int>(min_step, Ny - iy);
+            DataInfo info{C + ix, (const char *)B, (size_t)stride_C, row_size_qy, iy, 1, nullptr, 0};
+            mm.mul_mat_NxM(ne00, (const char *)A + ix*row_size_qx, row_size_qx, info, nrc_x, iy + nrc_y);
+        }
+        return true;
+    }
+
+    int npt = (Nx + nth - 1)/nth;
+
     auto etypeA = ggml_type(typeA);
-    if (auto dequant_type = MulMat::is_dequant_better(etypeA, Ny);
+    if (auto dequant_type = MulMat::is_dequant_better(etypeA, Ny); npt >= 16 &&
              dequant_type != etypeA && MulMat::prepare(dequant_type, typeB, ne00, mm, Ny) &&
              Nx%MulMat::num_rows(ggml_type(dequant_type)) == 0) {
 
@@ -522,8 +548,6 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
 
         size_t row_size_qx = ggml_row_size(dequant_type, ne00);
         size_t row_size_qy = strideB;
-
-        //printf("Dequant mul mat %s x %s: ne00 = %d, row_size = %d\n", ggml_type_name(dequant_type), ggml_type_name(ggml_type(typeB)), (int)ne00, (int)row_size_qx);
 
         DataInfo info{C + first_x, (const char *)B, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
 
@@ -548,10 +572,6 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         return false;
     }
 
-    size_t row_size_qx = strideA; //*ggml_type_size(ggml_type(typeA));
-    size_t row_size_qy = strideB; //*ggml_type_size(ggml_type(typeB));
-    //if (ith == 0) printf("%s: ne00 = %d, row_size_qx = %d, strideA = %d\n", __func__, int(ne00), int(row_size_qx), int(strideA));
-
     auto num_rows = MulMat::num_rows(ggml_type(typeA));
     if (Nx%num_rows) {
         fprintf(stderr, "%s: Nx = %d, Ny = %d, ne00 = %d, num_rows = %d, types = %s, %s\n", __func__, (int)Nx, (int)Ny,
@@ -559,6 +579,25 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         GGML_ASSERT(false);
     }
     GGML_ASSERT(Nx%num_rows == 0);
+
+    if (npt <= 16 && nth%2 == 0 && Ny >= 16 && Ny%2 == 0) {
+        int nth_new = nth/2;
+        auto nrc_x = num_rows*((Nx/num_rows + nth_new - 1)/nth_new);
+        if (ith < nth_new) {
+            auto first_x = ith*nrc_x;
+            nrc_x = std::min(nrc_x, Nx - first_x);
+            DataInfo info{C + first_x, (const char *)B, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
+            mm.mul_mat_NxM(ne00, (const char *)A + row_size_qx*first_x, row_size_qx, info, nrc_x, Ny/2);
+        } else {
+            ith -= nth_new;
+            auto first_x = ith*nrc_x;
+            nrc_x = std::min(nrc_x, Nx - first_x);
+            DataInfo info{C + first_x + (Ny/2)*stride_C, (const char *)B + (Ny/2)*row_size_qy, (size_t)stride_C, row_size_qy, 0, 1, nullptr, 0};
+            mm.mul_mat_NxM(ne00, (const char *)A + row_size_qx*first_x, row_size_qx, info, nrc_x, Ny/2);
+        }
+        return true;
+    }
+
     auto nrc_x = (Nx/num_rows + nth - 1)/nth;
     auto first_x = ith*nrc_x;
     if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
@@ -747,6 +786,8 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
 
     const mmid_row_mapping * row_mapping = (const mmid_row_mapping *)vrow_mapping;
     //assert(row_mapping != nullptr);
+    size_t row_size_qx = strideA;
+    size_t row_size_qy = strideB;
 
     MulMat mm;
 
@@ -797,8 +838,6 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
     if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
         return false;
     }
-    size_t row_size_qx = strideA;
-    size_t row_size_qy = strideB;
     auto num_rows = MulMat::num_rows(ggml_type(typeA));
     GGML_ASSERT(Nx%num_rows == 0);
     auto nrc_x = (Nx/num_rows + nth - 1)/nth;
@@ -1348,6 +1387,10 @@ bool iqk_flash_attn_impl(int int_type_k,         // type of k
         return iqk_fa_576_512(int_type_k, int_type_v, nq1, nk1, stride_q, stride_k, stride_v, stride_m, stride_qkv,
                 q, k, v, mask, scale, softcap, qkv, sinksf, M, S);
     }
+    if (Dk == 320 && Dv == 256) {
+        return iqk_fa_320_256(int_type_k, int_type_v, nq1, nk1, stride_q, stride_k, stride_v, stride_m, stride_qkv,
+                q, k, v, mask, scale, softcap, qkv, sinksf, M, S);
+    }
 
     if (Dk == 192 && Dv == 128) {
         return iqk_fa_192_128(int_type_k, int_type_v, nq1, nk1, stride_q, stride_k, stride_v, stride_m, stride_qkv,
@@ -1386,7 +1429,8 @@ bool iqk_flash_attn_impl(int int_type_k,         // type of k
 namespace {
 #ifdef __ARM_NEON
 template <int head_dim>
-void iqk_fused_delta_net_neon_impl(int n_heads, int n_tokens, int n_seqs,
+void iqk_fused_delta_net_neon_impl(int n_heads, int gqa_ratio, int repeat_type, int n_tokens, int n_seqs,
+        size_t vnb1, size_t vnb2, size_t vnb3,
         const float * q_data, const float * k_data, const float * v_data, const float * g_data, const float * beta_data,
         const float * state_in, float * out_data, float * state_out, int ith, int nth) {
     const int total_heads = n_heads * n_seqs;
@@ -1406,13 +1450,14 @@ void iqk_fused_delta_net_neon_impl(int n_heads, int n_tokens, int n_seqs,
     for (int h_idx = h_start; h_idx < h_end; ++h_idx) {
         const int batch_idx = h_idx / n_heads;
         const int head_idx  = h_idx % n_heads;
+        const int head_idx_kq = repeat_type == 0 ? head_idx / gqa_ratio : head_idx % (n_heads/gqa_ratio);
 
-        const int qkv_head_offset  = batch_idx * (head_dim * n_tokens * n_heads) + head_idx * (head_dim * n_tokens);
-        const int qkv_token_stride = head_dim;
-        const int g_head_offset    = batch_idx * (n_tokens * n_heads) + head_idx * n_tokens;
-        const int state_head_offset = batch_idx * (head_dim * head_dim * n_heads) + head_idx * (head_dim * head_dim);
-        const int out_head_offset  = batch_idx * (head_dim * n_heads * n_tokens) + head_idx * head_dim;
-        const int out_token_stride = head_dim * n_heads;
+        const int qkv_head_offset_kq  = batch_idx * (head_dim * n_tokens * n_heads/gqa_ratio) + head_idx_kq * (head_dim * n_tokens);
+        const int qkv_token_stride    = head_dim;
+        const int g_batch_offset      = batch_idx * n_tokens * n_heads;
+        const int state_head_offset   = batch_idx * (head_dim * head_dim * n_heads) + head_idx * (head_dim * head_dim);
+        const int out_head_offset     = batch_idx * (head_dim * n_heads * n_tokens) + head_idx * head_dim;
+        const int out_token_stride    = head_dim * n_heads;
 
         for (int i = 0; i < head_dim * head_dim; ++i) {
             state_out[state_head_offset + i] = state_in[state_head_offset + i];
@@ -1420,14 +1465,13 @@ void iqk_fused_delta_net_neon_impl(int n_heads, int n_tokens, int n_seqs,
 
         float * state = state_out + state_head_offset;
 
-
         for (int t = 0; t < n_tokens; ++t) {
-            const float * q_t = q_data + qkv_head_offset + t * qkv_token_stride;
-            const float * k_t = k_data + qkv_head_offset + t * qkv_token_stride;
-            const float * v_t = v_data + qkv_head_offset + t * qkv_token_stride;
+            const float * q_t = q_data + qkv_head_offset_kq + t * qkv_token_stride;
+            const float * k_t = k_data + qkv_head_offset_kq + t * qkv_token_stride;
+            const float * v_t = v_data + batch_idx * vnb3 + head_idx * vnb2 + t * vnb1;
 
-            const float g_val    = g_data[g_head_offset + t];
-            const float beta_raw = beta_data[g_head_offset + t];
+            const float g_val    = g_data[g_batch_offset + t * n_heads + head_idx];
+            const float beta_raw = beta_data[g_batch_offset + t * n_heads + head_idx];
 
             float kq_sum    = 0.0f;
             auto vqksum = vdupq_n_f32(0.0f);
@@ -1492,11 +1536,13 @@ void iqk_fused_delta_net_neon_impl(int n_heads, int n_tokens, int n_seqs,
 }
 #endif
 template <int head_dim>
-void iqk_fused_delta_net_impl(int n_heads, int n_tokens, int n_seqs,
+void iqk_fused_delta_net_impl(int n_heads, int gqa_ratio, int repeat_type, int n_tokens, int n_seqs,
+        size_t vnb1, size_t vnb2, size_t vnb3,
         const float * q_data, const float * k_data, const float * v_data, const float * g_data, const float * beta_data,
         const float * state_in, float * out_data, float * state_out, int ith, int nth) {
 #ifdef __ARM_NEON
-    iqk_fused_delta_net_neon_impl<head_dim>(n_heads, n_tokens, n_seqs, q_data, k_data, v_data, g_data, beta_data, state_in, out_data, state_out, ith, nth);
+    iqk_fused_delta_net_neon_impl<head_dim>(n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3,
+            q_data, k_data, v_data, g_data, beta_data, state_in, out_data, state_out, ith, nth);
     return;
 #endif
     const int total_heads = n_heads * n_seqs;
@@ -1510,16 +1556,21 @@ void iqk_fused_delta_net_impl(int n_heads, int n_tokens, int n_seqs,
 
     const float scale = 1.0f / sqrtf((float) head_dim);
 
+#ifdef __AVX512F__
+    __m512 v_prime[head_dim/16], out_val[head_dim/16];
+#else
     float v_new_buf[head_dim];
     float v_prime[head_dim], out_val[head_dim];
+#endif
 
     for (int h_idx = h_start; h_idx < h_end; ++h_idx) {
         const int batch_idx = h_idx / n_heads;
         const int head_idx  = h_idx % n_heads;
+        const int head_idx_kq = repeat_type == 0 ? head_idx / gqa_ratio : head_idx % (n_heads/gqa_ratio);
 
-        const int qkv_head_offset  = batch_idx * (head_dim * n_tokens * n_heads) + head_idx * (head_dim * n_tokens);
+        const int qkv_head_offset_kq  = batch_idx * (head_dim * n_tokens * n_heads/gqa_ratio) + head_idx_kq * (head_dim * n_tokens);
         const int qkv_token_stride = head_dim;
-        const int g_head_offset    = batch_idx * (n_tokens * n_heads) + head_idx * n_tokens;
+        const int g_batch_offset   = batch_idx * n_tokens * n_heads;
         const int state_head_offset = batch_idx * (head_dim * head_dim * n_heads) + head_idx * (head_dim * head_dim);
         const int out_head_offset  = batch_idx * (head_dim * n_heads * n_tokens) + head_idx * head_dim;
         const int out_token_stride = head_dim * n_heads;
@@ -1531,15 +1582,23 @@ void iqk_fused_delta_net_impl(int n_heads, int n_tokens, int n_seqs,
         float * state = state_out + state_head_offset;
 
         for (int t = 0; t < n_tokens; ++t) {
-            const float * q_t = q_data + qkv_head_offset + t * qkv_token_stride;
-            const float * k_t = k_data + qkv_head_offset + t * qkv_token_stride;
-            const float * v_t = v_data + qkv_head_offset + t * qkv_token_stride;
+            const float * q_t = q_data + qkv_head_offset_kq + t * qkv_token_stride;
+            const float * k_t = k_data + qkv_head_offset_kq + t * qkv_token_stride;
+            const float * v_t = v_data + batch_idx * vnb3 + head_idx * vnb2 + t * vnb1;
 
-            const float g_val    = g_data[g_head_offset + t];
-            const float beta_raw = beta_data[g_head_offset + t];
+            const float g_val    = g_data[g_batch_offset + t * n_heads + head_idx];
+            const float beta_raw = beta_data[g_batch_offset + t * n_heads + head_idx];
 
             float kq_sum    = 0.0f;
-#ifdef __AVX2__
+#if defined __AVX512F__
+            auto vqksum = _mm512_setzero_ps();
+            for (int i = 0; i < head_dim; i += 16) {
+                auto vq = _mm512_loadu_ps(q_t + i);
+                auto vk = _mm512_loadu_ps(k_t + i);
+                vqksum = _mm512_fmadd_ps(vk, vq, vqksum);
+            }
+            kq_sum = _mm512_reduce_add_ps(vqksum);
+#elif defined __AVX2__
             auto vqksum = _mm256_setzero_ps();
             for (int i = 0; i < head_dim; i += 8) {
                 auto vq = _mm256_loadu_ps(q_t + i);
@@ -1560,6 +1619,42 @@ void iqk_fused_delta_net_impl(int n_heads, int n_tokens, int n_seqs,
 
             float * out_t = out_data + out_head_offset + t * out_token_stride;
 
+#ifdef __AVX512F__
+            for (int j = 0; j < head_dim/16; ++j) {
+                v_prime[j] = out_val[j] = _mm512_setzero_ps();
+            }
+            for (int col = 0; col < head_dim; ++col) {
+                auto k_col = _mm512_set1_ps(k_t[col]);
+                auto q_col = _mm512_set1_ps(q_t[col]);
+                for (int j = 0; j < head_dim/16; ++j) {
+                    auto s = _mm512_loadu_ps(state + col * head_dim + 16*j);
+                    v_prime[j] = _mm512_fmadd_ps(s, k_col, v_prime[j]);
+                    out_val[j] = _mm512_fmadd_ps(s, q_col, out_val[j]);
+                }
+            }
+            auto c1 = _mm512_set1_ps(beta_val);
+            auto c2 = _mm512_set1_ps(beta_val*decay);
+            auto c3 = _mm512_set1_ps(decay*scale);
+            auto c4 = _mm512_set1_ps(attn_score);
+            for (int j = 0; j < head_dim/16; ++j) {
+                auto v = _mm512_loadu_ps(v_t + 16*j);
+                v_prime[j] = _mm512_sub_ps(_mm512_mul_ps(v, c1), _mm512_mul_ps(v_prime[j], c2));
+                auto oval = _mm512_fmadd_ps(v_prime[j], c4, _mm512_mul_ps(out_val[j], c3));
+                _mm512_storeu_ps(out_t + 16*j, oval);
+            }
+            auto vmin = _mm512_set1_ps(-1e6f);
+            auto vmax = _mm512_set1_ps( 1e6f);
+            auto vd   = _mm512_set1_ps(decay);
+            for (int col = 0; col < head_dim; ++col) {
+                auto vk = _mm512_set1_ps(k_t[col]);
+                for (int j = 0; j < head_dim/16; ++j) {
+                    auto vs = _mm512_loadu_ps(state + col * head_dim + 16*j);
+                    vs = _mm512_fmadd_ps(v_prime[j], vk, _mm512_mul_ps(vs, vd));
+                    vs = _mm512_max_ps(vmin, _mm512_min_ps(vmax, vs));
+                    _mm512_storeu_ps(state + col * head_dim + 16*j, vs);
+                }
+            }
+#else
             std::memset(v_prime, 0, head_dim*sizeof(float));
             std::memset(out_val, 0, head_dim*sizeof(float));
             for (int col = 0; col < head_dim; ++col) {
@@ -1604,22 +1699,24 @@ void iqk_fused_delta_net_impl(int n_heads, int n_tokens, int n_seqs,
                 }
             }
 #endif
+#endif
         }
     }
 }
 }
 
-bool iqk_fused_delta_net(int head_dim, int n_heads, int n_tokens, int n_seqs,
+bool iqk_fused_delta_net(int head_dim, int n_heads, int gqa_ratio, int repeat_type, int n_tokens, int n_seqs,
+        size_t vnb1, size_t vnb2, size_t vnb3,
         const float * q_data, const float * k_data, const float * v_data, const float * g_data, const float * beta_data,
         const float * state_in, float * out_data, float * state_out, int ith, int nth) {
     if (head_dim != 64 && head_dim != 128) {
         return false;
     }
     if (head_dim == 64) {
-        iqk_fused_delta_net_impl<64>(n_heads, n_tokens, n_seqs, q_data, k_data, v_data, g_data, beta_data, state_in,
+        iqk_fused_delta_net_impl<64>(n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3, q_data, k_data, v_data, g_data, beta_data, state_in,
                 out_data, state_out, ith, nth);
     } else {
-        iqk_fused_delta_net_impl<128>(n_heads, n_tokens, n_seqs, q_data, k_data, v_data, g_data, beta_data, state_in,
+        iqk_fused_delta_net_impl<128>(n_heads, gqa_ratio, repeat_type, n_tokens, n_seqs, vnb1, vnb2, vnb3, q_data, k_data, v_data, g_data, beta_data, state_in,
                 out_data, state_out, ith, nth);
     }
     return true;
@@ -1658,7 +1755,7 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long /*Nx*/, long /*Ny*/, long /*n
     return false;
 }
 
-bool iqk_fused_delta_net(int, int, int, int,
+bool iqk_fused_delta_net(int, int, int, int, int, int,
         const float *, const float *, const float *, const float *, const float *,
         const float *, float *, float *, int, int) {
     return false;
