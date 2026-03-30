@@ -94,6 +94,8 @@ struct bs_pread_task {
 };
 
 // Simple persistent I/O thread pool — avoids creating/destroying threads per call.
+// 1:1 worker-to-task mapping: worker `id` processes tasks[id].
+// For more tasks than MAX_WORKERS, the caller batches via dispatch_batched().
 struct bs_io_pool {
     static constexpr int MAX_WORKERS = 16;
 
@@ -133,8 +135,9 @@ struct bs_io_pool {
         }
     }
 
+    // Dispatch up to MAX_WORKERS tasks (1:1 mapping).
     void dispatch(bs_pread_task * t, int n) {
-        ensure_workers(n);
+        ensure_workers(std::min(n, MAX_WORKERS));
         {
             std::lock_guard<std::mutex> lock(mtx);
             tasks   = t;
@@ -147,6 +150,14 @@ struct bs_io_pool {
             cv_done.wait(lock, [this]() { return n_done.load() >= n_tasks; });
             tasks   = nullptr;
             n_tasks = 0;
+        }
+    }
+
+    // Dispatch any number of tasks by batching into chunks of MAX_WORKERS.
+    void dispatch_batched(bs_pread_task * t, int n) {
+        for (int off = 0; off < n; off += MAX_WORKERS) {
+            int batch = std::min(n - off, MAX_WORKERS);
+            dispatch(t + off, batch);
         }
     }
 
@@ -177,9 +188,85 @@ static bs_io_pool & bs_get_prefetch_io_pool() {
     return pool;
 }
 
+// ---------------------------------------------------------------------------
+// Split each pread task into N page-aligned sub-reads.
+//
+// Given an array of pread tasks, produces a new expanded array where each
+// original task is split into `n_split` sub-tasks.  Each sub-task reads
+// ~1/N of the data at a different file offset, allowing multiple SSD
+// channels / NVMe queues to service a single large read in parallel.
+//
+// Sub-task boundaries are rounded to page alignment (4096 bytes) so the
+// kernel can issue full-page DMA transfers.  The last sub-task absorbs
+// any remainder from rounding.
+// ---------------------------------------------------------------------------
+static constexpr size_t BS_PAGE_SIZE = 4096;
+
+static void bs_split_pread_tasks(
+        const bs_pread_task * tasks_in,
+        int                   n_tasks_in,
+        int                   n_split,
+        std::vector<bs_pread_task> & tasks_out) {
+    tasks_out.clear();
+    tasks_out.reserve((size_t)n_tasks_in * n_split);
+
+    for (int i = 0; i < n_tasks_in; ++i) {
+        const auto & t = tasks_in[i];
+        if (n_split <= 1 || t.size <= BS_PAGE_SIZE) {
+            tasks_out.push_back(t);
+            continue;
+        }
+
+        // Compute page-aligned chunk size (round up to page boundary)
+        size_t chunk_base = t.size / (size_t)n_split;
+        chunk_base = (chunk_base + BS_PAGE_SIZE - 1) & ~(BS_PAGE_SIZE - 1);
+
+        size_t off = 0;
+        for (int s = 0; s < n_split && off < t.size; ++s) {
+            size_t chunk = (s == n_split - 1) ? (t.size - off) : std::min(chunk_base, t.size - off);
+            bs_pread_task sub;
+            sub.fd     = t.fd;
+            sub.dst    = (char *)t.dst + off;
+            sub.offset = t.offset + (off_t)off;
+            sub.size   = chunk;
+            sub.result = 0;
+            tasks_out.push_back(sub);
+            off += chunk;
+        }
+    }
+}
+
 // Read n_tasks expert slices in parallel.  Falls back to sequential if n_tasks <= 1.
-static void bs_parallel_pread(bs_pread_task * tasks, int n_tasks) {
+// When io_split > 1, each task is split into io_split page-aligned sub-reads to
+// saturate multiple SSD channels / NVMe submission queues simultaneously.
+static void bs_parallel_pread(bs_pread_task * tasks, int n_tasks, int io_split = 1) {
     if (n_tasks <= 0) return;
+    if (io_split > 1) {
+        std::vector<bs_pread_task> split_tasks;
+        bs_split_pread_tasks(tasks, n_tasks, io_split, split_tasks);
+        if ((int)split_tasks.size() <= 1) {
+            split_tasks[0].result = pread(split_tasks[0].fd, split_tasks[0].dst,
+                                          split_tasks[0].size, split_tasks[0].offset);
+            // Propagate result back to original task
+            tasks[0].result = split_tasks[0].result;
+            return;
+        }
+        // Use batched dispatch — split may produce more tasks than MAX_WORKERS
+        bs_get_io_pool().dispatch_batched(split_tasks.data(), (int)split_tasks.size());
+        // Aggregate sub-task results back to original tasks
+        size_t si = 0;
+        for (int i = 0; i < n_tasks; ++i) {
+            ssize_t total = 0;
+            size_t orig_size = tasks[i].size;
+            while (si < split_tasks.size() && total < (ssize_t)orig_size) {
+                if (split_tasks[si].result < 0) { total = -1; break; }
+                total += split_tasks[si].result;
+                si++;
+            }
+            tasks[i].result = total;
+        }
+        return;
+    }
     if (n_tasks == 1) {
         tasks[0].result = pread(tasks[0].fd, tasks[0].dst, tasks[0].size, tasks[0].offset);
         return;
@@ -189,8 +276,32 @@ static void bs_parallel_pread(bs_pread_task * tasks, int n_tasks) {
 
 // Same as bs_parallel_pread but uses the dedicated prefetch IO pool.
 // Safe to call from the async prefetch background thread.
-static void bs_prefetch_parallel_pread(bs_pread_task * tasks, int n_tasks) {
+static void bs_prefetch_parallel_pread(bs_pread_task * tasks, int n_tasks, int io_split = 1) {
     if (n_tasks <= 0) return;
+    if (io_split > 1) {
+        std::vector<bs_pread_task> split_tasks;
+        bs_split_pread_tasks(tasks, n_tasks, io_split, split_tasks);
+        if ((int)split_tasks.size() <= 1) {
+            split_tasks[0].result = pread(split_tasks[0].fd, split_tasks[0].dst,
+                                          split_tasks[0].size, split_tasks[0].offset);
+            tasks[0].result = split_tasks[0].result;
+            return;
+        }
+        // Use batched dispatch — split may produce more tasks than MAX_WORKERS
+        bs_get_prefetch_io_pool().dispatch_batched(split_tasks.data(), (int)split_tasks.size());
+        size_t si = 0;
+        for (int i = 0; i < n_tasks; ++i) {
+            ssize_t total = 0;
+            size_t orig_size = tasks[i].size;
+            while (si < split_tasks.size() && total < (ssize_t)orig_size) {
+                if (split_tasks[si].result < 0) { total = -1; break; }
+                total += split_tasks[si].result;
+                si++;
+            }
+            tasks[i].result = total;
+        }
+        return;
+    }
     if (n_tasks == 1) {
         tasks[0].result = pread(tasks[0].fd, tasks[0].dst, tasks[0].size, tasks[0].offset);
         return;
@@ -3903,7 +4014,8 @@ void llama_blurry_sharp_async_prefetch_start(
             // Use the dedicated prefetch IO pool (not the main one —
             // dispatch() is not reentrant and the main thread uses
             // bs_get_io_pool() concurrently from the eval callback).
-            bs_prefetch_parallel_pread(tasks.data(), (int)tasks.size());
+            bs_prefetch_parallel_pread(tasks.data(), (int)tasks.size(),
+                                       bsctx->params.cache_io_split);
         }
 
         ap.ready = true;
@@ -4688,7 +4800,8 @@ static int64_t bs_overlay_expert_tensor(
                     tasks[i].size   = sharp_expert_slice;
                     tasks[i].result = 0;
                 }
-                bs_parallel_pread(tasks.data(), n_experts_req);
+                bs_parallel_pread(tasks.data(), n_experts_req,
+                                  bsctx->params.cache_io_split);
             } else {
                 for (int32_t i = 0; i < n_experts_req; ++i) {
                     int32_t eid = expert_ids[i];
@@ -4873,7 +4986,8 @@ static int64_t bs_overlay_expert_tensor(
                             tasks[m].size   = sharp_expert_slice;
                             tasks[m].result = 0;
                         }
-                        bs_parallel_pread(tasks.data(), (int)tasks.size());
+                        bs_parallel_pread(tasks.data(), (int)tasks.size(),
+                                          bsctx->params.cache_io_split);
                     } else {
                         for (int idx : file_miss_indices) {
                             int32_t eid = expert_ids[idx];
@@ -5008,7 +5122,8 @@ static int64_t bs_overlay_expert_tensor(
                         tasks[m].size   = sharp_expert_slice;
                         tasks[m].result = 0;
                     }
-                    bs_parallel_pread(tasks.data(), (int)tasks.size());
+                    bs_parallel_pread(tasks.data(), (int)tasks.size(),
+                                      bsctx->params.cache_io_split);
 
                     // Validate results
                     for (size_t m = 0; m < tasks.size(); ++m) {

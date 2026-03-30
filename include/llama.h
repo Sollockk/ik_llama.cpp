@@ -1625,6 +1625,11 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
                                                 // instead of sequential reads.  Improves throughput
                                                 // on NVMe SSDs with warm page cache.
 
+        int32_t  cache_io_split;               // split each expert slice read into N parallel
+                                                // page-aligned sub-reads hitting different SSD
+                                                // channels simultaneously.  1 = no split (default).
+                                                // Recommended: 4 with 16 IO threads.
+
         int64_t  gpu_cache_bytes;               // GPU expert cache size in bytes (0 = disabled).
                                                 // Pre-allocates a persistent GPU buffer to cache
                                                 // sharp expert slices.  Cache hits use fast GPU→GPU

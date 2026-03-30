@@ -2435,6 +2435,13 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.bs_parallel_expert_io = false;
         return true;
     }
+    if (arg == "--bs-cache-io-split") {
+        CHECK_ARG
+        params.bs_cache_io_split = std::stoi(argv[i]);
+        if (params.bs_cache_io_split < 1) params.bs_cache_io_split = 1;
+        if (params.bs_cache_io_split > 16) params.bs_cache_io_split = 16;
+        return true;
+    }
     if (arg == "--bs-gpu-cache") {
         CHECK_ARG
         params.bs_gpu_cache_mb = std::stoi(argv[i]);

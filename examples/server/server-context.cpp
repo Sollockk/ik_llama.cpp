@@ -250,6 +250,7 @@ bool server_context::load_model(const gpt_params& params_) {
         bs_params.n_sharp_experts_cpu = params_base.bs_sharp_experts_cpu;
         bs_params.n_sharp_experts_cpu_prompt = params_base.bs_sharp_experts_cpu_prompt;
         bs_params.parallel_expert_io  = params_base.bs_parallel_expert_io;
+        bs_params.cache_io_split     = params_base.bs_cache_io_split;
         bs_params.gpu_cache_bytes    = (int64_t)params_base.bs_gpu_cache_mb * 1024 * 1024;
         bs_params.ram_cache_bytes    = (int64_t)params_base.bs_ram_cache_mb * 1024 * 1024;
         bs_params.flash_experts      = params_base.bs_flash_experts;

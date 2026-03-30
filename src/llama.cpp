@@ -5671,6 +5671,7 @@ struct llama_blurry_sharp_params llama_blurry_sharp_default_params() {
     params.n_sharp_experts_cpu   = -2;  // -2 = use same as n_sharp_experts_gpu
     params.n_sharp_experts_cpu_prompt = -3;  // -3 = use same as n_sharp_experts_cpu
     params.parallel_expert_io    = true;
+    params.cache_io_split        = 1;
     params.gpu_cache_bytes       = 0;
     params.ram_cache_bytes       = 0;  // 0 = auto (4 GiB), -1 = disabled
     params.flash_experts         = false;

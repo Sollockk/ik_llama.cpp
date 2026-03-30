@@ -561,6 +561,7 @@ struct gpt_params {
     int         bs_sharp_experts_cpu   = -2;           // -2 = same as GPU, -1 = all, 0 = skip overlay
     int         bs_sharp_experts_cpu_prompt = -3;       // -3 = same as cpu, -2 = same as GPU, -1 = all, 0 = skip
     bool        bs_parallel_expert_io  = true;         // parallel pread for expert slices
+    int         bs_cache_io_split      = 1;            // split each pread into N page-aligned sub-reads
     int         bs_gpu_cache_mb        = 0;            // GPU expert cache size in MiB (0 = disabled)
     int         bs_ram_cache_mb        = 0;            // RAM expert cache in MiB (0 = auto 4096, -1 = off)
     bool        bs_flash_experts       = false;         // flash-moe style: stream Q4_K_M experts from SSD
