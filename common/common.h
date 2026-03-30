@@ -544,6 +544,16 @@ struct gpt_params {
     int         bs_cpu_skip_pct        = 0;            // % of CPU layers to skip (0=disabled)
     std::vector<int> bs_cpu_skip_list;                  // explicit list of CPU layers to skip
 
+    // --bs-probe-tiers
+    // Probe-driven three-tier adaptive layer management:
+    //   1. First prompt chunk: all layers run blurry, gate probes collect importance scores
+    //   2. After scoring: auto-partition using score distribution (mean ± stddev)
+    //      - Skip:    score < mean - 1σ  (clearly unimportant)
+    //      - Sharpen: score > mean + 1σ  (clearly important)
+    //      - Blurry:  everything else
+    //   3. Protects first 3 and last 3 layers from skipping
+    bool        bs_probe_tiers         = false;
+
     // --bs-sharp-experts-gpu N   overlay top-N experts per layer on GPU (-1=all, 0=none/CPU-only)
     // --bs-sharp-experts-cpu N   overlay top-N experts per layer on CPU (-1=all, 0=skip, -2=same as GPU)
     // --bs-no-parallel-io        disable parallel pread for expert slices

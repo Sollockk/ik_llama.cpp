@@ -2100,6 +2100,74 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             const int32_t        * layer_indices,
             int32_t                n_layers);
 
+    // -----------------------------------------------------------------------
+    // Gate Probe — Per-Layer Importance Prediction
+    //
+    // Uses precomputed low-rank probes (from bs-loracalc) to predict per-layer
+    // importance for adaptive layer skipping.  Each probe is a [d_model, rank]
+    // matrix; importance = ||probe^T @ hidden_state||².
+    //
+    // Workflow:
+    //   1. llama_gate_probe_load()   — load probes from corrections GGUF
+    //   2. llama_gate_probe_score()  — compute importance for a hidden state
+    //   3. llama_gate_probe_rank_layers() — rank all layers by importance
+    //   4. llama_gate_probe_free()   — release
+    // -----------------------------------------------------------------------
+
+    struct llama_gate_probe_context;
+
+    // Load gate probe tensors from a GGUF file (looks for "bs.gate_probe-{il}" tensors).
+    // Returns NULL on failure.
+    LLAMA_API struct llama_gate_probe_context * llama_gate_probe_load(
+            const char * path_gguf);
+
+    // Free gate probe context.
+    LLAMA_API void llama_gate_probe_free(
+            struct llama_gate_probe_context * gpctx);
+
+    // Compute importance score for a single layer given a hidden state vector.
+    // hidden_state: float array of length n_embd.
+    // Returns importance score (>= 0), or -1 if layer has no probe.
+    LLAMA_API float llama_gate_probe_score(
+            const struct llama_gate_probe_context * gpctx,
+            int32_t                                 layer_idx,
+            const float                           * hidden_state,
+            int32_t                                 n_embd);
+
+    // Rank all probed layers by importance for the given hidden state.
+    // out_layers: filled with layer indices sorted ascending by importance (least important first).
+    // out_scores: filled with corresponding importance scores.
+    // Returns number of layers ranked.
+    LLAMA_API int32_t llama_gate_probe_rank_layers(
+            const struct llama_gate_probe_context * gpctx,
+            const float                           * hidden_state,
+            int32_t                                 n_embd,
+            int32_t                               * out_layers,
+            float                                 * out_scores,
+            int32_t                                 max_layers);
+
+    // Attach a gate probe context to a llama_context.  When set, the eval
+    // callback will automatically intercept ffn_inp tensors and compute
+    // per-layer importance scores during decode.  Pass NULL to detach.
+    // The probe context is NOT owned — caller must keep it alive and free it.
+    LLAMA_API void llama_gate_probe_set(
+            struct llama_context            * ctx,
+            struct llama_gate_probe_context * gpctx);
+
+    // Get accumulated gate probe importance scores after a decode pass.
+    // Same convention as llama_router_get_layer_importance: sorted ascending
+    // by importance (least important first).
+    // Call after processing prompt to determine which layers to skip.
+    LLAMA_API int32_t llama_gate_probe_get_layer_importance(
+            const struct llama_context * ctx,
+            int32_t                    * out_layers,
+            float                      * out_avg_scores,
+            int32_t                      max_layers);
+
+    // Clear accumulated gate probe scores (call before a new prompt).
+    LLAMA_API void llama_gate_probe_clear_scores(
+            struct llama_context * ctx);
+
     //
     // MTP
     //

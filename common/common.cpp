@@ -2395,6 +2395,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.bs_cpu_skip_pct = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--bs-probe-tiers") {
+        params.bs_probe_tiers = true;
+        return true;
+    }
     if (arg == "--bs-cpu-skip-list") {
         CHECK_ARG
         // parse comma-separated int list of CPU layers to skip

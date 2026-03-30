@@ -3695,7 +3695,15 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
     const bool is_probs = (!is_topk && lctx->router_record_entropy
                            && strncmp(t->name, probs_prefix, probs_prefix_len) == 0);
 
+    static const char * ffn_inp_prefix = "ffn_inp-";
+    static const size_t ffn_inp_prefix_len = 8;
+    const bool is_ffn_inp = (!is_topk && !is_probs && lctx->gate_probe_ctx
+                             && strncmp(t->name, ffn_inp_prefix, ffn_inp_prefix_len) == 0);
+
     if (ask) {
+        if (is_ffn_inp) {
+            return true; // we want hidden state data for gate probe scoring
+        }
         if (is_probs) {
             return true; // we want gate probability data for entropy scoring
         }
@@ -3736,6 +3744,48 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
     }
 
     // --- data phase ---
+
+    // Gate probe importance scoring: read ffn_inp hidden states and compute
+    // per-layer importance via low-rank probe projection.
+    if (is_ffn_inp) {
+        const int layer_idx = atoi(t->name + ffn_inp_prefix_len);
+
+        // ffn_inp shape: [n_embd, n_tokens] (F32)
+        if (t->type == GGML_TYPE_F32 && t->ne[0] > 0 && t->ne[1] > 0) {
+            const int64_t n_embd   = t->ne[0];
+            const int64_t n_tokens = t->ne[1];
+            const size_t  nbytes   = (size_t)(n_embd * n_tokens) * sizeof(float);
+
+            if (nbytes <= ggml_nbytes(t)) {
+                std::vector<float> hidden(n_embd * n_tokens);
+                if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+                    ggml_backend_tensor_get(t, hidden.data(), 0, nbytes);
+                } else if (t->data) {
+                    memcpy(hidden.data(), t->data, nbytes);
+                }
+
+                // Compute average importance score across tokens
+                float score_sum = 0.0f;
+                for (int64_t tok = 0; tok < n_tokens; tok++) {
+                    float s = llama_gate_probe_score(
+                        lctx->gate_probe_ctx, layer_idx,
+                        hidden.data() + tok * n_embd, (int32_t)n_embd);
+                    if (s >= 0.0f) score_sum += s;
+                }
+
+                // Accumulate per-layer scores
+                auto & ls = lctx->gate_probe_layer_scores[layer_idx];
+                ls.first  += score_sum;
+                ls.second += (int32_t)n_tokens;
+            }
+        }
+
+        // Chain to user callback
+        if (lctx->cparams.cb_eval) {
+            return lctx->cparams.cb_eval(t, false, lctx->cparams.cb_eval_user_data);
+        }
+        return true;
+    }
 
     // Gate entropy scoring: read ffn_moe_probs and compute per-token entropy
     if (is_probs) {
@@ -4611,7 +4661,7 @@ static int llama_decode_internal(
             // Both features use the same callback (llama_router_eval_callback)
             // which handles router recording AND JIT sharpening based on the
             // flags set on the context (router_recording, jit_sharpening).
-            if (lctx.router_recording || lctx.jit_sharpening) {
+            if (lctx.router_recording || lctx.jit_sharpening || lctx.gate_probe_ctx) {
                 ggml_backend_sched_set_eval_callback(lctx.sched, llama_router_eval_callback, &lctx);
             } else {
                 ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
@@ -5463,9 +5513,9 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
                 ab_map[name].b = cur;
             }
         } else {
-            gguf_free(ctx_gguf);
-            ggml_free(ctx);
-            throw std::runtime_error("LoRA tensor '" + name + "' has unexpected suffix");
+            // Skip non-LoRA tensors (e.g., bs.gate_probe-* from bs-loracalc)
+            LLAMA_LOG_DEBUG("%s: skipping non-LoRA tensor '%s'\n", __func__, name.c_str());
+            continue;
         }
     }
 
@@ -5483,9 +5533,8 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
         // device buft and device ctx
         auto * model_tensor = llama_get_model_tensor(model, name.c_str());
         if (!model_tensor) {
-            gguf_free(ctx_gguf);
-            ggml_free(ctx);
-            throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model");
+            LLAMA_LOG_WARN("%s: LoRA tensor '%s' does not exist in base model, skipping\n", __func__, name.c_str());
+            continue;
         }
         struct ggml_context * dev_ctx = get_ctx_for_buft(ggml_backend_buffer_get_type(model_tensor->buffer));
         // validate tensor shape
@@ -5498,6 +5547,16 @@ static void llama_lora_adapter_init_internal(struct llama_model * model, const c
             gguf_free(ctx_gguf);
             ggml_free(ctx);
             throw std::runtime_error("lora_a tensor is not transposed (hint: adapter from \"finetune\" example is no longer supported)");
+        }
+        // validate expert dimension for 3D MoE tensors (ne[2] = n_expert)
+        if (model_tensor->ne[2] > 1) {
+            if (w.a->ne[2] != model_tensor->ne[2] || w.b->ne[2] != model_tensor->ne[2]) {
+                gguf_free(ctx_gguf);
+                ggml_free(ctx);
+                throw std::runtime_error("tensor '" + name + "' has incorrect expert dimension (ne[2]): model="
+                    + std::to_string(model_tensor->ne[2]) + " lora_a=" + std::to_string(w.a->ne[2])
+                    + " lora_b=" + std::to_string(w.b->ne[2]));
+            }
         }
         // save tensor to adapter
         struct ggml_tensor * tensor_a = ggml_dup_tensor(dev_ctx, w.a);
@@ -5558,8 +5617,8 @@ int32_t llama_lora_adapter_set(
             struct llama_lora_adapter * adapter,
             float scale) {
     if (ctx->cparams.flash_attn) {
-        LLAMA_LOG_ERROR("%s: flash_attn is not compatible with LoRA\n", __func__);
-        return -1;
+        LLAMA_LOG_WARN("%s: flash_attn is enabled — LoRA corrections on attention tensors will be ignored, "
+                       "but MoE/FFN corrections will still apply\n", __func__);
     }
     ctx->lora_adapters[adapter] = scale;
     return 0;
@@ -8710,6 +8769,47 @@ int32_t llama_router_get_token_range_experts(
     }
 
     return count;
+}
+
+// ---- Gate Probe API ----
+
+void llama_gate_probe_set(
+        struct llama_context            * ctx,
+        struct llama_gate_probe_context * gpctx) {
+    if (!ctx) return;
+    ctx->gate_probe_ctx = gpctx;
+}
+
+int32_t llama_gate_probe_get_layer_importance(
+        const struct llama_context * ctx,
+        int32_t                    * out_layers,
+        float                      * out_avg_scores,
+        int32_t                      max_layers) {
+    if (!ctx) return 0;
+    const auto & ls = ctx->gate_probe_layer_scores;
+
+    struct entry { int32_t layer; float avg; };
+    std::vector<entry> entries;
+    entries.reserve(ls.size());
+    for (const auto & [layer, pair] : ls) {
+        float avg = pair.second > 0 ? pair.first / pair.second : 0.0f;
+        entries.push_back({ layer, avg });
+    }
+    // Sort ascending by score (least important first)
+    std::sort(entries.begin(), entries.end(),
+              [](const entry & a, const entry & b) { return a.avg < b.avg; });
+
+    const int32_t n = std::min((int32_t)entries.size(), max_layers);
+    for (int32_t i = 0; i < n; i++) {
+        if (out_layers)     out_layers[i]     = entries[i].layer;
+        if (out_avg_scores) out_avg_scores[i]  = entries[i].avg;
+    }
+    return n;
+}
+
+void llama_gate_probe_clear_scores(struct llama_context * ctx) {
+    if (!ctx) return;
+    ctx->gate_probe_layer_scores.clear();
 }
 
 void llama_synchronize(struct llama_context * ctx) {

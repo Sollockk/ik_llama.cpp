@@ -5954,8 +5954,9 @@ int32_t llama_blurry_sharp_apply_experts(
         // original type/size.
         //
         // Safe cases:
-        //   - Expert tensors on plain CPU buffers (--n-cpu-moe): these have
-        //     no device copies, the MoE kernel reads them directly on CPU.
+        //   - Expert tensors on any CPU-computed buffer (plain CPU or CUDA
+        //     host/pinned from --n-cpu-moe): no device copies for MoE tensors,
+        //     the CPU backend reads directly from tensor->data.
         //   - Any tensor where sharp nbytes == blurry nbytes: the device
         //     copy fits, tensor_copy re-types dst in place.
         //

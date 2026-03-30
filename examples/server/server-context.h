@@ -258,6 +258,15 @@ struct server_context {
     std::vector<int32_t> turbo_skip_layers;        // generation pattern
     std::vector<int32_t> turbo_skip_layers_prompt;  // aggressive prompt pattern
 
+    // Gate probe context for adaptive layer skipping (loaded from corrections GGUF).
+    // When set, probe-based importance replaces entropy-based importance for skip refinement.
+    llama_gate_probe_context * gate_probe = nullptr;
+
+    // Probe-driven three-tier layer management (--bs-probe-tiers)
+    bool probe_tiers_enabled = false;    // --bs-probe-tiers flag
+    bool probe_tiers_active = false;     // set after first chunk scores are collected
+    bool probe_first_chunk_done = false; // tracks whether we've collected scores yet
+
     int32_t n_ctx; // total context for all clients / slots
 
     // system prompt

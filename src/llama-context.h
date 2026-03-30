@@ -233,6 +233,13 @@ struct llama_context {
     // key = layer index, value = {sum_entropy, n_tokens}
     std::unordered_map<int32_t, std::pair<float, int32_t>> router_layer_entropy;
 
+    // Gate probe importance scoring: when gate_probe_ctx is set, the eval
+    // callback intercepts "ffn_inp-{il}" tensors and computes probe-based
+    // importance scores for adaptive layer skipping.
+    // key = layer index, value = {sum_importance, n_tokens}
+    struct llama_gate_probe_context * gate_probe_ctx = nullptr;
+    std::unordered_map<int32_t, std::pair<float, int32_t>> gate_probe_layer_scores;
+
     // -----------------------------------------------------------------------
     // JIT (just-in-time) per-layer sharpening
     //

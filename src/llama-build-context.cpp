@@ -638,6 +638,14 @@ ggml_tensor * llm_build_context::llm_build_lora_mm_id(
         const float alpha = it.first->alpha;
         const float rank  = (float) lora->b->ne[0];
         const float scale = alpha ? it.second * alpha / rank : it.second;
+        static bool logged_lora_id = false;
+        if (!logged_lora_id) {
+            LLAMA_LOG_INFO("lora_mm_id: applying LoRA correction to '%s' (rank=%.0f, scale=%.4f, a=[%lld,%lld,%lld], b=[%lld,%lld,%lld])\n",
+                w->name, rank, scale,
+                (long long)lora->a->ne[0], (long long)lora->a->ne[1], (long long)lora->a->ne[2],
+                (long long)lora->b->ne[0], (long long)lora->b->ne[1], (long long)lora->b->ne[2]);
+            logged_lora_id = true;
+        }
         struct ggml_tensor * ab_cur = ggml_mul_mat_id(
             ctx0, lora->b,
             ggml_mul_mat_id(ctx0, lora->a, cur, ids),

@@ -223,13 +223,23 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
     if (ml.tensor_buft_overrides) {
         for (const auto * o = ml.tensor_buft_overrides; o->pattern != nullptr; ++o) {
             auto buft = o->buft;
-            if (ggml_backend_buft_is_host(buft)) buft = default_cpu_buft;
+            // Upgrade host buffers to pinned for faster H2D transfers —
+            // but preserve plain CPU when explicitly requested (e.g. for
+            // blurry-sharp cross-type JIT overlay which requires no device copies).
+            if (ggml_backend_buft_is_host(buft) && buft != ggml_backend_cpu_buffer_type()) {
+                buft = default_cpu_buft;
+            }
             overrides.emplace_back(std::make_pair(std::regex(o->pattern), buft));
         }
     }
 
     if (ml.ncmoe > 0) {
-        auto buft = llama_default_buffer_type_cpu(true);
+        // Use plain CPU buffers (not CUDA pinned) for --n-cpu-moe expert tensors.
+        // Pinned buffers cause the scheduler to create device copies, which breaks
+        // cross-type JIT overlay (TQ1_0→Q4_K_M) — the device copy is pre-allocated
+        // at blurry size and can't hold the larger sharp data.  Plain CPU buffers
+        // have no device copies, so the CPU backend reads directly from tensor->data.
+        auto buft = ggml_backend_cpu_buffer_type();
         if (model.split_mode == LLAMA_SPLIT_MODE_ATTN || model.split_mode == LLAMA_SPLIT_MODE_GRAPH || ml.ncmoe >= n_layer || model.devices.size() < 2) {
             int nmax = std::min(ml.ncmoe, n_layer);
             for (int i = 0; i < nmax; ++i) {
@@ -406,7 +416,7 @@ static std::vector<int> create_split(int nr, int granularity, const std::vector<
 ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx, const std::string & name) {
     for (auto & o : overrides) {
         if (std::regex_search(name, o.first)) {
-            if (o.second == default_cpu_buft) has_buft_overrides = true;
+            if (ggml_backend_buft_is_host(o.second)) has_buft_overrides = true;
             const struct ggml_tensor * cur = ml.get_tensor_meta(name.c_str());
             const size_t nbytes = cur ? ggml_nbytes(cur) : 0;
             LLAMA_LOG_INFO("Tensor %s (size = %.2f MiB) buffer type overriden to %s\n", name.c_str(), nbytes/1024./1024., ggml_backend_buft_name(o.second));

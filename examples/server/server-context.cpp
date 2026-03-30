@@ -23,6 +23,13 @@ static void log_text(const gpt_params & params_base, const std::string & text) {
 }
 
 server_context::~server_context() {
+    // Free gate probe before context (it's attached to ctx)
+    if (gate_probe) {
+        if (ctx) llama_gate_probe_set(ctx, nullptr);
+        llama_gate_probe_free(gate_probe);
+        gate_probe = nullptr;
+    }
+
     // Free blurry-sharp overlay before model (it holds references to model tensors)
     if (bsctx) {
         llama_blurry_sharp_free(bsctx);
@@ -79,7 +86,27 @@ bool server_context::load_model(const gpt_params& params_) {
         return false;
     }
 
+    // Try to load gate probes from LoRA adapter files (bs-loracalc embeds them)
+    for (const auto & la : params_base.lora_adapters) {
+        gate_probe = llama_gate_probe_load(la.path.c_str());
+        if (gate_probe) {
+            llama_gate_probe_set(ctx, gate_probe);
+            LOG_INFO("loaded gate probes for adaptive layer skipping", {{"path", la.path}});
+            break;  // use first LoRA that has probes
+        }
+    }
+
     n_ctx = llama_n_ctx(ctx);
+
+    // Initialize probe-driven three-tier layer management
+    if (params_base.bs_probe_tiers) {
+        if (gate_probe) {
+            probe_tiers_enabled = true;
+            LOG_INFO("probe-driven three-tier layers enabled (auto thresholds from score distribution)", {});
+        } else {
+            LOG_WARNING("--bs-probe-tiers requires gate probes (use --lora with bs-loracalc output)", {});
+        }
+    }
 
     // Apply MoE top-k override if requested (reduces experts per token)
     if (params_base.bs_moe_top_k_override > 0) {
@@ -4441,6 +4468,50 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             llama_router_clear(ctx);
         }
 
+        // ---- Probe-driven per-token JIT layer update ----
+        // After each decode, use the probe scores collected during this token
+        // to update which layers get JIT-sharpened on the NEXT token.
+        // Skip set stays fixed (graph rebuild too expensive per-token).
+        if (probe_tiers_active && is_generation && gate_probe && bsctx) {
+            const int n_layers_total = llama_n_layer(model);
+            std::vector<int32_t> imp_layers(n_layers_total);
+            std::vector<float>   imp_scores(n_layers_total);
+            const int32_t n_imp = llama_gate_probe_get_layer_importance(
+                ctx, imp_layers.data(), imp_scores.data(), n_layers_total);
+
+            if (n_imp > 1) {
+                // Compute mean + stddev for adaptive thresholds
+                float sum = 0.0f, sum_sq = 0.0f;
+                for (int32_t j = 0; j < n_imp; j++) {
+                    sum    += imp_scores[j];
+                    sum_sq += imp_scores[j] * imp_scores[j];
+                }
+                const float mean   = sum / (float)n_imp;
+                const float var    = sum_sq / (float)n_imp - mean * mean;
+                const float stddev = sqrtf(std::max(0.0f, var));
+                const float sharp_threshold = mean + stddev;
+
+                // Only sharpen layers above threshold
+                std::vector<int32_t> sharp_layers;
+                for (int32_t j = 0; j < n_imp; j++) {
+                    if (imp_scores[j] > sharp_threshold) {
+                        sharp_layers.push_back(imp_layers[j]);
+                    }
+                }
+
+                if (!sharp_layers.empty()) {
+                    std::sort(sharp_layers.begin(), sharp_layers.end());
+                    llama_blurry_sharp_set_jit_layers(
+                        ctx, sharp_layers.data(), (int32_t)sharp_layers.size());
+                } else {
+                    // Nothing scores high enough — clear JIT budget (all blurry)
+                    llama_blurry_sharp_set_jit_layers(ctx, nullptr, 0);
+                }
+            }
+
+            llama_gate_probe_clear_scores(ctx);
+        }
+
         // Disable layer skipping after decode (only set for prompt)
         if (turbo_active && !bs_spec_verify && !is_generation) {
             llama_set_skip_layers(ctx, nullptr, 0);
@@ -4463,8 +4534,23 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 const int n_layers_total = llama_n_layer(model);
                 std::vector<int32_t> imp_layers(n_layers_total);
                 std::vector<float>   imp_scores(n_layers_total);
-                const int32_t n_imp = llama_router_get_layer_importance(
-                    ctx, imp_layers.data(), imp_scores.data(), n_layers_total);
+                int32_t n_imp = 0;
+
+                // Prefer gate probe importance over entropy-based importance
+                if (gate_probe) {
+                    n_imp = llama_gate_probe_get_layer_importance(
+                        ctx, imp_layers.data(), imp_scores.data(), n_layers_total);
+                    if (n_imp > 0) {
+                        LOG_INFO("using gate probe importance for skip refinement",
+                                 {{"n_layers_scored", n_imp}});
+                    }
+                }
+
+                // Fallback to entropy-based importance
+                if (n_imp == 0) {
+                    n_imp = llama_router_get_layer_importance(
+                        ctx, imp_layers.data(), imp_scores.data(), n_layers_total);
+                }
 
                 if (n_imp > 0) {
                     // Skip the same NUMBER of layers as before, but pick the
@@ -4484,10 +4570,100 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                             {"n_skip", (int)new_skip.size()},
                             {"least_important_layer", new_skip[0]},
                             {"most_important_kept", imp_layers[n_imp - 1]},
+                            {"source", gate_probe ? "gate_probe" : "entropy"},
                         });
                     }
                 }
+
+                // Clear probe scores for next chunk
+                if (gate_probe) {
+                    llama_gate_probe_clear_scores(ctx);
+                }
             }
+
+        }
+
+        // ---- Probe-driven three-tier layer management ----
+        // After first prompt chunk: partition layers into skip/blurry/sharpen
+        // based on gate probe scores collected during the (all-blurry) decode.
+        // Thresholds are determined automatically from the score distribution:
+        //   skip:    score < mean - 1σ
+        //   sharpen: score > mean + 1σ
+        //   blurry:  everything else
+        if (probe_tiers_enabled && !probe_first_chunk_done && !is_generation) {
+            probe_first_chunk_done = true;
+
+            const int n_layers_total = llama_n_layer(model);
+            std::vector<int32_t> imp_layers(n_layers_total);
+            std::vector<float>   imp_scores(n_layers_total);
+            const int32_t n_imp = llama_gate_probe_get_layer_importance(
+                ctx, imp_layers.data(), imp_scores.data(), n_layers_total);
+
+            if (n_imp > 1) {
+                // Compute mean and stddev of scores
+                float sum = 0.0f, sum_sq = 0.0f;
+                for (int32_t j = 0; j < n_imp; j++) {
+                    sum    += imp_scores[j];
+                    sum_sq += imp_scores[j] * imp_scores[j];
+                }
+                const float mean   = sum / (float)n_imp;
+                const float var    = sum_sq / (float)n_imp - mean * mean;
+                const float stddev = sqrtf(std::max(0.0f, var));
+
+                const float skip_threshold  = mean - stddev;
+                const float sharp_threshold = mean + stddev;
+
+                std::vector<int32_t> skip_layers;
+                std::vector<int32_t> sharp_layers;
+
+                // imp_layers is sorted ascending by score
+                for (int32_t j = 0; j < n_imp; j++) {
+                    int32_t layer = imp_layers[j];
+                    float   score = imp_scores[j];
+
+                    if (score < skip_threshold) {
+                        // Skip — protect first 3 and last 3
+                        if (layer >= 3 && layer < n_layers_total - 3) {
+                            skip_layers.push_back(layer);
+                        }
+                    } else if (score > sharp_threshold) {
+                        sharp_layers.push_back(layer);
+                    }
+                    // else: stays blurry (no action needed)
+                }
+
+                // Apply skip layers
+                if (!skip_layers.empty()) {
+                    std::sort(skip_layers.begin(), skip_layers.end());
+                    turbo_skip_layers = skip_layers;
+                    turbo_skip_layers_prompt = skip_layers;
+                    llama_set_skip_layers(ctx, skip_layers.data(), (int32_t)skip_layers.size());
+                }
+
+                // Apply JIT sharp layer budget
+                if (!sharp_layers.empty() && bsctx) {
+                    std::sort(sharp_layers.begin(), sharp_layers.end());
+                    llama_blurry_sharp_set_jit_layers(
+                        ctx, sharp_layers.data(), (int32_t)sharp_layers.size());
+                }
+
+                probe_tiers_active = true;
+
+                LOG_INFO("probe three-tier layers applied", {
+                    {"n_scored",        n_imp},
+                    {"n_skip",          (int)skip_layers.size()},
+                    {"n_blurry",        n_imp - (int)skip_layers.size() - (int)sharp_layers.size()},
+                    {"n_sharp",         (int)sharp_layers.size()},
+                    {"mean_score",      mean},
+                    {"stddev",          stddev},
+                    {"skip_threshold",  skip_threshold},
+                    {"sharp_threshold", sharp_threshold},
+                    {"lowest_score",    imp_scores[0]},
+                    {"highest_score",   imp_scores[n_imp - 1]},
+                });
+            }
+
+            llama_gate_probe_clear_scores(ctx);
         }
 
         // ---------------------------------------------------------------

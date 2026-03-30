@@ -52,12 +52,17 @@
 // eigendecomposition of the small projected matrix.
 
 // Dense (row-major) matmul: C[m×n] = A[m×k] @ B[k×n]
+// Uses ikj loop order for cache-friendly access of B (row-wise instead of column-wise).
 static void f32_matmul(float * C, const float * A, const float * B, int m, int k, int n) {
+    memset(C, 0, (size_t)m * n * sizeof(float));
     for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
-            float s = 0.0f;
-            for (int p = 0; p < k; p++) s += A[i*k+p] * B[p*n+j];
-            C[i*n+j] = s;
+        for (int p = 0; p < k; p++) {
+            const float a_ip = A[i*k+p];
+            const float * b_row = B + p*n;
+            float * c_row = C + i*n;
+            for (int j = 0; j < n; j++) {
+                c_row[j] += a_ip * b_row[j];
+            }
         }
     }
 }
@@ -130,7 +135,8 @@ static void f32_sym_jacobi(float * A, float * V, int n) {
 // loraA_out: m × R  (= U * S, absorbs singular values)
 // loraB_out: n × R  (= V, right singular vectors)
 // Both stored in caller-provided FP32 buffers.
-static void randomized_svd(
+// Returns fraction of squared Frobenius norm captured by rank-R approximation.
+static float randomized_svd(
     const float * A, int m, int n, int rank,
     std::vector<float> & loraA_out,
     std::vector<float> & loraB_out)
@@ -153,13 +159,19 @@ static void randomized_svd(
     f32_mgs(Q.data(), Y.data(), m, k);
 
     // 4. B = Q^T @ A  (k × n)
+    // Cache-friendly: iterate over rows of Q and A together (both row-major)
     std::vector<float> B((size_t)k * n, 0.0f);
-    for (int i = 0; i < k; i++)
-        for (int j = 0; j < n; j++) {
-            float s = 0.0f;
-            for (int r = 0; r < m; r++) s += Q[r*k+i] * A[r*n+j];
-            B[i*n+j] = s;
+    for (int r = 0; r < m; r++) {
+        const float * q_row = Q.data() + r * k;
+        const float * a_row = A + r * n;
+        for (int i = 0; i < k; i++) {
+            const float q_ri = q_row[i];
+            float * b_row = B.data() + i * n;
+            for (int j = 0; j < n; j++) {
+                b_row[j] += q_ri * a_row[j];
+            }
         }
+    }
 
     // 5. BBt = B @ B^T  (k × k)  — small, eigendecompose directly
     std::vector<float> BBt((size_t)k * k, 0.0f);
@@ -205,6 +217,17 @@ static void randomized_svd(
             }
         }
     }
+
+    // Compute fraction of variance captured:
+    // eigenvalues of BBt ≈ σ² of A (via randomized projection)
+    // sum of top-R eigenvalues / sum of all eigenvalues
+    float sum_top_r = 0.0f, sum_all = 0.0f;
+    for (int i = 0; i < k; i++) {
+        float ev = std::max(0.0f, BBt[idx[i]*k+idx[i]]);
+        sum_all += ev;
+        if (i < rank) sum_top_r += ev;
+    }
+    return (sum_all > 1e-20f) ? (sum_top_r / sum_all) : 1.0f;
 }
 
 // ============================================================
@@ -270,6 +293,15 @@ static void dequant_to_f32(const void * src, ggml_type type, int64_t n_elements,
 
 static void f32_to_f16(const float * src, ggml_fp16_t * dst, int64_t n) {
     for (int64_t i = 0; i < n; i++) dst[i] = ggml_fp32_to_fp16(src[i]);
+}
+
+// Transpose [rows × cols] row-major FP32 → [rows × cols] GGML-layout (ne[0]-contiguous) FP16.
+// GGML stores ne[0]=rows as the contiguous dimension, so element(r, c) = data[c * rows + r].
+// Source row-major: src[r * cols + c].
+static void f32_to_f16_transpose(const float * src, ggml_fp16_t * dst, int rows, int cols) {
+    for (int r = 0; r < rows; r++)
+        for (int c = 0; c < cols; c++)
+            dst[c * rows + r] = ggml_fp32_to_fp16(src[r * cols + c]);
 }
 
 // ============================================================
@@ -436,8 +468,27 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "Found %zu expert tensors to process (rank=%d)\n",
             expert_tensor_names.size(), rank);
 
+    // ---- read architecture from blurry model ----
+    std::string model_arch = "unknown";
+    {
+        int key_id = gguf_find_key(blurry_gguf, "general.architecture");
+        if (key_id >= 0) {
+            model_arch = gguf_get_val_str(blurry_gguf, key_id);
+        } else {
+            fprintf(stderr, "warning: could not find general.architecture in blurry model\n");
+        }
+    }
+
     // ---- prepare output GGUF ----
     gguf_context * out_gguf = gguf_init_empty();
+
+    // Standard LoRA adapter metadata (required by llama_lora_adapter_init_internal)
+    gguf_set_val_str(out_gguf, "general.type",          "adapter");
+    gguf_set_val_str(out_gguf, "general.architecture",  model_arch.c_str());
+    gguf_set_val_str(out_gguf, "adapter.type",          "lora");
+    gguf_set_val_f32(out_gguf, "adapter.lora.alpha",    (float)rank);
+
+    // Provenance metadata
     gguf_set_val_str(out_gguf, "bs.loracalc.blurry_path", blurry_path);
     gguf_set_val_str(out_gguf, "bs.loracalc.sharp_path",  sharp_path);
     gguf_set_val_i32(out_gguf, "bs.loracalc.rank",        rank);
@@ -463,6 +514,19 @@ int main(int argc, char ** argv) {
         std::vector<ggml_fp16_t> data;
     };
     std::vector<OutTensor> out_tensors;
+
+    // ---- per-layer probe accumulation ----
+    // For gate and up tensors (both take hidden state h as input), average
+    // the lora_a matrices across experts to produce a per-layer importance probe.
+    // probe_L projects h [n_embd] → [rank], and ||probe_L^T @ h||² gives importance.
+    // Key: layer_idx → {sum of lora_a FP32 data, count of tensors accumulated}
+    struct ProbeAccum {
+        std::vector<float> sum_a;   // [d_out * rank] FP32 accumulator
+        int64_t            d_out;
+        int                count;   // number of tensor × expert contributions
+        int                n_experts;
+    };
+    std::unordered_map<int, ProbeAccum> probe_accum;
 
     // ---- main processing loop ----
     int processed = 0;
@@ -504,23 +568,30 @@ int main(int argc, char ** argv) {
         size_t b_slice = binfo.nbytes / (size_t)n_experts;
         size_t s_slice = sinfo.nbytes / (size_t)n_experts;
 
-        // Output stacked loraA [d_out, rank, n_experts] and loraB [d_in, rank, n_experts] (FP16)
+        // Output stacked LoRA tensors in GGML convention:
+        //   lora_a: ne[0]=d_out (matches model), ne[1]=rank, ne[2]=n_experts
+        //   lora_b: ne[0]=rank, ne[1]=d_in (matches model), ne[2]=n_experts
+        // Validation expects: a->ne[0]==model->ne[0], b->ne[1]==model->ne[1], a->ne[1]==b->ne[0]==rank
         OutTensor ot_A, ot_B;
         {
-            std::string suffix = suffix_of(sname);
-            // Remove ".weight" suffix if present, then add _loraA/_loraB
-            std::string base_suffix = suffix;
-            if (base_suffix.size() > 7 &&
-                base_suffix.substr(base_suffix.size()-7) == ".weight") {
-                base_suffix = base_suffix.substr(0, base_suffix.size()-7);
-            }
-            ot_A.name = "blk." + std::to_string(sinfo.layer_idx) + "." + base_suffix + "_loraA.weight";
-            ot_B.name = "blk." + std::to_string(sinfo.layer_idx) + "." + base_suffix + "_loraB.weight";
+            // Use standard LoRA naming: <tensor_name>.lora_a / <tensor_name>.lora_b
+            // The LoRA loader strips .lora_a/.lora_b and looks up the remainder as a model tensor name
+            ot_A.name = sname + ".lora_a";
+            ot_B.name = sname + ".lora_b";
         }
-        ot_A.ne[0] = d_out;   ot_A.ne[1] = rank; ot_A.ne[2] = n_experts; ot_A.ne[3] = 1;
-        ot_B.ne[0] = d_in;    ot_B.ne[1] = rank; ot_B.ne[2] = n_experts; ot_B.ne[3] = 1;
+        ot_A.ne[0] = d_out;  ot_A.ne[1] = rank;  ot_A.ne[2] = n_experts; ot_A.ne[3] = 1;
+        ot_B.ne[0] = rank;   ot_B.ne[1] = d_in;   ot_B.ne[2] = n_experts; ot_B.ne[3] = 1;
         ot_A.data.resize((size_t)d_out * rank * n_experts);
         ot_B.data.resize((size_t)d_in  * rank * n_experts);
+
+        std::vector<float> variance_captured(n_experts, 0.0f);
+
+        // For probe accumulation: collect all per-expert loraA in FP32
+        // Only for gate/up tensors (whose d_out = n_embd, i.e. hidden state input)
+        const bool is_gate_or_up = (sname.find("ffn_gate_exps") != std::string::npos ||
+                                    sname.find("ffn_up_exps")   != std::string::npos);
+        // Per-expert loraA storage for probe averaging (only allocated if needed)
+        std::vector<std::vector<float>> all_loraA(is_gate_or_up ? n_experts : 0);
 
         #pragma omp parallel for schedule(dynamic)
         for (int64_t ei = 0; ei < n_experts; ei++) {
@@ -540,19 +611,89 @@ int main(int argc, char ** argv) {
             }
 
             // Randomized SVD of delta [d_out × d_in]
-            randomized_svd(delta_f32.data(), (int)d_out, (int)d_in, rank, loraA_f32, loraB_f32);
+            float frac = randomized_svd(delta_f32.data(), (int)d_out, (int)d_in, rank, loraA_f32, loraB_f32);
+            variance_captured[ei] = frac;
+
+            // Save FP32 loraA for probe accumulation
+            if (is_gate_or_up) {
+                all_loraA[ei] = loraA_f32;  // copy [d_out * rank]
+            }
 
             // Store as FP16 into stacked output tensors (non-overlapping writes, safe)
-            f32_to_f16(loraA_f32.data(), ot_A.data.data() + (size_t)ei * d_out * rank, (int64_t)d_out * rank);
+            // lora_a: SVD output is row-major [d_out × rank], GGML needs ne[0]=d_out contiguous → transpose
+            f32_to_f16_transpose(loraA_f32.data(), ot_A.data.data() + (size_t)ei * d_out * rank, (int)d_out, rank);
+            // lora_b: SVD output is row-major [d_in × rank], which matches GGML ne[0]=rank contiguous layout
             f32_to_f16(loraB_f32.data(), ot_B.data.data() + (size_t)ei * d_in  * rank, (int64_t)d_in  * rank);
         }
+
+        // Accumulate per-layer probe: average lora_a across experts for gate/up tensors
+        if (is_gate_or_up) {
+            int layer = sinfo.layer_idx;
+            auto & pa = probe_accum[layer];
+            if (pa.sum_a.empty()) {
+                pa.sum_a.assign((size_t)d_out * rank, 0.0f);
+                pa.d_out = d_out;
+                pa.count = 0;
+                pa.n_experts = (int)n_experts;
+            }
+            for (int64_t ei = 0; ei < n_experts; ei++) {
+                const auto & la = all_loraA[ei];
+                for (size_t j = 0; j < la.size(); j++) {
+                    pa.sum_a[j] += la[j];
+                }
+                pa.count++;
+            }
+        }
+
+        // Report variance captured
+        float min_vc = 1.0f, max_vc = 0.0f, sum_vc = 0.0f;
+        for (int64_t ei = 0; ei < n_experts; ei++) {
+            min_vc = std::min(min_vc, variance_captured[ei]);
+            max_vc = std::max(max_vc, variance_captured[ei]);
+            sum_vc += variance_captured[ei];
+        }
+        float avg_vc = sum_vc / (float)n_experts;
+        fprintf(stderr, "  variance captured: avg=%.1f%% min=%.1f%% max=%.1f%%\n",
+                avg_vc * 100.0f, min_vc * 100.0f, max_vc * 100.0f);
 
         out_tensors.push_back(std::move(ot_A));
         out_tensors.push_back(std::move(ot_B));
     }
 
+    // ---- emit per-layer gate probe tensors ----
+    // Each probe is the mean of lora_a across experts and gate/up tensors for that layer.
+    // Shape: [d_out, rank] in GGML convention (same as lora_a but 2D, no expert dim).
+    // At runtime: importance_L = ||probe_L^T @ h||² where h is the hidden state.
+    {
+        std::vector<int> probe_layers;
+        for (auto & [layer, pa] : probe_accum) probe_layers.push_back(layer);
+        std::sort(probe_layers.begin(), probe_layers.end());
+
+        for (int layer : probe_layers) {
+            auto & pa = probe_accum[layer];
+            if (pa.count == 0) continue;
+
+            // Average: divide sum by count (n_experts × n_tensors)
+            float inv_count = 1.0f / (float)pa.count;
+            for (auto & v : pa.sum_a) v *= inv_count;
+
+            // Convert to FP16 in GGML layout (transpose from row-major to ne[0]-contiguous)
+            OutTensor ot_probe;
+            ot_probe.name = "bs.gate_probe-" + std::to_string(layer);
+            ot_probe.ne[0] = pa.d_out;
+            ot_probe.ne[1] = rank;
+            ot_probe.ne[2] = 1;
+            ot_probe.ne[3] = 1;
+            ot_probe.data.resize((size_t)pa.d_out * rank);
+            f32_to_f16_transpose(pa.sum_a.data(), ot_probe.data.data(), (int)pa.d_out, rank);
+
+            out_tensors.push_back(std::move(ot_probe));
+        }
+        fprintf(stderr, "Added %zu gate probe tensors\n", probe_layers.size());
+    }
+
     // ---- write output GGUF ----
-    fprintf(stderr, "Writing %zu correction tensors to %s ...\n", out_tensors.size(), output_path);
+    fprintf(stderr, "Writing %zu total tensors to %s ...\n", out_tensors.size(), output_path);
 
     // Add tensors to gguf context
     for (auto & ot : out_tensors) {
