@@ -113,39 +113,71 @@ void ggml_vec_dot_ray_march_3tier(
     const size_t dinput_blk_bytes = ggml_type_size(dinput_vdt);
     const size_t dinput_qblocks_per_eblock = (dinput_blk_elems > 0) ? block_size / dinput_blk_elems : 1;
 
-    // --- Step 1: FULL blurry baseline (dense, branchless, SIMD) ---
-    float baseline = 0.0f;
-    if (blurry_traits.vec_dot) {
-        blurry_traits.vec_dot(n, &baseline, 0, blurry_row, 0, input_row, 0, 1);
-    }
+    // Blurry block strides
+    const int    blurry_blk_elems = blurry_traits.blck_size;
+    const size_t blurry_blk_bytes = blurry_traits.type_size;
+    const size_t blurry_qblocks_per_eblock = (blurry_blk_elems > 0) ? block_size / blurry_blk_elems : 1;
 
-    // --- Step 2: Delta correction for ALL non-skip blocks ---
-    float correction = 0.0f;
-    if (delta_row && delta_traits.vec_dot) {
-        const void * delta_input = input_row_delta ? input_row_delta : input_row;
+    // Input block strides (for blurry's vec_dot_type)
+    enum ggml_type input_vdt = blurry_traits.vec_dot_type;
+    const int    input_blk_elems = ggml_blck_size(input_vdt);
+    const size_t input_blk_bytes = ggml_type_size(input_vdt);
+    const size_t input_qblocks_per_eblock = (input_blk_elems > 0) ? block_size / input_blk_elems : 1;
 
-        // Blurry-tier blocks
-        for (int g = 0; g < tiers->n_blurry; g++) {
-            int b = tiers->blurry_blocks[g];
-            float block_result = 0.0f;
-            delta_traits.vec_dot(
-                block_size, &block_result, 0,
-                (const char *)delta_row   + b * delta_qblocks_per_eblock * delta_blk_bytes, 0,
-                (const char *)delta_input + b * dinput_qblocks_per_eblock * dinput_blk_bytes, 0, 1);
-            correction += block_result;
+    // --- TRUE RAY MARCH: skip BOTH blurry and delta for zero-energy blocks ---
+    // Only non-skip blocks are computed. The ray flies through empty space.
+    float total = 0.0f;
+    const void * delta_input = input_row_delta ? input_row_delta : input_row;
+
+    // Blurry-tier blocks: blurry + delta
+    for (int g = 0; g < tiers->n_blurry; g++) {
+        int b = tiers->blurry_blocks[g];
+
+        // Blurry contribution
+        if (blurry_traits.vec_dot) {
+            float bv = 0.0f;
+            blurry_traits.vec_dot(
+                block_size, &bv, 0,
+                (const char *)blurry_row + b * blurry_qblocks_per_eblock * blurry_blk_bytes, 0,
+                (const char *)input_row  + b * input_qblocks_per_eblock  * input_blk_bytes, 0, 1);
+            total += bv;
         }
 
-        // Sharp-tier blocks
-        for (int g = 0; g < tiers->n_sharp; g++) {
-            int b = tiers->sharp_blocks[g];
-            float block_result = 0.0f;
+        // Delta correction
+        if (delta_row && delta_traits.vec_dot) {
+            float dv = 0.0f;
             delta_traits.vec_dot(
-                block_size, &block_result, 0,
-                (const char *)delta_row   + b * delta_qblocks_per_eblock * delta_blk_bytes, 0,
+                block_size, &dv, 0,
+                (const char *)delta_row   + b * delta_qblocks_per_eblock  * delta_blk_bytes, 0,
                 (const char *)delta_input + b * dinput_qblocks_per_eblock * dinput_blk_bytes, 0, 1);
-            correction += block_result;
+            total += dv;
         }
     }
 
-    *s = baseline + correction;
+    // Sharp-tier blocks: blurry + delta (same computation, different list)
+    for (int g = 0; g < tiers->n_sharp; g++) {
+        int b = tiers->sharp_blocks[g];
+
+        if (blurry_traits.vec_dot) {
+            float bv = 0.0f;
+            blurry_traits.vec_dot(
+                block_size, &bv, 0,
+                (const char *)blurry_row + b * blurry_qblocks_per_eblock * blurry_blk_bytes, 0,
+                (const char *)input_row  + b * input_qblocks_per_eblock  * input_blk_bytes, 0, 1);
+            total += bv;
+        }
+
+        if (delta_row && delta_traits.vec_dot) {
+            float dv = 0.0f;
+            delta_traits.vec_dot(
+                block_size, &dv, 0,
+                (const char *)delta_row   + b * delta_qblocks_per_eblock  * delta_blk_bytes, 0,
+                (const char *)delta_input + b * dinput_qblocks_per_eblock * dinput_blk_bytes, 0, 1);
+            total += dv;
+        }
+    }
+
+    // Skip blocks: contribute ZERO. No blurry read. No delta read. The ray flew through.
+
+    *s = total;
 }
