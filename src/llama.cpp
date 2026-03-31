@@ -3778,62 +3778,9 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                 ls.first  += score_sum;
                 ls.second += (int32_t)n_tokens;
 
-                // --- Ray march: evaluate SDF from live hidden state ---
-                if (lctx->ray_march.enabled) {
-                    auto & rm = lctx->ray_march;
-                    float sdf = n_tokens > 0 ? score_sum / (float)n_tokens : 0.0f;
-
-                    // Update running statistics for adaptive threshold
-                    rm.sdf_sum    += sdf;
-                    rm.sdf_sum_sq += sdf * sdf;
-                    rm.sdf_count++;
-                    rm.update_threshold();
-
-                    // Track derivative (rate of change across layers)
-                    rm.sdf_derivative = sdf - rm.prev_sdf;
-                    rm.prev_sdf = sdf;
-                    rm.current_sdf = sdf;
-
-                    if (rm.coast_counter > 0) {
-                        // Coasting — far from surface, skip this layer
-                        rm.coast_counter--;
-                        rm.current_layer_sharpen = false;
-                        rm.current_layer_depth = 0;
-                        rm.n_coasted++;
-                    } else if (rm.sdf_count >= 3 && sdf < rm.surface_threshold) {
-                        // Below threshold — compute coast step size
-                        float distance = rm.surface_threshold - sdf;
-                        float scale = rm.surface_threshold > 1e-6f ? rm.surface_threshold : 1.0f;
-                        int step = std::max(1, (int)(distance / scale * rm.coast_scale));
-                        // If SDF is decreasing (moving away from surface), coast further
-                        if (rm.sdf_derivative < 0.0f) {
-                            step = (int)((float)step * rm.derivative_boost);
-                        }
-                        rm.coast_counter = step - 1; // -1: current layer already handled
-                        rm.current_layer_sharpen = false;
-                        rm.current_layer_depth = 0;
-                        rm.n_coasted++;
-                    } else {
-                        // Surface hit — sharpen at depth proportional to SDF
-                        rm.current_layer_sharpen = true;
-                        if (rm.max_depth > 1 && rm.sdf_count >= 3) {
-                            float mean = rm.sdf_sum / (float)rm.sdf_count;
-                            float var  = (rm.sdf_sum_sq / (float)rm.sdf_count) - (mean * mean);
-                            float stddev = var > 0.0f ? sqrtf(var) : 1.0f;
-                            // Linear map: mean-0.5σ → depth 1, mean+1.5σ → max_depth
-                            float t_val = (sdf - (mean - 0.5f * stddev)) / (2.0f * stddev);
-                            t_val = std::max(0.0f, std::min(1.0f, t_val));
-                            rm.current_layer_depth = 1 + (int32_t)(t_val * (float)(rm.max_depth - 1));
-                            // Boost depth if SDF is increasing (approaching deeper surface)
-                            if (rm.sdf_derivative > 0.0f && rm.current_layer_depth < rm.max_depth) {
-                                rm.current_layer_depth++;
-                            }
-                        } else {
-                            rm.current_layer_depth = rm.max_depth;
-                        }
-                        rm.n_sharpened++;
-                    }
-                }
+                // Note: ray march SDF is now computed in the ffn_moe_probs
+                // handler using entropy (fires reliably for all MoE layers)
+                // instead of probe scores (which require ffn_inp interception).
             }
         }
 
@@ -3915,6 +3862,45 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
         auto & le = lctx->router_layer_entropy[layer_idx];
         le.first  += layer_entropy_sum;
         le.second += (int32_t)n_tokens;
+
+        // --- Ray march: use entropy as SDF ---
+        // High entropy = gate is confused = this layer needs sharp quality.
+        // Low entropy = gate is confident = safe to coast.
+        if (lctx->ray_march.enabled) {
+            auto & rm = lctx->ray_march;
+            float sdf = (n_tokens > 0) ? layer_entropy_sum / (float)n_tokens : 0.0f;
+
+            rm.sdf_sum    += sdf;
+            rm.sdf_sum_sq += sdf * sdf;
+            rm.sdf_count++;
+            rm.update_threshold();
+
+            rm.sdf_derivative = sdf - rm.prev_sdf;
+            rm.prev_sdf = sdf;
+            rm.current_sdf = sdf;
+
+            if (rm.coast_counter > 0) {
+                rm.coast_counter--;
+                rm.current_layer_sharpen = false;
+                rm.current_layer_depth = 0;
+                rm.n_coasted++;
+            } else if (rm.sdf_count >= 3 && sdf < rm.surface_threshold) {
+                float distance = rm.surface_threshold - sdf;
+                float scale = rm.surface_threshold > 1e-6f ? rm.surface_threshold : 1.0f;
+                int step = std::max(1, (int)(distance / scale * rm.coast_scale));
+                if (rm.sdf_derivative < 0.0f) {
+                    step = (int)((float)step * rm.derivative_boost);
+                }
+                rm.coast_counter = step - 1;
+                rm.current_layer_sharpen = false;
+                rm.current_layer_depth = 0;
+                rm.n_coasted++;
+            } else {
+                rm.current_layer_sharpen = true;
+                rm.current_layer_depth = rm.max_depth;
+                rm.n_sharpened++;
+            }
+        }
 
         // Chain to user callback if set
         if (lctx->cparams.cb_eval) {
@@ -4028,19 +4014,17 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                 }
             }
 
-            // 2b) Ray march: if active AND has collected SDF data, use live decision.
-            //     The ray march SDF is computed in the ffn_inp callback above.
-            //     If no SDF data has been collected (sdf_count == 0), fall through
-            //     to the static priority path to avoid blocking all sharpening.
-            if (lctx->ray_march.enabled && lctx->ray_march.sdf_count > 0) {
-                if (!lctx->ray_march.current_layer_sharpen) {
-                    goto jit_done;  // coasting — leave at blurry
-                }
-                // Fall through to sharpening with ray_march.current_layer_depth
-            }
-            // 2c) Static layer budget check (when ray march is off or has no data):
-            //     Skip layers not in the priority set.
-            else if (!lctx->jit_priority_layers.empty() &&
+            // 2b) Delta ray march JIT bypass: DISABLED for now.
+            //     The three-tier kernel runs on CPU mul_mat_id, but with -ngl 99
+            //     the scheduler may route expert ops to GPU where the ray march
+            //     code doesn't exist. Re-enable when GPU ray march is implemented
+            //     or when experts are confirmed CPU-only.
+            //
+            // TODO: re-enable when we can confirm mul_mat_id runs on CPU for
+            //       layers with --n-cpu-moe.
+
+            // 2c) Static layer budget check: skip layers not in the priority set.
+            if (!lctx->jit_priority_layers.empty() &&
                 lctx->jit_priority_layers.find(layer_idx) == lctx->jit_priority_layers.end()) {
                 goto jit_done;
             }
@@ -4425,15 +4409,10 @@ void llama_blurry_sharp_start_jit(
     ctx->router_per_token_experts.clear();
     ctx->router_recording = true;
 
-    // Initialize ray march if gate probe is available.
-    // The ray march uses the probe score as a signed distance function
-    // to adaptively decide per-layer quality during a single forward pass.
-    if (ctx->gate_probe_ctx) {
-        ctx->ray_march.enabled = true;
-        ctx->ray_march.reset();
-        ctx->ray_march.max_depth = bsctx->fractal_mode ? bsctx->fractal_max_depth : 1;
-        if (ctx->ray_march.max_depth < 1) ctx->ray_march.max_depth = 1;
-    }
+    // Ray march Level 0 (layer coasting via entropy SDF): DISABLED.
+    // It's redundant with the existing jit_priority_layers system and adds overhead.
+    // The real PIM speedup comes from Level 2 (three-tier block-skip kernel in mul_mat_id).
+    ctx->ray_march.enabled = false;
 
     LLAMA_LOG_DEBUG("%s: JIT per-layer sharpening enabled (ray_march=%s)\n",
                     __func__, ctx->ray_march.enabled ? "on" : "off");

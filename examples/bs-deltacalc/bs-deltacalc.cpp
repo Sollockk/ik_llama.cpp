@@ -118,6 +118,9 @@ static void dequant_to_f32(const void * src, ggml_type type, int64_t n_elements,
 // ---------------------------------------------------------------------------
 
 static ggml_type parse_quant_type(const char * s) {
+    if (!strcmp(s, "Q4_0"))   return GGML_TYPE_Q4_0;
+    if (!strcmp(s, "Q5_0"))   return GGML_TYPE_Q5_0;
+    if (!strcmp(s, "Q8_0"))   return GGML_TYPE_Q8_0;
     if (!strcmp(s, "Q2_K"))   return GGML_TYPE_Q2_K;
     if (!strcmp(s, "Q3_K_S")) return GGML_TYPE_Q3_K;
     if (!strcmp(s, "Q3_K_M")) return GGML_TYPE_Q3_K;
@@ -126,10 +129,10 @@ static ggml_type parse_quant_type(const char * s) {
     if (!strcmp(s, "Q5_K_S")) return GGML_TYPE_Q5_K;
     if (!strcmp(s, "Q5_K_M")) return GGML_TYPE_Q5_K;
     if (!strcmp(s, "Q6_K"))   return GGML_TYPE_Q6_K;
-    if (!strcmp(s, "Q8_0"))   return GGML_TYPE_Q8_0;
     if (!strcmp(s, "F16"))    return GGML_TYPE_F16;
     if (!strcmp(s, "F32"))    return GGML_TYPE_F32;
-    fprintf(stderr, "unknown quantization type: %s\n", s);
+    fprintf(stderr, "ERROR: unknown quantization type: '%s'\n", s);
+    fprintf(stderr, "  Valid types: Q4_0 Q5_0 Q8_0 Q2_K Q3_K_S Q3_K_M Q4_K_S Q4_K_M Q5_K_S Q5_K_M Q6_K F16 F32\n");
     return GGML_TYPE_Q2_K;
 }
 

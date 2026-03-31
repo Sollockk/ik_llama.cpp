@@ -34,6 +34,8 @@
 #include <mutex>
 #include <thread>
 #include <signal.h>
+#include <unistd.h>
+#include <cstring>
 #include <memory>
 #include <random>
 #include <algorithm>
@@ -429,6 +431,25 @@ inline void signal_handler(int signal) {
     }
 
     shutdown_handler(signal);
+}
+
+// Hard crash handler: _exit() immediately to avoid swap thrashing from cleanup
+// of massive model allocations. The kernel reclaims memory instantly on _exit().
+inline void crash_signal_handler(int sig) {
+    const char * name = "unknown";
+    switch (sig) {
+        case SIGSEGV: name = "SIGSEGV"; break;
+        case SIGABRT: name = "SIGABRT"; break;
+        case SIGBUS:  name = "SIGBUS";  break;
+        case SIGFPE:  name = "SIGFPE";  break;
+    }
+    // write() is async-signal-safe, fprintf is not
+    const char msg_pre[] = "\n[CRASH] Signal ";
+    const char msg_post[] = " — exiting immediately to free memory fast.\n";
+    (void)!write(STDERR_FILENO, msg_pre, sizeof(msg_pre) - 1);
+    (void)!write(STDERR_FILENO, name, strlen(name));
+    (void)!write(STDERR_FILENO, msg_post, sizeof(msg_post) - 1);
+    _exit(128 + sig);
 }
 
 static void log_prompt(const gpt_params & params_base, const json & body) {
@@ -2148,6 +2169,28 @@ int main(int argc, char ** argv) {
     sigint_action.sa_flags = 0;
     sigaction(SIGINT, &sigint_action, NULL);
     sigaction(SIGTERM, &sigint_action, NULL);
+
+    // Crash signals: _exit() immediately so the kernel reclaims our huge
+    // model allocations without swap-thrashing through destructors/cleanup.
+    struct sigaction crash_action;
+    crash_action.sa_handler = crash_signal_handler;
+    sigemptyset(&crash_action.sa_mask);
+    crash_action.sa_flags = SA_RESETHAND;  // one-shot, avoids infinite loop
+    sigaction(SIGSEGV, &crash_action, NULL);
+    sigaction(SIGABRT, &crash_action, NULL);
+    sigaction(SIGBUS,  &crash_action, NULL);
+    sigaction(SIGFPE,  &crash_action, NULL);
+
+    // Tell the OOM killer to target this process first. We'd rather die fast
+    // than have the whole system grind to a halt in swap.
+    {
+        FILE * f = fopen("/proc/self/oom_score_adj", "w");
+        if (f) {
+            fprintf(f, "1000\n");
+            fclose(f);
+            LOG_INF("Set oom_score_adj=1000 (OOM killer will target us first)\n");
+        }
+    }
 #elif defined (_WIN32)
     auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
         return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
