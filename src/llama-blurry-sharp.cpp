@@ -6732,3 +6732,358 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
 
     return n_wired;
 }
+
+// ---------------------------------------------------------------------------
+// Apply delta correction to non-expert tensors at startup (permanent upgrade)
+// ---------------------------------------------------------------------------
+
+static bool bs_is_expert_tensor_name(const std::string & name) {
+    return name.find("ffn_gate_exps") != std::string::npos ||
+           name.find("ffn_up_exps")   != std::string::npos ||
+           name.find("ffn_down_exps") != std::string::npos ||
+           name.find("ffn_up_gate_exps") != std::string::npos;
+}
+
+int32_t llama_blurry_sharp_apply_delta_non_expert(
+        llama_blurry_sharp_context * bsctx) {
+    LLAMA_LOG_INFO("%s: starting (bsctx=%p, n_levels=%d)\n", __func__,
+                   (void*)bsctx, bsctx ? (int)bsctx->correction_levels.size() : 0);
+    fflush(stderr);
+
+    if (!bsctx || bsctx->correction_levels.empty()) {
+        return 0;
+    }
+
+    auto & level = bsctx->correction_levels[0];
+    LLAMA_LOG_INFO("%s: level 0 has %zu delta tensors, %zu mmaps\n", __func__,
+                   level.delta_index.size(), level.mmaps.size());
+    fflush(stderr);
+    int32_t n_upgraded = 0;
+    int32_t n_skipped = 0;
+    int64_t total_bytes = 0;
+
+    int iter = 0;
+    for (auto & [name, dinfo] : level.delta_index) {
+        // Skip expert tensors — those use the runtime PIM kernel
+        if (bs_is_expert_tensor_name(name)) continue;
+
+        ggml_tensor * base = dinfo.base_tensor;
+        if (!base) {
+            if (bsctx->model) {
+                base = llama_get_model_tensor(bsctx->model, name.c_str());
+                dinfo.base_tensor = base;
+            }
+        }
+        if (!base || !base->data) { n_skipped++; continue; }
+
+        LLAMA_LOG_INFO("%s: [%d] %s type=%s buf=%p data=%p ne0=%lld\n", __func__, iter++,
+                       name.c_str(), ggml_type_name(base->type),
+                       (void*)base->buffer, base->data, (long long)base->ne[0]);
+        fflush(stderr);
+
+        // Skip GPU-resident tensors — can't access device memory from CPU.
+        if (base->buffer) {
+            bool is_host = false;
+            // ggml_backend_buffer_is_host may crash if backend not initialized
+            // Use a safe check: try-catch or just check buffer type name
+            const char * buf_name = ggml_backend_buffer_name(base->buffer);
+            is_host = (buf_name && (strstr(buf_name, "CPU") || strstr(buf_name, "cpu") ||
+                                    strstr(buf_name, "host") || strstr(buf_name, "Host") ||
+                                    strstr(buf_name, "mmap") || strstr(buf_name, "Mmap")));
+            LLAMA_LOG_INFO("%s:   buffer=%s is_host=%d\n", __func__, buf_name ? buf_name : "null", (int)is_host);
+            fflush(stderr);
+            if (!is_host) {
+                n_skipped++;
+                continue;
+            }
+        }
+
+        // Get delta data from mmap
+        if (dinfo.split_idx >= (int)level.mmaps.size() || !level.mmaps[dinfo.split_idx]) {
+            n_skipped++; continue;
+        }
+        const uint8_t * mmap_base_ptr = (const uint8_t *)level.mmaps[dinfo.split_idx]->addr();
+        size_t mmap_total_size = level.mmaps[dinfo.split_idx]->size();
+
+        // Bounds check: delta offset + nbytes must be within the mmap
+        if (dinfo.file_offset + dinfo.nbytes > mmap_total_size) {
+            LLAMA_LOG_INFO("%s:   SKIP %s — delta offset %zu + nbytes %zu > mmap size %zu\n",
+                           __func__, name.c_str(), dinfo.file_offset, dinfo.nbytes, mmap_total_size);
+            n_skipped++; continue;
+        }
+
+        const uint8_t * delta_data = mmap_base_ptr + dinfo.file_offset;
+
+        int64_t n_elements = 1;
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            if (base->ne[d] > 0) n_elements *= base->ne[d];
+        }
+        if (n_elements == 0) { n_skipped++; continue; }
+
+        // Verify delta nbytes matches expected size for the type
+        size_t expected_delta_bytes = ggml_row_size(dinfo.type, dinfo.ne[0]);
+        for (int d = 1; d < GGML_MAX_DIMS; d++) {
+            if (dinfo.ne[d] > 0) expected_delta_bytes *= dinfo.ne[d];
+        }
+
+        ggml_type_traits_t dt = ggml_internal_get_type_traits(dinfo.type);
+        if (!dt.to_float) { n_skipped++; continue; }
+
+        LLAMA_LOG_INFO("%s:   delta_offset=%zu delta_nbytes=%zu mmap_size=%zu n_elem=%lld\n",
+                       __func__, dinfo.file_offset, dinfo.nbytes, mmap_total_size, (long long)n_elements);
+        fflush(stderr);
+
+        LLAMA_LOG_DEBUG("%s: upgrading %s (type=%s, %lld elements, delta_type=%s)\n",
+                        __func__, name.c_str(), ggml_type_name(base->type),
+                        (long long)n_elements, ggml_type_name(dinfo.type));
+
+        // Skip F32 base tensors — norms/embeddings are identical between
+        // blurry and sharp models (both stored as F32). Delta is quantized zeros.
+        if (base->type == GGML_TYPE_F32) {
+            n_skipped++;
+            continue;
+        }
+
+        if (false) { // disabled F32 path — kept for reference
+            std::vector<float> delta_f32(n_elements);
+            dt.to_float(delta_data, delta_f32.data(), n_elements);
+
+            float * base_f32 = (float *)base->data;
+            for (int64_t i = 0; i < n_elements; i++) {
+                base_f32[i] += delta_f32[i];
+            }
+            n_upgraded++;
+            total_bytes += n_elements * sizeof(float);
+        } else {
+            // Quantized base: dequant both → add → requant back to base type.
+            // For low-precision base types (e.g. TQ1_0) the delta correction
+            // is largely lost, but the non-expert tensors stay compatible with
+            // the blurry model's compute graph.
+            ggml_type_traits_t bt = ggml_internal_get_type_traits(base->type);
+            if (!bt.to_float || !bt.from_float) {
+                LLAMA_LOG_DEBUG("%s: skipping %s — no round-trip for type %s\n",
+                                __func__, name.c_str(), ggml_type_name(base->type));
+                n_skipped++;
+                continue;
+            }
+
+            size_t original_bytes = ggml_nbytes(base);
+            size_t requant_bytes  = ggml_row_size(base->type, base->ne[0]);
+            int64_t n_rows = n_elements / base->ne[0];
+            if (requant_bytes * n_rows != original_bytes) {
+                LLAMA_LOG_DEBUG("%s: skipping %s — size mismatch: %zu vs %zu\n",
+                                __func__, name.c_str(), requant_bytes * n_rows, original_bytes);
+                n_skipped++;
+                continue;
+            }
+
+            std::vector<float> base_f32(n_elements);
+            std::vector<float> delta_f32(n_elements);
+
+            bt.to_float(base->data, base_f32.data(), n_elements);
+            dt.to_float(delta_data, delta_f32.data(), n_elements);
+
+            for (int64_t i = 0; i < n_elements; i++) {
+                base_f32[i] += delta_f32[i];
+            }
+
+            // The base tensor data lives in a read-only mmap region
+            // (PROT_READ | MAP_SHARED).  Allocate a writable copy.
+            bsctx->delta_owned_bufs.emplace_back(original_bytes);
+            auto & owned = bsctx->delta_owned_bufs.back();
+
+            // Requantize back to base type into writable memory
+            bt.from_float(base_f32.data(), owned.data(), n_elements);
+            base->data = owned.data();
+
+            n_upgraded++;
+            total_bytes += original_bytes;
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: upgraded %d non-expert tensors (%.1f MiB), skipped %d\n",
+                   __func__, n_upgraded, total_bytes / (1024.0 * 1024.0), n_skipped);
+
+    return n_upgraded;
+}
+
+// ---------------------------------------------------------------------------
+// Apply delta correction to GPU expert tensors at startup (permanent upgrade)
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_apply_delta_gpu_experts(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || bsctx->correction_levels.empty()) {
+        return 0;
+    }
+
+    auto & level = bsctx->correction_levels[0];
+    int32_t n_upgraded = 0;
+    int32_t n_skipped = 0;
+    int64_t total_bytes = 0;
+
+    LLAMA_LOG_INFO("%s: upgrading GPU tensors with delta correction (experts + attention)...\n", __func__);
+
+    for (auto & [name, dinfo] : level.delta_index) {
+
+        ggml_tensor * base = dinfo.base_tensor;
+        if (!base) {
+            if (bsctx->model) {
+                base = llama_get_model_tensor(bsctx->model, name.c_str());
+                dinfo.base_tensor = base;
+            }
+        }
+        if (!base || !base->data) { n_skipped++; continue; }
+
+        // Only process GPU-resident tensors (skip CPU ones — PIM kernel handles those)
+        bool is_gpu = base->buffer && !ggml_backend_buffer_is_host(base->buffer);
+        const char * buf_name = base->buffer ? ggml_backend_buffer_name(base->buffer) : "null";
+        if (!is_gpu) {
+            if (n_skipped < 3) {
+                LLAMA_LOG_INFO("%s: SKIP (CPU) %s — buffer=%s, is_host=%d\n",
+                               __func__, name.c_str(), buf_name,
+                               base->buffer ? (int)ggml_backend_buffer_is_host(base->buffer) : -1);
+            }
+            n_skipped++;
+            continue;
+        }
+        // Skip F32 tensors (norms, biases) — identical between blurry and sharp
+        if (base->type == GGML_TYPE_F32) {
+            n_skipped++;
+            continue;
+        }
+
+        LLAMA_LOG_INFO("%s: FOUND GPU tensor: %s type=%s — buffer=%s\n",
+                       __func__, name.c_str(), ggml_type_name(base->type), buf_name);
+
+        // Get delta data from mmap
+        if (dinfo.split_idx >= (int)level.mmaps.size() || !level.mmaps[dinfo.split_idx]) {
+            n_skipped++; continue;
+        }
+        const uint8_t * delta_data = (const uint8_t *)level.mmaps[dinfo.split_idx]->addr()
+                                     + dinfo.file_offset;
+
+        if (dinfo.file_offset + dinfo.nbytes > level.mmaps[dinfo.split_idx]->size()) {
+            n_skipped++; continue;
+        }
+
+        int64_t n_elements = 1;
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            if (base->ne[d] > 0) n_elements *= base->ne[d];
+        }
+        if (n_elements == 0) { n_skipped++; continue; }
+
+        ggml_type_traits_t bt = ggml_internal_get_type_traits(base->type);
+        ggml_type_traits_t dt = ggml_internal_get_type_traits(dinfo.type);
+        if (!bt.to_float || !bt.from_float || !dt.to_float) { n_skipped++; continue; }
+
+        size_t original_bytes = ggml_nbytes(base);
+
+        // 1. Download GPU tensor data to CPU
+        std::vector<uint8_t> gpu_data(original_bytes);
+        ggml_backend_tensor_get(base, gpu_data.data(), 0, original_bytes);
+
+        // 2. Dequant blurry to f32
+        std::vector<float> base_f32(n_elements);
+        bt.to_float(gpu_data.data(), base_f32.data(), n_elements);
+
+        // 3. Dequant delta to f32 and add
+        std::vector<float> delta_f32(n_elements);
+        dt.to_float(delta_data, delta_f32.data(), n_elements);
+
+        for (int64_t i = 0; i < n_elements; i++) {
+            base_f32[i] += delta_f32[i];
+        }
+
+        // 4. Requant to base type
+        bt.from_float(base_f32.data(), gpu_data.data(), n_elements);
+
+        // 5. Upload corrected data back to GPU
+        ggml_backend_tensor_set(base, gpu_data.data(), 0, original_bytes);
+
+        n_upgraded++;
+        total_bytes += original_bytes;
+
+        if (n_upgraded % 10 == 0) {
+            LLAMA_LOG_INFO("%s: %d tensors upgraded (%.1f MiB)...\n",
+                           __func__, n_upgraded, total_bytes / (1024.0 * 1024.0));
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: upgraded %d GPU tensors (%.1f MiB), skipped %d\n",
+                   __func__, n_upgraded, total_bytes / (1024.0 * 1024.0), n_skipped);
+
+    // Clear delta data pointers on upgraded GPU tensors — they no longer need
+    // runtime correction (the weights are already corrected).
+    for (auto & [name, dinfo] : level.delta_index) {
+        if (dinfo.base_tensor && dinfo.base_tensor->buffer &&
+            !ggml_backend_buffer_is_host(dinfo.base_tensor->buffer)) {
+            dinfo.base_tensor->ray_march_delta_data = NULL;
+        }
+    }
+
+    // ---- Audit: find ALL GPU tensors and report which are NOT upgraded ----
+    if (bsctx->model) {
+        int n_gpu_total = 0;
+        int n_gpu_upgraded = 0;
+        int n_gpu_no_delta = 0;
+        int n_gpu_f32_skip = 0;
+
+        // Iterate all tensors in the model
+        for (int i = 0; ; i++) {
+            char tname_buf[256];
+            snprintf(tname_buf, sizeof(tname_buf), "%d", i);
+            // Use the layer_tensor_names from bsctx if available,
+            // otherwise scan the delta index for base tensors
+            break; // can't iterate model tensors without an API
+        }
+
+        // Alternative: scan delta index for GPU tensors that were NOT upgraded
+        for (auto & [name, dinfo] : level.delta_index) {
+            ggml_tensor * base = dinfo.base_tensor;
+            if (!base) continue;
+            if (!base->buffer || ggml_backend_buffer_is_host(base->buffer)) continue;
+
+            n_gpu_total++;
+            if (base->type == GGML_TYPE_F32) {
+                n_gpu_f32_skip++;
+            } else {
+                // Check if it was upgraded (delta_data pointer cleared = upgraded)
+                if (base->ray_march_delta_data == NULL) {
+                    n_gpu_upgraded++;
+                } else {
+                    n_gpu_no_delta++;
+                    LLAMA_LOG_WARN("%s: GPU tensor NOT upgraded: %s (type=%s)\n",
+                                   __func__, name.c_str(), ggml_type_name(base->type));
+                }
+            }
+        }
+
+        // Also check for GPU tensors that have NO delta entry at all
+        // (tensors in the model but not in the delta GGUF)
+        // We need to iterate model tensors for this — use sharp_index as proxy
+        int n_gpu_missing_delta = 0;
+        for (auto & [name, sinfo] : bsctx->sharp_index) {
+            if (!sinfo.base_tensor) continue;
+            ggml_tensor * base = sinfo.base_tensor;
+            if (!base->buffer || ggml_backend_buffer_is_host(base->buffer)) continue;
+            if (base->type == GGML_TYPE_F32) continue;
+
+            // Check if this tensor has a delta entry
+            if (level.delta_index.find(name) == level.delta_index.end()) {
+                n_gpu_missing_delta++;
+                LLAMA_LOG_WARN("%s: GPU tensor has NO delta data: %s (type=%s)\n",
+                               __func__, name.c_str(), ggml_type_name(base->type));
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: GPU audit: %d upgraded, %d f32 (skipped), %d failed, %d no delta entry\n",
+                       __func__, n_gpu_upgraded, n_gpu_f32_skip, n_gpu_no_delta, n_gpu_missing_delta);
+
+        if (n_gpu_no_delta == 0 && n_gpu_missing_delta == 0) {
+            LLAMA_LOG_INFO("%s: ✓ All non-F32 GPU tensors are delta-upgraded\n", __func__);
+        }
+    }
+
+    return n_upgraded;
+}

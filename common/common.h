@@ -563,6 +563,15 @@ struct gpt_params {
     // Enables hierarchical weight reconstruction: base + sum(deltas)
     std::vector<std::string> delta_paths;
 
+    // --gpu-delta-priority: skip auto --cpu-moe when --sharp is present.
+    bool        gpu_delta_priority     = false;
+
+    // --n-gpu-delta-layers N: put the first N expert layers on GPU and
+    // delta-upgrade them at startup. These layers get near-sharp quality
+    // permanently with zero per-token overhead. Remaining expert layers
+    // follow --n-cpu-moe rules (CPU with PIM delta kernel at runtime).
+    int         n_gpu_delta_layers     = 0;
+
     // --bs-sharp-experts-gpu N   overlay top-N experts per layer on GPU (-1=all, 0=none/CPU-only)
     // --bs-sharp-experts-cpu N   overlay top-N experts per layer on CPU (-1=all, 0=skip, -2=same as GPU)
     // --bs-no-parallel-io        disable parallel pread for expert slices

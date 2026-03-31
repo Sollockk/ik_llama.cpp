@@ -1852,6 +1852,26 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API void llama_blurry_sharp_deflate_expert_types(
             struct llama_blurry_sharp_context * bsctx);
 
+    // Apply delta correction to non-expert tensors (attention, norms) at startup.
+    // For each non-expert tensor with delta data: dequant(blurry) + dequant(delta) → requant.
+    // Permanently upgrades weights to near-sharp quality. Call once after init.
+    // Returns number of tensors upgraded.
+    LLAMA_API int32_t llama_blurry_sharp_apply_delta_non_expert(
+            struct llama_blurry_sharp_context * bsctx);
+
+    // Apply delta correction to GPU expert tensors at startup (permanent upgrade).
+    // Downloads GPU weights to CPU, adds delta correction, uploads back.
+    // Same VRAM size, better quality. Clears ray_march_delta_data on upgraded tensors.
+    LLAMA_API int32_t llama_blurry_sharp_apply_delta_gpu_experts(
+            struct llama_blurry_sharp_context * bsctx);
+
+    // Get the range of layers that have delta expert coverage.
+    // Returns the highest layer index + 1 that has delta data for expert tensors.
+    // Layers beyond this have no delta and should stay on CPU (no point putting
+    // them on GPU at blurry quality). Use this to auto-compute --n-cpu-moe.
+    LLAMA_API int32_t llama_blurry_sharp_delta_max_layer(
+            struct llama_blurry_sharp_context * bsctx);
+
     // Wire delta correction data to model expert tensors for ray march PIM.
     // For each expert tensor that has a corresponding entry in the delta index
     // (from correction_levels[0]), sets tensor->ray_march_delta_data to the

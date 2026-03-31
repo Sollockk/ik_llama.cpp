@@ -17181,9 +17181,10 @@ static void ggml_compute_forward_mul_mat_id(
 
     // Ray march PIM: delta correction for CPU expert tensors.
     // Block size adapts to delta quant type (32 for Q4_0, 256 for K-quants).
+    // When vec_dot_type differs between blurry and delta, the input is re-quantized
+    // for the delta's vec_dot_type (one-time cost per input column).
     const bool has_delta = (src0->ray_march_delta_data != NULL);
-    const int rm_block_size = has_delta ?
-        ggml_blck_size(src0->ray_march_delta_type) : 0;
+    const int rm_block_size = has_delta ? ggml_blck_size(src0->ray_march_delta_type) : 0;
     const bool ray_march_active = has_delta && rm_block_size > 0 && (ne00 % rm_block_size == 0);
     const bool ray_march_fullrow = has_delta && !ray_march_active;
     const enum ggml_type ray_march_delta_type = src0->ray_march_delta_type;
@@ -17438,9 +17439,27 @@ IQK_MulMat_Not_Available:;
                             }
                         }
 
-                        // Quantize input for delta's vec_dot_type if different from blurry's
-                        // For now, assume same input works for both (TODO: handle divergent types)
+                        // Re-quantize input for delta's vec_dot_type if different from blurry's.
+                        // This is a one-time cost per input column, reused across all output rows.
                         const void * input_for_delta = src1_col;
+                        void * delta_input_alloc = NULL;
+                        {
+                            ggml_type_traits_t dt = ggml_internal_get_type_traits(ray_march_delta_type);
+                            if (dt.vec_dot_type != vec_dot_type && src1->type == GGML_TYPE_F32) {
+                                // Re-quantize from f32 source to delta's vec_dot_type
+                                size_t dinput_size = ggml_row_size(dt.vec_dot_type, ne00);
+                                delta_input_alloc = malloc(dinput_size);
+                                if (delta_input_alloc) {
+                                    ggml_type_traits_t dit = ggml_internal_get_type_traits(dt.vec_dot_type);
+                                    if (dit.from_float) {
+                                        const float * src1_f32_col = (src1_f32 != NULL) ? src1_f32
+                                            : (const float *)((const char *)src1->data + i11*nb11 + i12*nb12);
+                                        dit.from_float(src1_f32_col, delta_input_alloc, ne00);
+                                    }
+                                    input_for_delta = delta_input_alloc;
+                                }
+                            }
+                        }
 
                         for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ++ir0) {
                             const char * delta_row = delta_expert + ir0 * delta_row_stride;
@@ -17453,6 +17472,7 @@ IQK_MulMat_Not_Available:;
                                 &tiers, rm_block_size);
                         }
 
+                        if (delta_input_alloc) free(delta_input_alloc);
                         if (tiers.blurry_blocks != rm_blurry_buf) free(tiers.blurry_blocks);
                         if (tiers.sharp_blocks  != rm_sharp_buf)  free(tiers.sharp_blocks);
                     } else if (ray_march_fullrow) {

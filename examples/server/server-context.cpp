@@ -76,6 +76,21 @@ server_context::~server_context() {
 bool server_context::load_model(const gpt_params& params_) {
     params_base = params_;
 
+    // --n-gpu-delta-layers N: the first N expert layers are eligible for GPU
+    // delta upgrade at startup. Does NOT change ngl or ncmoe — use those
+    // separately to control the GPU/CPU split:
+    //   -ngl 99              → all attention on GPU (required for this model)
+    //   --n-cpu-moe M        → first M expert layers on CPU (PIM kernel)
+    //   --n-gpu-delta-layers N → GPU experts in layers M..M+N get delta-upgraded
+    //
+    // The flag just enables apply_delta_gpu_experts() after loading.
+    // The actual GPU/CPU split is controlled by -ngl and --n-cpu-moe.
+    if (params_base.n_gpu_delta_layers > 0 && !params_base.delta_paths.empty()) {
+        LOG_INFO("GPU delta layers: will upgrade first N GPU expert layers at startup", {
+            {"n_gpu_delta_layers", params_base.n_gpu_delta_layers},
+        });
+    }
+
     llama_init_result llama_init = llama_init_from_gpt_params(params_base);
 
     model = llama_init.model;
@@ -316,6 +331,11 @@ bool server_context::load_model(const gpt_params& params_) {
             if (bs_params.n_delta_levels > 0) {
                 int32_t n_wired = llama_blurry_sharp_wire_delta_tensors(bsctx);
                 LOG_INFO("Delta tensors wired for ray march PIM", {{"n_wired", n_wired}});
+
+                // Permanently upgrade GPU expert tensors with delta correction.
+                // Downloads weights, adds correction, uploads back. Same VRAM, better quality.
+                int32_t n_gpu = llama_blurry_sharp_apply_delta_gpu_experts(bsctx);
+                LOG_INFO("GPU expert tensors upgraded with delta", {{"n_upgraded", n_gpu}});
             }
 
             // Determine mode
@@ -498,6 +518,50 @@ bool server_context::load_model(const gpt_params& params_) {
                     });
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Standalone delta loading (no --sharp required)
+    // When --delta is provided without --sharp, load deltas directly and
+    // wire them to model tensors. No JIT, no sharp overlay — pure PIM.
+    // -----------------------------------------------------------------------
+    if (!bsctx && !params_base.delta_paths.empty()) {
+        LOG_INFO("Delta-only PIM mode (no sharp model)", {{"n_levels", (int)params_base.delta_paths.size()}});
+
+        // Create a minimal blurry-sharp context just for delta loading
+        llama_blurry_sharp_params bs_params = llama_blurry_sharp_default_params();
+
+        // Use a dummy sharp path — the init needs it but we won't use sharp data.
+        // Actually, we need to bypass init and load deltas directly.
+        // Create context manually and load only deltas.
+        // For now, use the blurry model as "sharp" — apply_non_expert_permanent will be a no-op
+        // since types match, and we only care about delta loading.
+        bs_params.sharp_model_path = params_base.model.c_str(); // blurry == "sharp" → no-op overlay
+        bs_params.permanent = true;
+        bs_params.use_mmap = true;
+
+        std::vector<const char *> delta_cstrs;
+        for (auto & p : params_base.delta_paths) delta_cstrs.push_back(p.c_str());
+        bs_params.delta_paths    = delta_cstrs.data();
+        bs_params.n_delta_levels = (int32_t)delta_cstrs.size();
+
+        bsctx = llama_blurry_sharp_init(model, bs_params);
+        if (bsctx) {
+            int32_t n_wired = llama_blurry_sharp_wire_delta_tensors(bsctx);
+            LOG_INFO("Delta-only PIM: expert tensors wired", {{"n_wired", n_wired}});
+
+            // Permanently upgrade GPU expert tensors with delta correction.
+            int32_t n_gpu = llama_blurry_sharp_apply_delta_gpu_experts(bsctx);
+            LOG_INFO("Delta-only PIM: GPU expert tensors upgraded", {{"n_upgraded", n_gpu}});
+
+            // TODO: apply delta to non-expert tensors at startup for full --sharp replacement.
+            // Currently crashes on CPU-only configs due to mmap/requant issues.
+            // For now, use --sharp for non-expert quality + --delta for expert PIM.
+            // int32_t n_upgraded = llama_blurry_sharp_apply_delta_non_expert(bsctx);
+            // LOG_INFO("Delta-only PIM: non-expert tensors upgraded", {{"n_upgraded", n_upgraded}});
+        } else {
+            LOG_WARNING("Failed to initialize delta-only context", {});
         }
     }
 

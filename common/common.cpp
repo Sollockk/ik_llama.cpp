@@ -471,11 +471,14 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
                 break;
             }
         }
-        if (!has_cpu_moe) {
+        if (!has_cpu_moe && !params.gpu_delta_priority) {
             fprintf(stderr, "%s: --sharp active, auto-adding --cpu-moe "
                     "(all MoE expert tensors → plain CPU for cross-type overlay)\n", __func__);
             params.tensor_buft_overrides.push_back(
                 {strdup("\\.ffn_(up|down|gate)_exps\\.weight"), ggml_backend_cpu_buffer_type()});
+        } else if (params.gpu_delta_priority) {
+            fprintf(stderr, "%s: --gpu-delta-priority active, skipping auto --cpu-moe "
+                    "(GPU experts will be delta-upgraded at startup)\n", __func__);
         }
     }
     if (!params.tensor_buft_overrides.empty()) {
@@ -2406,6 +2409,16 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--delta") {
         CHECK_ARG
         params.delta_paths.push_back(argv[i]);
+        return true;
+    }
+    if (arg == "--gpu-delta-priority") {
+        params.gpu_delta_priority = true;
+        return true;
+    }
+    if (arg == "--n-gpu-delta-layers") {
+        CHECK_ARG
+        params.n_gpu_delta_layers = std::stoi(argv[i]);
+        params.gpu_delta_priority = true;  // implies priority mode
         return true;
     }
     if (arg == "--bs-cpu-skip-list") {

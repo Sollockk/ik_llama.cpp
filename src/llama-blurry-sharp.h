@@ -414,6 +414,12 @@ struct llama_blurry_sharp_context {
     std::vector<uint8_t> requant_buf;
     std::vector<uint8_t> read_buf;    // fallback when pinned staging is unavailable or too small
 
+    // -- owned buffers for delta-upgraded tensors --
+    // When apply_delta_non_expert() modifies mmap'd tensors, we must allocate
+    // writable copies (mmap is PROT_READ / MAP_SHARED).  These are kept alive
+    // for the model's lifetime and freed when this context is destroyed.
+    std::vector<std::vector<uint8_t>> delta_owned_bufs;
+
     // -- RAM cache for sharp tensor data (memory-tier management) --
     //
     // When enabled, sharp tensor data is pre-read into anonymous heap buffers

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <stdexcept>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 #include <map>
@@ -41,6 +42,11 @@ struct llama_model_loader {
     size_t  n_bytes    = 0;
 
     int     ncmoe      = 0;
+
+    // When gpu_delta_priority is true, expert layers WITHOUT delta coverage
+    // are forced to CPU. Only delta-covered expert layers go to GPU.
+    bool                         gpu_delta_priority = false;
+    std::unordered_set<int>      delta_covered_layers;  // layers with delta expert data
 
     bool use_mmap = false;
     bool check_tensors;
