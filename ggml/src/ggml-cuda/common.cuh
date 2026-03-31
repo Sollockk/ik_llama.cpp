@@ -882,6 +882,31 @@ struct ggml_backend_cuda_context {
         return stream(device, 0);
     }
 
+    // JIT upload stream (stream index 1) for overlapping expert weight
+    // uploads with compute on stream 0.
+    cudaStream_t jit_upload_stream() {
+        return stream(device, 1);
+    }
+
+    // Event for synchronizing JIT uploads on stream 1 with compute on stream 0.
+    cudaEvent_t jit_upload_event = nullptr;
+
+    void jit_record_upload_done() {
+        if (!jit_upload_event) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaEventCreateWithFlags(&jit_upload_event, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(jit_upload_event, jit_upload_stream()));
+    }
+
+    // Make compute stream 0 wait for all JIT uploads to complete on stream 1.
+    // Non-blocking on the CPU — the GPU handles the dependency internally.
+    void jit_wait_for_uploads() {
+        if (jit_upload_event) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream(), jit_upload_event, 0));
+        }
+    }
+
     cublasHandle_t cublas_handle(int device) {
         if (cublas_handles[device] == nullptr) {
             ggml_cuda_set_device(device);

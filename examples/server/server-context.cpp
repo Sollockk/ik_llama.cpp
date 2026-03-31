@@ -5,6 +5,7 @@
 
 #include "common.h"
 #include "llama.h"
+#include "llama-streaming.h"
 
 #include <unordered_set>
 #include <cmath>
@@ -97,6 +98,16 @@ bool server_context::load_model(const gpt_params& params_) {
     }
 
     n_ctx = llama_n_ctx(ctx);
+
+    // Initialize streaming micro-graph execution engine
+    if (params_base.streaming_decode) {
+        if (gate_probe && bsctx) {
+            streaming_enabled = true;
+            LOG_INFO("streaming micro-graph execution enabled (iterative probe-driven refinement)", {});
+        } else {
+            LOG_WARNING("--streaming requires both gate probes (--lora) and blurry-sharp (--sharp)", {});
+        }
+    }
 
     // Initialize probe-driven three-tier layer management
     if (params_base.bs_probe_tiers) {
@@ -255,6 +266,15 @@ bool server_context::load_model(const gpt_params& params_) {
         bs_params.ram_cache_bytes    = (int64_t)params_base.bs_ram_cache_mb * 1024 * 1024;
         bs_params.flash_experts      = params_base.bs_flash_experts;
 
+        // Fractal delta correction chain
+        std::vector<const char *> delta_cstrs;
+        if (!params_base.delta_paths.empty()) {
+            for (auto & p : params_base.delta_paths) delta_cstrs.push_back(p.c_str());
+            bs_params.delta_paths    = delta_cstrs.data();
+            bs_params.n_delta_levels = (int32_t)delta_cstrs.size();
+            LOG_INFO("Delta correction chain", {{"n_levels", bs_params.n_delta_levels}});
+        }
+
         bsctx = llama_blurry_sharp_init(model, bs_params);
 
         if (!bsctx) {
@@ -292,6 +312,12 @@ bool server_context::load_model(const gpt_params& params_) {
                     }
                 }
             }
+            // Wire fractal delta correction data to model tensors for ray march PIM
+            if (bs_params.n_delta_levels > 0) {
+                int32_t n_wired = llama_blurry_sharp_wire_delta_tensors(bsctx);
+                LOG_INFO("Delta tensors wired for ray march PIM", {{"n_wired", n_wired}});
+            }
+
             // Determine mode
             bool use_moe_dynamic = params_base.bs_moe_combination;
             int32_t n_expert      = llama_blurry_sharp_n_experts(bsctx);
@@ -4407,9 +4433,39 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             {"flash_experts", params_base.bs_flash_experts},
             {"n_skip_layers", (turbo_active && !is_generation) ? (int)turbo_skip_layers_prompt.size() : 0},
             {"prompt_repair", prompt_repair_active},
+            {"streaming", streaming_enabled && is_generation},
         });
 
-        const int ret = llama_decode(ctx, batch_view);
+        int ret;
+        if (streaming_enabled && is_generation && gate_probe && bsctx) {
+            // Streaming micro-graph execution: iterative refinement with
+            // multi-signal replanning (probe + entropy + expert diversity).
+            const int n_model_layers = llama_n_layer(model);
+            const int n_transformer = n_model_layers;
+
+            std::unordered_set<int32_t> skip_set(turbo_skip_layers.begin(),
+                                                  turbo_skip_layers.end());
+
+            // Build plan from cross-token EMA history if available,
+            // otherwise fall back to static tier plan.
+            llama_execution_plan plan;
+            if (!streaming_ema_scores.empty()) {
+                plan = llama_plan_from_probe_history(
+                    n_transformer, streaming_ema_scores, skip_set,
+                    -0.5f,  // skip_sigma: skip below mean - 0.5σ
+                    1.0f);  // sharp_sigma: sharpen above mean + 1σ
+            } else {
+                std::unordered_set<int32_t> prio_set;
+                plan = llama_plan_from_tiers(n_transformer, skip_set, prio_set);
+            }
+
+            ret = llama_streaming_decode(*ctx, batch_view, &plan);
+
+            // Carry over EMA scores for next token
+            streaming_ema_scores = plan.ema_scores;
+        } else {
+            ret = llama_decode(ctx, batch_view);
+        }
         const double t_decode_ms = (ggml_time_us() - t_decode_start) / 1000.0;
         if (ret == 0) {
             LOG_INFO("decode complete", {

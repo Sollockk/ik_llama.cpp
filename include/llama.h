@@ -1643,6 +1643,14 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
                                                 // pages are faster to recover than re-faulting from
                                                 // a GGUF mmap.  Set -1 to disable.
 
+        // --- Fractal delta correction chain ---
+        // When n_delta_levels > 0, the system operates in fractal mode:
+        // weights are reconstructed as base + sum(delta_i for i in 1..depth),
+        // where depth is determined per-layer by probe scores.
+        // Each delta GGUF stores quantized residuals at one correction level.
+        const char ** delta_paths;              // array of delta GGUF paths (level 1..N)
+        int32_t       n_delta_levels;           // number of delta files (0 = classic sharp mode)
+
         bool     flash_experts;                 // flash-moe style expert streaming: instead of loading
                                                 // blurry expert weights into RAM and overlaying sharp
                                                 // data on top, stream Q4_K_M expert slices directly
@@ -1842,6 +1850,14 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // Restore expert tensor types to their original (blurry) types after
     // the scheduler has allocated device copies at the inflated size.
     LLAMA_API void llama_blurry_sharp_deflate_expert_types(
+            struct llama_blurry_sharp_context * bsctx);
+
+    // Wire delta correction data to model expert tensors for ray march PIM.
+    // For each expert tensor that has a corresponding entry in the delta index
+    // (from correction_levels[0]), sets tensor->ray_march_delta_data to the
+    // mmap'd delta data and tensor->ray_march_delta_type to the delta quant type.
+    // Call once after delta GGUFs are loaded. Returns number of tensors wired.
+    LLAMA_API int32_t llama_blurry_sharp_wire_delta_tensors(
             struct llama_blurry_sharp_context * bsctx);
 
     // -----------------------------------------------------------------------
@@ -2104,6 +2120,29 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             struct llama_context * ctx,
             const int32_t        * layer_indices,
             int32_t                n_layers);
+
+    // -----------------------------------------------------------------------
+    // Streaming Micro-Graph Execution Engine
+    //
+    // When enabled, inference uses an iterative execution model where:
+    //   Pass 1: Execute all layers per the plan (skip/blurry/sharp)
+    //   Pass 2+: Re-execute only high-importance layers with sharp quality
+    //   Stop: When probe scores converge or max iterations reached
+    //
+    // This enables "looped instantiated compute" — layers exist only for
+    // the moment they compute, and high-importance layers can be revisited
+    // with better quality based on intermediate probe results.
+    // -----------------------------------------------------------------------
+
+    // Enable/disable streaming decode for this context.
+    // When enabled, llama_decode() uses the streaming engine for MoE models.
+    LLAMA_API void llama_set_streaming_decode(
+            struct llama_context * ctx,
+            bool                   enable);
+
+    // Check if streaming decode is enabled.
+    LLAMA_API bool llama_get_streaming_decode(
+            const struct llama_context * ctx);
 
     // -----------------------------------------------------------------------
     // Gate Probe — Per-Layer Importance Prediction

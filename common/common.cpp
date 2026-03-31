@@ -2399,6 +2399,15 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.bs_probe_tiers = true;
         return true;
     }
+    if (arg == "--streaming") {
+        params.streaming_decode = true;
+        return true;
+    }
+    if (arg == "--delta") {
+        CHECK_ARG
+        params.delta_paths.push_back(argv[i]);
+        return true;
+    }
     if (arg == "--bs-cpu-skip-list") {
         CHECK_ARG
         // parse comma-separated int list of CPU layers to skip

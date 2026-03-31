@@ -50,6 +50,16 @@ GGML_API void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback,
 // finished before evicting cached GPU buffers.
 GGML_API void ggml_backend_cuda_device_synchronize(int device);
 
+// JIT expert upload on a dedicated CUDA stream (stream 1), separate from
+// the compute stream (stream 0).  This allows expert weight uploads to
+// overlap with compute on the GPU.
+// After all uploads, call ggml_backend_cuda_jit_sync_uploads() to insert
+// a CUDA event dependency: compute stream 0 waits for upload stream 1.
+// Both calls are non-blocking on the CPU.
+GGML_API void ggml_backend_cuda_jit_upload(ggml_backend_t backend, struct ggml_tensor * tensor,
+                                            const void * data, size_t offset, size_t size);
+GGML_API void ggml_backend_cuda_jit_sync_uploads(ggml_backend_t backend);
+
 #ifdef  __cplusplus
 }
 #endif

@@ -805,6 +805,13 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
+        // Ray march: secondary weight data for mixed-precision PIM computation.
+        // When non-NULL, the CPU mul_mat_id kernel uses the ray march path:
+        //   result = dense_vec_dot(data) + sparse_vec_dot(ray_march_delta_data)
+        // The delta data is typically mmap'd from a delta correction GGUF.
+        void *         ray_march_delta_data; // delta weight data (additive correction)
+        enum ggml_type ray_march_delta_type; // quantization type of the delta
+
         // char padding[4];
     };
 

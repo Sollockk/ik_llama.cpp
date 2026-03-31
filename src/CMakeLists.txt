@@ -60,6 +60,8 @@ add_library(llama
             llama-blurry-sharp.h
             llama-blurry-sharp.cpp
             llama-gate-probe.cpp
+            llama-streaming.h
+            llama-streaming.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp

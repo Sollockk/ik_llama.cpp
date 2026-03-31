@@ -7396,6 +7396,126 @@ ggml_cgraph * llm_build_context::build_deepseek2() {
     return gf;
 }
 
+ggml_tensor * llm_build_context::build_glm4_moe_layer(
+        ggml_cgraph * gf,
+        ggml_tensor * inpL,
+        ggml_tensor * inp_pos,
+        ggml_tensor * KQ_mask,
+        ggml_tensor * inp_out_ids,
+        ggml_tensor * rope_cache_t,
+        float         kq_scale,
+        int           il,
+        int           n_transformer_layers,
+        bool          skip_ffn) {
+    ggml_tensor * cur;
+    struct ggml_tensor * inpSA = inpL;
+
+    // self-attention
+    if (rope_cache_t == nullptr) {
+        cur = build_std_attention(gf, model.layers[il].attn_norm, inpL,
+                inp_pos, il == n_transformer_layers - 1 ? inp_out_ids : nullptr, nullptr,
+                KQ_mask, nullptr, nullptr, kq_scale, 0.0f, 0, il, true, false, true);
+    } else {
+        // Pre-attention norm
+        cur = llm_build_norm(ctx0, inpL, hparams, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, cb, il);
+        cb(cur, "attn_norm", il);
+
+        auto [Qcur, Kcur, Vcur] = llm_build_mul_mat_qkv(gf, cur,
+                model.layers[il].wqkv, model.layers[il].bqkv,
+                model.layers[il].wqk, model.layers[il].bqk,
+                model.layers[il].wq, model.layers[il].bq,
+                model.layers[il].wk, model.layers[il].bk,
+                model.layers[il].wv, model.layers[il].bv,
+                model.layers[il].attn_q_norm, model.layers[il].attn_k_norm, 0.f, il);
+
+        // apply RoPE
+        if (rope_cache_t) {
+            Qcur = ggml_rope_fast(ctx0, Qcur, rope_cache_t);
+            Kcur = ggml_rope_fast(ctx0, Kcur, rope_cache_t);
+        } else {
+            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+        }
+        cb(Qcur, "Qcur", il);
+        cb(Kcur, "Kcur", il);
+        cb(Vcur, "Vcur", il);
+
+        const int64_t n_embd_head = hparams.n_embd_head_v;
+
+        // build attention KV (no unified cache)
+        cur = llm_build_kv(ctx0, lctx, kv_self, gf,
+                model.layers[il].wo, NULL,
+                Kcur, Vcur, Qcur, KQ_mask,
+                n_tokens, kv_head, n_kv,
+                1.0f/sqrtf(float(n_embd_head)), cb, il);
+
+        if (il == n_transformer_layers - 1 && inp_out_ids) {
+            // skip computing output for unused tokens
+            cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
+            if (rope_cache_t) {
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+        }
+    }
+
+    // residual connection for attention output
+    ggml_tensor * ffn_inp;
+    if (rope_cache_t) {
+        ffn_inp = ggml_add(ctx0, cur, inpSA);
+        cb(ffn_inp, "ffn_inp", il);
+    } else {
+        ffn_inp = cur;
+    }
+
+    if ((uint32_t) il < hparams.n_layer_dense_lead) {
+        // dense FFN — never skipped (always few and cheap)
+        cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
+                model.layers[il].ffn_up,   NULL, NULL,
+                model.layers[il].ffn_gate, NULL, NULL,
+                model.layers[il].ffn_down, NULL, NULL,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true);
+        cb(cur, "ffn_out", il);
+    } else if (skip_ffn && model.layers[il].ffn_up_shexp &&
+               model.layers[il].ffn_gate_shexp &&
+               model.layers[il].ffn_down_shexp) {
+        // MoE-skip mode: skip expensive MoE routing, run only shared expert.
+        cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
+                model.layers[il].ffn_up_shexp,    nullptr, nullptr,
+                model.layers[il].ffn_gate_shexp,  nullptr, nullptr,
+                model.layers[il].ffn_down_shexp,  nullptr, nullptr,
+                nullptr,
+                LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true);
+        cb(cur, "ffn_shexp", il);
+    } else if (skip_ffn) {
+        // MoE-skip but no shared expert — just pass through with residual
+        cur = ffn_inp;
+    } else {
+        // Full MoE + shared expert computation
+        cur = llm_build_std_moe_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
+                model.layers[il].ffn_gate_inp,  model.layers[il].ffn_gate_inp_b,
+                model.layers[il].ffn_up_exps,   model.layers[il].ffn_up_exps_b,
+                model.layers[il].ffn_gate_exps, model.layers[il].ffn_gate_exps_b,
+                model.layers[il].ffn_down_exps, model.layers[il].ffn_down_exps_b,
+                model.layers[il].ffn_exp_probs_b,
+                model.layers[il].ffn_up_shexp,    nullptr,
+                model.layers[il].ffn_gate_shexp,  nullptr,
+                model.layers[il].ffn_down_shexp,  nullptr,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, hparams.expert_weights_norm, true, hparams.expert_weights_scale,
+                (llm_expert_gating_func_type) hparams.expert_gating_func,
+                LLM_FFN_SILU, cb, il, gf, true, model.layers[il].ffn_up_gate_exps);
+    }
+
+    // residual and context vector
+    cur = lctx.cvec.apply_to(ctx0, cur, il);
+    cb(cur, "l_out", il);
+
+    return cur;
+}
+
 ggml_cgraph * llm_build_context::build_glm4_moe() {
     // create a new graph
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model, n_tokens), false);
@@ -7447,121 +7567,10 @@ ggml_cgraph * llm_build_context::build_glm4_moe() {
         // Final layer tensors are loaded but not processed in forward pass
         const int n_transformer_layers = n_layer - hparams.nextn_predict_layers;
         for (int il = 0; il < n_transformer_layers; ++il) {
-            // MoE-skip: when skip_layers is set, skip expensive MoE routing
-            // but still run the shared expert FFN to stabilize hidden states.
-            // Attention always runs to populate KV cache.
             const bool skip_ffn = !lctx.skip_layers.empty() && lctx.skip_layers.count(il);
 
-            struct ggml_tensor * inpSA = inpL;
-
-            // self-attention
-            if (rope_cache == nullptr) {
-                cur = build_std_attention(gf, model.layers[il].attn_norm, inpL,
-                        inp_pos, il == n_transformer_layers - 1 ? inp_out_ids : nullptr, nullptr,
-                        KQ_mask, nullptr, nullptr, kq_scale, 0.0f, 0, il, true, false, true);
-            } else {
-                // Pre-attention norm
-                cur = llm_build_norm(ctx0, inpL, hparams, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, cb, il);
-                cb(cur, "attn_norm", il);
-
-                auto [Qcur, Kcur, Vcur] = llm_build_mul_mat_qkv(gf, cur,
-                        model.layers[il].wqkv, model.layers[il].bqkv,
-                        model.layers[il].wqk, model.layers[il].bqk,
-                        model.layers[il].wq, model.layers[il].bq,
-                        model.layers[il].wk, model.layers[il].bk,
-                        model.layers[il].wv, model.layers[il].bv,
-                        model.layers[il].attn_q_norm, model.layers[il].attn_k_norm, 0.f, il);
-
-                // apply RoPE
-                if (rope_cache) {
-                    Qcur = ggml_rope_fast(ctx0, Qcur, rope_cache);
-                    Kcur = ggml_rope_fast(ctx0, Kcur, rope_cache);
-                } else {
-                    Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                            ext_factor, attn_factor, beta_fast, beta_slow);
-                    Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                            ext_factor, attn_factor, beta_fast, beta_slow);
-                }
-                cb(Qcur, "Qcur", il);
-                cb(Kcur, "Kcur", il);
-                cb(Vcur, "Vcur", il);
-
-                // build attention KV (no unified cache)
-                cur = llm_build_kv(ctx0, lctx, kv_self, gf,
-                        model.layers[il].wo, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask,
-                        n_tokens, kv_head, n_kv,
-                        1.0f/sqrtf(float(n_embd_head)), cb, il);
-
-                if (il == n_transformer_layers - 1 && inp_out_ids) {
-                    // skip computing output for unused tokens
-                    cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
-                    if (rope_cache) {
-                        inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
-                    }
-                }
-            }
-
-            // crop output on last layer
-
-            // residual connection for attention output
-            ggml_tensor * ffn_inp;
-            if (rope_cache) {
-                ffn_inp = ggml_add(ctx0, cur, inpSA);
-                cb(ffn_inp, "ffn_inp", il);
-            } else {
-                ffn_inp = cur;
-            }
-
-            if ((uint32_t) il < hparams.n_layer_dense_lead) {
-                // dense FFN — never skipped (always few and cheap)
-                cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
-                        model.layers[il].ffn_up,   NULL, NULL,
-                        model.layers[il].ffn_gate, NULL, NULL,
-                        model.layers[il].ffn_down, NULL, NULL,
-                        NULL,
-                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true);
-                cb(cur, "ffn_out", il);
-            } else if (skip_ffn && model.layers[il].ffn_up_shexp &&
-                       model.layers[il].ffn_gate_shexp &&
-                       model.layers[il].ffn_down_shexp) {
-                // MoE-skip mode: skip expensive MoE routing, run only shared expert.
-                // This avoids the 128-expert routing + FFN while keeping hidden
-                // state flow stable through the shared expert path.
-                cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
-                        model.layers[il].ffn_up_shexp,    nullptr, nullptr,
-                        model.layers[il].ffn_gate_shexp,  nullptr, nullptr,
-                        model.layers[il].ffn_down_shexp,  nullptr, nullptr,
-                        nullptr,
-                        LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true);
-                cb(cur, "ffn_shexp", il);
-            } else if (skip_ffn) {
-                // MoE-skip but no shared expert — just pass through with residual
-                cur = ffn_inp;
-            } else {
-                // Full MoE + shared expert computation
-                cur = llm_build_std_moe_ffn(ctx0, lctx, model.layers[il].ffn_norm, ffn_inp,
-                        model.layers[il].ffn_gate_inp,  model.layers[il].ffn_gate_inp_b,
-                        model.layers[il].ffn_up_exps,   model.layers[il].ffn_up_exps_b,
-                        model.layers[il].ffn_gate_exps, model.layers[il].ffn_gate_exps_b,
-                        model.layers[il].ffn_down_exps, model.layers[il].ffn_down_exps_b,
-                        model.layers[il].ffn_exp_probs_b,
-                        model.layers[il].ffn_up_shexp,    nullptr,
-                        model.layers[il].ffn_gate_shexp,  nullptr,
-                        model.layers[il].ffn_down_shexp,  nullptr,
-                        n_expert, n_expert_used,
-                        LLM_FFN_SILU, hparams.expert_weights_norm, true, hparams.expert_weights_scale,
-                        (llm_expert_gating_func_type) hparams.expert_gating_func,
-                        LLM_FFN_SILU, cb, il, gf, true, model.layers[il].ffn_up_gate_exps);
-            }
-
-            // residual and context vector
-            //cur = ggml_add(ctx0, cur, ffn_inp);
-            cur = lctx.cvec.apply_to(ctx0, cur, il);
-            cb(cur, "l_out", il);
-
-            // prepare next layer input
-            inpL = cur;
+            inpL = build_glm4_moe_layer(gf, inpL, inp_pos, KQ_mask, inp_out_ids,
+                    rope_cache, kq_scale, il, n_transformer_layers, skip_ffn);
         }
         cur = inpL;
 

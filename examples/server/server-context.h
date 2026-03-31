@@ -267,6 +267,15 @@ struct server_context {
     bool probe_tiers_active = false;     // set after first chunk scores are collected
     bool probe_first_chunk_done = false; // tracks whether we've collected scores yet
 
+    // Streaming micro-graph execution engine (--streaming)
+    // When enabled during generation, uses iterative refinement:
+    // first pass at blurry quality, then re-execute high-importance layers sharp.
+    bool streaming_enabled = false;
+
+    // Cross-token EMA scores: persisted across tokens so the plan gets smarter.
+    // After ~15 tokens the EMA stabilizes and reliably identifies critical layers.
+    std::unordered_map<int32_t, float> streaming_ema_scores;
+
     int32_t n_ctx; // total context for all clients / slots
 
     // system prompt

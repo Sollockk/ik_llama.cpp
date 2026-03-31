@@ -5418,6 +5418,8 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
+        /*.ray_march_delta_data =*/ NULL,
+        /*.ray_march_delta_type =*/ (enum ggml_type)0,
         ///*.padding      =*/ { 0 },
     };
 
@@ -17176,6 +17178,22 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->shared);
 
+    // Ray march state: delta data for additive correction
+    const bool ray_march_active = (src0->ray_march_delta_data != NULL);
+    const enum ggml_type ray_march_delta_type = src0->ray_march_delta_type;
+
+    // Per-expert scratch for ray march (allocated once, reused)
+    float * rm_energies = NULL;
+    int   * rm_gather   = NULL;
+    int     rm_n_blocks = 0;
+    if (ray_march_active) {
+        rm_n_blocks = (int)(ne00 / 256);  // QK_K = 256
+        if (rm_n_blocks > 0 && ith == 0) {
+            // Only thread 0 manages the scratch; other threads will use it read-only
+            // after the barrier. For now, single-threaded ray march gather.
+        }
+    }
+
     // compute each matrix multiplication in sequence
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
@@ -17319,8 +17337,39 @@ IQK_MulMat_Not_Available:;
                     //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
                     //}
 
-                    for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ++ir0) {
-                        vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                    if (ray_march_active && rm_n_blocks > 0) {
+                        // --- Ray march path: dense baseline + sparse delta correction ---
+                        for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ++ir0) {
+                            // Step 1: Dense baseline (full TQ1_0 row, branchless)
+                            vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+
+                            // Step 2+3: Sparse delta correction
+                            // Delta data layout: same expert stacking as base, offset by cur_a*expert_stride
+                            const size_t delta_expert_stride = ggml_row_size(ray_march_delta_type, ne00) * ne01;
+                            const char * delta_expert = (const char *)src0->ray_march_delta_data + cur_a * delta_expert_stride;
+                            const size_t delta_row_stride = ggml_row_size(ray_march_delta_type, ne00);
+                            const char * delta_row = delta_expert + ir0 * delta_row_stride;
+
+                            // Block energies (computed from f32 input — need dequant if input is quantized)
+                            // For now, use a simple heuristic: compute energy from the quantized input
+                            // by checking if the delta would be worth reading.
+                            // TODO: proper f32 energy computation from pre-dequantized input
+                            float correction = 0.0f;
+                            // For the initial implementation, apply delta to ALL blocks
+                            // (equivalent to threshold=0, validates correctness).
+                            // Block-level energy thresholding will be added after validation.
+                            ggml_type_traits_t delta_traits = ggml_internal_get_type_traits(ray_march_delta_type);
+                            if (delta_traits.vec_dot) {
+                                delta_traits.vec_dot(ne00, &correction, 0, delta_row, 0, src1_col, 0, 1);
+                            }
+
+                            tmp[ir0 - iir0] += correction;
+                        }
+                    } else {
+                        // --- Standard path ---
+                        for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ++ir0) {
+                            vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                        }
                     }
 
                     memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir011) - iir0)*sizeof(float));

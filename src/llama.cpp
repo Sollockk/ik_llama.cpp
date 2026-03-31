@@ -3777,6 +3777,63 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                 auto & ls = lctx->gate_probe_layer_scores[layer_idx];
                 ls.first  += score_sum;
                 ls.second += (int32_t)n_tokens;
+
+                // --- Ray march: evaluate SDF from live hidden state ---
+                if (lctx->ray_march.enabled) {
+                    auto & rm = lctx->ray_march;
+                    float sdf = n_tokens > 0 ? score_sum / (float)n_tokens : 0.0f;
+
+                    // Update running statistics for adaptive threshold
+                    rm.sdf_sum    += sdf;
+                    rm.sdf_sum_sq += sdf * sdf;
+                    rm.sdf_count++;
+                    rm.update_threshold();
+
+                    // Track derivative (rate of change across layers)
+                    rm.sdf_derivative = sdf - rm.prev_sdf;
+                    rm.prev_sdf = sdf;
+                    rm.current_sdf = sdf;
+
+                    if (rm.coast_counter > 0) {
+                        // Coasting — far from surface, skip this layer
+                        rm.coast_counter--;
+                        rm.current_layer_sharpen = false;
+                        rm.current_layer_depth = 0;
+                        rm.n_coasted++;
+                    } else if (rm.sdf_count >= 3 && sdf < rm.surface_threshold) {
+                        // Below threshold — compute coast step size
+                        float distance = rm.surface_threshold - sdf;
+                        float scale = rm.surface_threshold > 1e-6f ? rm.surface_threshold : 1.0f;
+                        int step = std::max(1, (int)(distance / scale * rm.coast_scale));
+                        // If SDF is decreasing (moving away from surface), coast further
+                        if (rm.sdf_derivative < 0.0f) {
+                            step = (int)((float)step * rm.derivative_boost);
+                        }
+                        rm.coast_counter = step - 1; // -1: current layer already handled
+                        rm.current_layer_sharpen = false;
+                        rm.current_layer_depth = 0;
+                        rm.n_coasted++;
+                    } else {
+                        // Surface hit — sharpen at depth proportional to SDF
+                        rm.current_layer_sharpen = true;
+                        if (rm.max_depth > 1 && rm.sdf_count >= 3) {
+                            float mean = rm.sdf_sum / (float)rm.sdf_count;
+                            float var  = (rm.sdf_sum_sq / (float)rm.sdf_count) - (mean * mean);
+                            float stddev = var > 0.0f ? sqrtf(var) : 1.0f;
+                            // Linear map: mean-0.5σ → depth 1, mean+1.5σ → max_depth
+                            float t_val = (sdf - (mean - 0.5f * stddev)) / (2.0f * stddev);
+                            t_val = std::max(0.0f, std::min(1.0f, t_val));
+                            rm.current_layer_depth = 1 + (int32_t)(t_val * (float)(rm.max_depth - 1));
+                            // Boost depth if SDF is increasing (approaching deeper surface)
+                            if (rm.sdf_derivative > 0.0f && rm.current_layer_depth < rm.max_depth) {
+                                rm.current_layer_depth++;
+                            }
+                        } else {
+                            rm.current_layer_depth = rm.max_depth;
+                        }
+                        rm.n_sharpened++;
+                    }
+                }
             }
         }
 
@@ -3971,11 +4028,19 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                 }
             }
 
-            // 2b) Layer budget check: skip layers not in the priority set.
-            //     Non-priority layers use blurry weights:
-            //     - Generation: CPU MoE with TQ1_0 data
-            //     - Prompt: GPU MoE with TQ1_0 via only_active_experts
-            if (!lctx->jit_priority_layers.empty() &&
+            // 2b) Ray march: if active AND has collected SDF data, use live decision.
+            //     The ray march SDF is computed in the ffn_inp callback above.
+            //     If no SDF data has been collected (sdf_count == 0), fall through
+            //     to the static priority path to avoid blocking all sharpening.
+            if (lctx->ray_march.enabled && lctx->ray_march.sdf_count > 0) {
+                if (!lctx->ray_march.current_layer_sharpen) {
+                    goto jit_done;  // coasting — leave at blurry
+                }
+                // Fall through to sharpening with ray_march.current_layer_depth
+            }
+            // 2c) Static layer budget check (when ray march is off or has no data):
+            //     Skip layers not in the priority set.
+            else if (!lctx->jit_priority_layers.empty() &&
                 lctx->jit_priority_layers.find(layer_idx) == lctx->jit_priority_layers.end()) {
                 goto jit_done;
             }
@@ -4052,12 +4117,33 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                         expert_vec.push_back(sorted_experts[i].first);
                     }
 
-                    // 4) Sharpen this layer's expert weights
-                    //    Disable parallel pread during prompt — with many experts
-                    //    selected (up to 160), parallel I/O floods the SSD and
-                    //    hangs the system.  Sequential reads are fine for prompt
-                    //    since we're I/O bound anyway.  Keep parallel for generation
-                    //    (few experts, parallelism helps latency).
+                    // 4a) Kick off async prefetch for NEXT layer's experts
+                    //     before we start the (blocking) SSD I/O for this layer.
+                    //     The prefetch thread reads N+1's predicted expert slices
+                    //     in parallel with our overlay+upload work for layer N.
+                    //     Uses the same expert IDs as prediction (~70% overlap).
+                    //
+                    //     Only when RAM cache is warm — with cold cache, both
+                    //     the main thread and prefetch thread would hit SSD
+                    //     simultaneously, causing I/O thrashing.  Once the RAM
+                    //     cache is populated, the main thread reads from RAM
+                    //     (fast) while prefetch does SSD I/O (no contention).
+                    if (!is_prompt && lctx->jit_bsctx->params.parallel_expert_io
+                        && lctx->jit_bsctx->ram_cache_populated) {
+                        int next_layer = layer_idx + 1;
+                        if (next_layer < (int)lctx->model.hparams.n_layer) {
+                            llama_blurry_sharp_async_prefetch_start(
+                                lctx->jit_bsctx, next_layer,
+                                expert_vec.data(), (int32_t)expert_vec.size());
+                        }
+                    }
+
+                    // 4b) Sharpen this layer's expert weights
+                    //     Disable parallel pread during prompt — with many experts
+                    //     selected (up to 160), parallel I/O floods the SSD and
+                    //     hangs the system.  Sequential reads are fine for prompt
+                    //     since we're I/O bound anyway.  Keep parallel for generation
+                    //     (few experts, parallelism helps latency).
                     bool saved_parallel_io = lctx->jit_bsctx->params.parallel_expert_io;
                     if (is_prompt) {
                         lctx->jit_bsctx->params.parallel_expert_io = false;
@@ -4108,6 +4194,7 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                             }
 
                             auto & gcache = lctx->jit_bsctx->gpu_cache;
+                            [[maybe_unused]] ggml_backend_t cuda_be_for_sync = nullptr;
                             auto lt_it = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
                             if (lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
                                 int n_be = ggml_backend_sched_get_n_backends(lctx->sched);
@@ -4121,6 +4208,9 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                     for (int bi = 0; bi < n_be; ++bi) {
                                         ggml_backend_t be = ggml_backend_sched_get_backend(lctx->sched, bi);
                                         if (ggml_backend_is_cpu(be)) continue;
+#ifdef GGML_USE_CUDA
+                                        if (ggml_backend_is_cuda(be)) cuda_be_for_sync = be;
+#endif
 
                                         // Lazy-init GPU cache on first use
                                         if (!gcache.enabled && lctx->jit_bsctx->params.gpu_cache_bytes > 0) {
@@ -4167,45 +4257,49 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                                                         bs_gpu_cache_copy_to_dcpy(
                                                             gcache, cache_off, sz, dcpy, off);
                                                     } else {
-                                                        ggml_backend_tensor_set(dcpy, src, off, sz);
+#ifdef GGML_USE_CUDA
+                                                        // Dual-stream upload: enqueue on stream 1
+                                                        // (overlaps with compute on stream 0).
+                                                        ggml_backend_cuda_jit_upload(be, dcpy, src, off, sz);
+#else
+                                                        ggml_backend_tensor_set_async(be, dcpy, src, off, sz);
+#endif
                                                     }
                                                     n_pcie_bytes += (int64_t)sz; // CPU→GPU transfer
                                                     gcache.n_misses++;
                                                 }
                                             } else {
-                                                ggml_backend_tensor_set(dcpy,
+#ifdef GGML_USE_CUDA
+                                                // Dual-stream upload: enqueue on stream 1
+                                                ggml_backend_cuda_jit_upload(be, dcpy,
                                                     (const uint8_t *)bt->data + off, off, sz);
+#else
+                                                ggml_backend_tensor_set_async(be, dcpy,
+                                                    (const uint8_t *)bt->data + off, off, sz);
+#endif
                                                 n_pcie_bytes += (int64_t)sz;
                                             }
                                         }
                                     }
                                 }
                             }
+
+#ifdef GGML_USE_CUDA
+                            // Make compute stream 0 wait for all JIT uploads on
+                            // stream 1.  Non-blocking on CPU — the GPU handles
+                            // the dependency internally via a CUDA event.
+                            if (cuda_be_for_sync && n_pcie_bytes > 0) {
+                                ggml_backend_cuda_jit_sync_uploads(cuda_be_for_sync);
+                            }
+#endif
                         }
 
                         int64_t t_upload_end = now_us();
                         t_upload_us += (t_upload_end - t_upload_start);
 
-                        // Start async prefetch for next layer's experts.
-                        // Uses a dedicated IO pool (separate from the main
-                        // thread's pool) to avoid dispatch() deadlock.
-                        // Consume supports partial matches — even if only
-                        // 5/8 experts overlap, those 5 skip I/O.
-                        // NOTE: Async prefetch disabled — causes heap corruption
-                        // ("double free or corruption (out)") from rapid alloc/free
-                        // of large 2MB-aligned buffers via posix_memalign.
-                        // Infrastructure (separate IO pool, partial consume) remains
-                        // for future use once buffer lifecycle is fixed.
-                        // int64_t t_hint_start = now_us();
-                        // if (!is_prompt && lctx->jit_bsctx->params.parallel_expert_io) {
-                        //     int next_layer = layer_idx + 1;
-                        //     if (next_layer < (int)lctx->model.hparams.n_layer) {
-                        //         llama_blurry_sharp_async_prefetch_start(
-                        //             lctx->jit_bsctx, next_layer,
-                        //             expert_vec.data(), (int32_t)expert_vec.size());
-                        //     }
-                        // }
-                        // t_overhead_us += (now_us() - t_hint_start);
+                        // Async prefetch for next layer was started BEFORE
+                        // apply_experts (step 4a above) so SSD reads for N+1
+                        // overlap with the overlay+upload work for layer N.
                     }
 
                     // If sharpening fails, we fall through to jit_done
@@ -4331,7 +4425,18 @@ void llama_blurry_sharp_start_jit(
     ctx->router_per_token_experts.clear();
     ctx->router_recording = true;
 
-    LLAMA_LOG_DEBUG("%s: JIT per-layer sharpening enabled\n", __func__);
+    // Initialize ray march if gate probe is available.
+    // The ray march uses the probe score as a signed distance function
+    // to adaptively decide per-layer quality during a single forward pass.
+    if (ctx->gate_probe_ctx) {
+        ctx->ray_march.enabled = true;
+        ctx->ray_march.reset();
+        ctx->ray_march.max_depth = bsctx->fractal_mode ? bsctx->fractal_max_depth : 1;
+        if (ctx->ray_march.max_depth < 1) ctx->ray_march.max_depth = 1;
+    }
+
+    LLAMA_LOG_DEBUG("%s: JIT per-layer sharpening enabled (ray_march=%s)\n",
+                    __func__, ctx->ray_march.enabled ? "on" : "off");
 }
 
 void llama_blurry_sharp_stop_jit(
@@ -4362,6 +4467,16 @@ void llama_blurry_sharp_stop_jit(
         }
         bsctx->jit_active = false;
         bsctx->jit_host_only = false;
+    }
+
+    // Log ray march summary
+    if (ctx->ray_march.enabled) {
+        LLAMA_LOG_INFO("%s: ray march: %d sharpened, %d coasted (of %d layers)\n",
+                       __func__,
+                       ctx->ray_march.n_sharpened,
+                       ctx->ray_march.n_coasted,
+                       ctx->ray_march.sdf_count);
+        ctx->ray_march.enabled = false;
     }
 
     LLAMA_LOG_DEBUG("%s: JIT per-layer sharpening stopped\n", __func__);
@@ -5675,6 +5790,8 @@ struct llama_blurry_sharp_params llama_blurry_sharp_default_params() {
     params.gpu_cache_bytes       = 0;
     params.ram_cache_bytes       = 0;  // 0 = auto (4 GiB), -1 = disabled
     params.flash_experts         = false;
+    params.delta_paths           = nullptr;
+    params.n_delta_levels        = 0;
     return params;
 }
 
@@ -6167,6 +6284,7 @@ struct llama_context * llama_init_from_model(
     cparams.thresh_experts   = params.thresh_experts;
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
+    cparams.streaming_decode = false;  // enabled at runtime via llama_set_streaming_decode()
 
     cparams.reduce_type      = params.type_reduce;
     cparams.pooling_type     = params.pooling_type;
@@ -8603,6 +8721,20 @@ int32_t llama_decode(
 
 void llama_set_mtp_op_type(llama_context * ctx, llama_mtp_op_type mtp_op_type) {
     ctx->set_mtp_op_type(mtp_op_type);
+}
+
+// ---------------------------------------------------------------------------
+// Streaming Micro-Graph Execution Engine API
+// ---------------------------------------------------------------------------
+
+void llama_set_streaming_decode(struct llama_context * ctx, bool enable) {
+    if (!ctx) return;
+    ctx->cparams.streaming_decode = enable;
+}
+
+bool llama_get_streaming_decode(const struct llama_context * ctx) {
+    if (!ctx) return false;
+    return ctx->cparams.streaming_decode;
 }
 
 // ---------------------------------------------------------------------------

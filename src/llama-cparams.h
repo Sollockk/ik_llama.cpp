@@ -46,6 +46,7 @@ struct llama_cparams {
     int  min_experts;
     float thresh_experts;
     bool mtp;
+    bool streaming_decode; // enable streaming micro-graph execution for MoE
 
     enum ggml_type reduce_type;
     enum llama_pooling_type pooling_type;

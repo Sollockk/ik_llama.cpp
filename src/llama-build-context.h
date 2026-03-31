@@ -255,6 +255,20 @@ struct llm_build_context {
 
     ggml_cgraph * build_glm4_moe();
 
+    // Per-layer builder for GLM4 MoE, extracted for streaming micro-graph execution.
+    // Returns the updated hidden state tensor after one transformer layer.
+    ggml_tensor * build_glm4_moe_layer(
+        ggml_cgraph * gf,
+        ggml_tensor * inpL,
+        ggml_tensor * inp_pos,
+        ggml_tensor * KQ_mask,
+        ggml_tensor * inp_out_ids,
+        ggml_tensor * rope_cache,
+        float         kq_scale,
+        int           il,
+        int           n_transformer_layers,
+        bool          skip_ffn);
+
     ggml_cgraph * build_bitnet();
 
     ggml_cgraph * build_bitnet_158();

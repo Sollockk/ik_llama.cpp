@@ -554,6 +554,15 @@ struct gpt_params {
     //   3. Protects first 3 and last 3 layers from skipping
     bool        bs_probe_tiers         = false;
 
+    // --streaming: enable streaming micro-graph execution engine
+    // Uses iterative refinement: first pass blurry, subsequent passes
+    // re-execute high-importance layers with sharp quality.
+    bool        streaming_decode       = false;
+
+    // --delta: fractal delta correction chain GGUFs (one per level)
+    // Enables hierarchical weight reconstruction: base + sum(deltas)
+    std::vector<std::string> delta_paths;
+
     // --bs-sharp-experts-gpu N   overlay top-N experts per layer on GPU (-1=all, 0=none/CPU-only)
     // --bs-sharp-experts-cpu N   overlay top-N experts per layer on CPU (-1=all, 0=skip, -2=same as GPU)
     // --bs-no-parallel-io        disable parallel pread for expert slices

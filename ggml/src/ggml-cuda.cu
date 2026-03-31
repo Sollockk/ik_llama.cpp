@@ -3924,6 +3924,23 @@ GGML_CALL static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend,
     CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
+// JIT upload on dedicated stream 1 — overlaps with compute on stream 0.
+// After all uploads, call jit_record_upload_done() then jit_wait_for_uploads()
+// to make stream 0 wait for the uploads via a CUDA event (non-blocking on CPU).
+void ggml_backend_cuda_jit_upload(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size,
+                                cudaMemcpyHostToDevice, cuda_ctx->jit_upload_stream()));
+}
+
+// Record event on upload stream and make compute stream wait for it.
+void ggml_backend_cuda_jit_sync_uploads(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    cuda_ctx->jit_record_upload_done();
+    cuda_ctx->jit_wait_for_uploads();
+}
+
 GGML_CALL static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;

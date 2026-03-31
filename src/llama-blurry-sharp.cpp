@@ -9,6 +9,8 @@
 #include "llama-model-loader.h"
 #include "llama-impl.h"
 
+#include <array>
+
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -1525,6 +1527,97 @@ llama_blurry_sharp_context * llama_blurry_sharp_init(
         }
     }
 #endif
+
+    // -----------------------------------------------------------------------
+    // Fractal delta correction chain loading
+    // -----------------------------------------------------------------------
+    if (params.n_delta_levels > 0 && params.delta_paths) {
+        LLAMA_LOG_INFO("%s: loading %d delta correction level(s)...\n",
+                       __func__, params.n_delta_levels);
+
+        for (int32_t lvl = 0; lvl < params.n_delta_levels; ++lvl) {
+            const char * delta_path = params.delta_paths[lvl];
+            LLAMA_LOG_INFO("%s:   level %d: %s\n", __func__, lvl + 1, delta_path);
+
+            llama_blurry_sharp_context::bs_correction_level level;
+            level.level = lvl + 1;
+
+            // Open the delta GGUF
+            gguf_init_params gp = { .no_alloc = true, .ctx = nullptr };
+            gguf_context * gctx = gguf_init_from_file(delta_path, gp);
+            if (!gctx) {
+                LLAMA_LOG_WARN("%s:   failed to open delta GGUF: %s\n", __func__, delta_path);
+                continue;
+            }
+
+            // Open file + mmap
+            auto file_ptr = std::make_unique<llama_file>(delta_path, "rb");
+            if (!file_ptr || file_ptr->size() == 0) {
+                LLAMA_LOG_WARN("%s:   failed to open delta file: %s\n", __func__, delta_path);
+                gguf_free(gctx);
+                continue;
+            }
+            std::unique_ptr<llama_mmap> mmap_ptr;
+            try {
+                mmap_ptr = std::make_unique<llama_mmap>(file_ptr.get(), 0, false);
+            } catch (...) {
+                LLAMA_LOG_WARN("%s:   failed to mmap delta: %s\n", __func__, delta_path);
+                gguf_free(gctx);
+                continue;
+            }
+
+            // Build delta tensor index
+            ggml_init_params tip = { .mem_size = 256*1024*1024, .mem_buffer = nullptr, .no_alloc = true };
+            ggml_context * tctx = ggml_init(tip);
+            gguf_init_params tp2 = { .no_alloc = true, .ctx = &tctx };
+            gguf_context * g2 = gguf_init_from_file(delta_path, tp2);
+
+            if (g2) {
+                size_t data_off = gguf_get_data_offset(g2);
+                int n_tensors = gguf_get_n_tensors(g2);
+
+                for (int i = 0; i < n_tensors; i++) {
+                    const char * tname = gguf_get_tensor_name(g2, i);
+                    blurry_sharp_tensor_info info;
+                    info.name        = tname;
+                    info.tensor_idx  = i;
+                    info.split_idx   = 0;
+                    info.file_offset = data_off + gguf_get_tensor_offset(g2, i);
+                    info.type        = gguf_get_tensor_type(g2, i);
+
+                    ggml_tensor * t = ggml_get_tensor(tctx, tname);
+                    if (t) {
+                        for (int d = 0; d < GGML_MAX_DIMS; d++) info.ne[d] = t->ne[d];
+                        info.nbytes = ggml_nbytes(t);
+                    }
+
+                    // Find the corresponding base model tensor
+                    info.base_tensor = llama_get_model_tensor(model, tname);
+
+                    level.delta_index[tname] = info;
+                }
+
+                LLAMA_LOG_INFO("%s:   indexed %d delta tensors for level %d\n",
+                               __func__, n_tensors, lvl + 1);
+                gguf_free(g2);
+            }
+            ggml_free(tctx);
+
+            level.ggufs.push_back(gctx);
+            level.files.push_back(std::move(file_ptr));
+            level.mmaps.push_back(std::move(mmap_ptr));
+            level.n_splits = 1;
+
+            bsctx->correction_levels.push_back(std::move(level));
+        }
+
+        if (!bsctx->correction_levels.empty()) {
+            bsctx->fractal_mode = true;
+            bsctx->fractal_max_depth = (int32_t)bsctx->correction_levels.size();
+            LLAMA_LOG_INFO("%s: fractal mode enabled with %d correction level(s)\n",
+                           __func__, bsctx->fractal_max_depth);
+        }
+    }
 
     bsctx->initialized = true;
 
@@ -3939,27 +4032,35 @@ void llama_blurry_sharp_async_prefetch_start(
     ap.ready  = false;
     ap.active = true;
 
-    // Prefetch buffers are keyed by tensor name (includes layer number).
-    // To avoid accumulating 45 layers × 3 tensors × ~100MB of buffers,
-    // we clear the map BUT keep one set of pre-allocated buffers around
-    // by swapping into a reuse pool.  The worker then moves them back
-    // for the new layer's tensor names, avoiding alloc/free churn.
+    // Double-buffered prefetch: alternate between dbufs[0] and dbufs[1].
+    // Each map accumulates buffers for one layer's expert tensors.
+    // On the next cycle, we harvest buffers from the target map for reuse
+    // (move out → move back under new tensor names).  Since all MoE layers
+    // have identical tensor shapes, resize() is a no-op after first use.
     //
-    // Since all MoE layers have identical tensor shapes, the buffers
-    // from any layer fit any other layer's tensors.
+    // Flip write_idx: the NEW prefetch writes to the OTHER buffer.
+    // The previous cycle's completed data (dbufs[old write_idx]) remains
+    // available for consumption until this new prefetch completes.
+    ap.write_idx = 1 - ap.write_idx;
+    int wi = ap.write_idx;
 
-    // Collect reusable buffers from previous prefetch (avoid free+realloc)
-    std::vector<bs_aligned_buffer> reuse_pool;
-    for (auto & [name, buf] : ap.buffers) {
-        if (!buf.empty()) {
-            reuse_pool.push_back(std::move(buf));
+    // Harvest reusable buffers from the target map (this map was last written
+    // 2 cycles ago, so its data has already been consumed).
+    // Move buffers to a std::array — avoids heap alloc for the reuse container.
+    static constexpr size_t MAX_REUSE = 4;  // gate_exps, up_exps, down_exps (+spare)
+    std::array<bs_aligned_buffer, MAX_REUSE> reuse_arr;
+    int n_reuse = 0;
+    for (auto & [name, buf] : ap.dbufs[wi]) {
+        if (!buf.empty() && n_reuse < (int)MAX_REUSE) {
+            reuse_arr[n_reuse++] = std::move(buf);
         }
     }
-    ap.buffers.clear();
+    ap.dbufs[wi].clear();  // safe: all buffers moved out (null ptrs)
 
-    // Launch worker thread that does parallel pread into prefetch buffers
-    ap.worker = std::thread([bsctx, layer_idx, n_experts,
-                             reuse = std::move(reuse_pool)]() mutable {
+    // Launch worker thread that does parallel pread into dbufs[wi]
+    ap.worker = std::thread([bsctx, layer_idx, n_experts, wi,
+                             reuse_bufs = std::move(reuse_arr),
+                             n_reuse_bufs = n_reuse]() mutable {
         auto & ap = bsctx->async_prefetch;
         auto lt_it = bsctx->layer_tensor_names.find(layer_idx);
         if (lt_it == bsctx->layer_tensor_names.end()) {
@@ -3985,14 +4086,15 @@ void llama_blurry_sharp_async_prefetch_start(
 
             size_t sharp_expert_slice = si.nbytes / (size_t)si.ne[2];
 
-            // Reuse buffer from pool or allocate new one
-            if (reuse_idx < (int)reuse.size() && reuse[reuse_idx].size() >= si.nbytes) {
-                ap.buffers[tname] = std::move(reuse[reuse_idx]);
+            // Reuse buffer from harvested pool or resize in-place
+            if (reuse_idx < n_reuse_bufs && reuse_bufs[reuse_idx].size() >= si.nbytes) {
+                ap.dbufs[wi][tname] = std::move(reuse_bufs[reuse_idx]);
+                ap.dbufs[wi][tname].resize(si.nbytes);  // no-op if same size
                 reuse_idx++;
             } else {
-                ap.buffers[tname].resize(si.nbytes);
+                ap.dbufs[wi][tname].resize(si.nbytes);
             }
-            auto & buf = ap.buffers[tname];
+            auto & buf = ap.dbufs[wi][tname];
 
             std::vector<bs_pread_task> tasks;
             tasks.reserve(n_experts);
@@ -4043,8 +4145,12 @@ static int bs_async_prefetch_consume(
         ap.active = false;
     }
 
-    auto pf_it = ap.buffers.find(tensor_name);
-    if (pf_it == ap.buffers.end() || pf_it->second.empty()) return 0;
+    // Read from the last-written buffer (dbufs[write_idx]).
+    // The flip to the next write_idx happens later in prefetch_start,
+    // so at consume time write_idx still points to the completed data.
+    auto & read_map = ap.dbufs[ap.write_idx];
+    auto pf_it = read_map.find(tensor_name);
+    if (pf_it == read_map.end() || pf_it->second.empty()) return 0;
 
     // Look up tensor info for slice size calculation
     auto info_it = bsctx->sharp_index.find(tensor_name);
@@ -6577,4 +6683,52 @@ void llama_blurry_sharp_deflate_expert_types(
         }
     }
     bsctx->inflate_saved_types.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Ray march PIM: wire delta correction data to model expert tensors
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_wire_delta_tensors(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->fractal_mode || bsctx->correction_levels.empty()) {
+        return 0;
+    }
+
+    // Use the first correction level's delta index
+    auto & level = bsctx->correction_levels[0];
+    if (level.delta_index.empty() || level.mmaps.empty()) {
+        return 0;
+    }
+
+    int32_t n_wired = 0;
+
+    // For each tensor in the delta index, find the corresponding base model tensor
+    // and set its ray_march_delta_data pointer to the mmap'd delta data.
+    for (auto & [name, dinfo] : level.delta_index) {
+        if (!dinfo.base_tensor) {
+            // Try to find the base tensor in the model
+            if (bsctx->model) {
+                ggml_tensor * bt = llama_get_model_tensor(bsctx->model, name.c_str());
+                if (bt) {
+                    dinfo.base_tensor = bt;
+                }
+            }
+        }
+
+        if (dinfo.base_tensor && dinfo.split_idx < (int)level.mmaps.size() && level.mmaps[dinfo.split_idx]) {
+            // Point the base tensor's ray march data at the delta mmap
+            const uint8_t * mmap_base = (const uint8_t *)level.mmaps[dinfo.split_idx]->addr();
+            dinfo.base_tensor->ray_march_delta_data = (void *)(mmap_base + dinfo.file_offset);
+            dinfo.base_tensor->ray_march_delta_type = dinfo.type;
+            n_wired++;
+        }
+    }
+
+    if (n_wired > 0) {
+        LLAMA_LOG_INFO("%s: wired %d expert tensors with delta correction data for ray march PIM\n",
+                       __func__, n_wired);
+    }
+
+    return n_wired;
 }

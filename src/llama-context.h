@@ -5,6 +5,7 @@
 #include "llama-sampling.h"
 
 struct llama_model;
+struct llama_execution_plan;
 
 #include <vector>
 #include <map>
@@ -295,6 +296,78 @@ struct llama_context {
     struct ggml_tensor * inp_KQ_mask_cross; // F32 [n_outputs_enc, n_batch]
     struct ggml_tensor * inp_scale = nullptr; // F32 [n_tokens]
     struct ggml_tensor * inp_mtp_states = nullptr;
+
+    // -----------------------------------------------------------------------
+    // Streaming micro-graph execution engine
+    //
+    // When streaming_plan is non-null, the streaming decode engine is active.
+    // The execution plan drives per-layer decisions (skip, sharpen, loop).
+    // -----------------------------------------------------------------------
+    llama_execution_plan * streaming_plan = nullptr;
+    int32_t                streaming_iteration = 0;
+
+    // Fractal reconstruction: per-layer depth for the JIT callback.
+    // When fractal mode is active, determines how many delta levels to stack.
+    std::unordered_map<int32_t, int32_t> jit_fractal_depths;
+
+    // -----------------------------------------------------------------------
+    // Ray-march state
+    //
+    // Instead of pre-deciding layer quality, the callback ray-marches through
+    // the model: at each layer it evaluates the SDF (probe score) from the
+    // live hidden state and decides on the fly to sharpen or coast.
+    //
+    // Big SDF step → coast (skip sharpening for N layers).
+    // Small SDF → surface hit → sharpen at depth proportional to SDF.
+    // -----------------------------------------------------------------------
+    struct {
+        bool     enabled = false;
+        int32_t  coast_counter = 0;       // layers remaining to coast
+        float    prev_sdf = 0.0f;         // previous layer's probe score
+        float    sdf_derivative = 0.0f;   // rate of change across layers
+        float    sdf_sum = 0.0f;          // running sum for adaptive threshold
+        float    sdf_sum_sq = 0.0f;       // running sum of squares
+        int32_t  sdf_count = 0;           // layers evaluated so far
+        float    surface_threshold = 0.0f;// adaptive: mean + sigma_coeff * stddev
+        int32_t  max_depth = 1;           // max fractal depth (1 = classic sharp)
+
+        // Per-layer decision (set at ffn_inp, consumed at ffn_moe_topk)
+        bool     current_layer_sharpen = false;
+        int32_t  current_layer_depth = 0; // 0 = blurry, >0 = sharpen at this depth
+        float    current_sdf = 0.0f;      // raw probe score for current layer
+
+        // Configuration
+        float    sigma_coeff = 0.5f;      // sharpen layers scoring > mean + sigma*stddev
+        float    coast_scale = 5.0f;      // multiplier for coast step size
+        float    derivative_boost = 1.5f; // coast further when SDF is decreasing
+
+        // Metrics for this decode call
+        int32_t  n_sharpened = 0;
+        int32_t  n_coasted = 0;
+
+        void reset() {
+            coast_counter = 0;
+            prev_sdf = 0.0f;
+            sdf_derivative = 0.0f;
+            sdf_sum = 0.0f;
+            sdf_sum_sq = 0.0f;
+            sdf_count = 0;
+            surface_threshold = 0.0f;
+            current_layer_sharpen = false;
+            current_layer_depth = 0;
+            current_sdf = 0.0f;
+            n_sharpened = 0;
+            n_coasted = 0;
+        }
+
+        void update_threshold() {
+            if (sdf_count < 3) { surface_threshold = 0.0f; return; }
+            float mean = sdf_sum / (float)sdf_count;
+            float var = (sdf_sum_sq / (float)sdf_count) - (mean * mean);
+            float stddev = var > 0.0f ? sqrtf(var) : 0.0f;
+            surface_threshold = mean + sigma_coeff * stddev;
+        }
+    } ray_march;
 
     ggml_backend_t ggml_backend_by_name(const char * name);
 

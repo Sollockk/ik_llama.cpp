@@ -582,13 +582,23 @@ struct llama_blurry_sharp_context {
     // While the MoE kernel computes layer N using combo_buffers, a background
     // thread reads layer N+1's predicted expert slices into prefetch_buffers.
     // When layer N+1's callback fires, we swap prefetch→combo (no I/O).
+    //
+    // Double-buffered: dbufs[0] and dbufs[1] alternate each cycle.
+    // The prefetch thread writes to dbufs[write_idx]; the consumer reads
+    // from dbufs[1 - write_idx] (the previous cycle's completed data).
+    // Buffer allocations are reused across cycles (never freed during
+    // normal operation) to avoid heap corruption from rapid alloc/free
+    // of large 2MB-aligned buffers.
     struct {
         std::thread                worker;
         std::atomic<bool>          ready{false};
         std::atomic<bool>          active{false};  // worker is running
         int                        layer_idx = -1;
         std::vector<int32_t>       expert_ids;
-        std::unordered_map<std::string, bs_aligned_buffer> buffers;
+
+        std::unordered_map<std::string, bs_aligned_buffer> dbufs[2];
+        int                        write_idx = 0;  // prefetch writes to dbufs[write_idx]
+
         int64_t                    n_hits = 0;     // prefetch buffer used (I/O saved)
         int64_t                    n_misses = 0;   // prefetch missed, fell back to sync I/O
     } async_prefetch;
@@ -616,6 +626,27 @@ struct llama_blurry_sharp_context {
     // reset to -1 when the function returns.  The eviction loop skips
     // any cache entry whose layer_idx matches this value.
     int building_layer_idx = -1;
+
+    // -- fractal delta correction chain --
+    // When fractal_mode is true, weights are reconstructed additively:
+    //   result = blurry + sum(delta_level[i] for i in 1..depth)
+    // Each level is a separate GGUF file containing quantized residuals.
+    struct bs_correction_level {
+        int32_t level = 0;                    // 1-indexed level number
+        std::vector<gguf_context *>                  ggufs;
+        std::vector<ggml_context *>                  tensor_ctxs;
+        std::vector<std::unique_ptr<llama_file>>     files;
+        std::vector<std::unique_ptr<llama_mmap>>     mmaps;
+        int                                          n_splits = 0;
+        std::unordered_map<std::string, blurry_sharp_tensor_info> delta_index;
+        std::unordered_map<int, float> layer_rmse;  // from GGUF metadata
+    };
+    std::vector<bs_correction_level> correction_levels;  // levels 1..N
+    bool    fractal_mode = false;
+    int32_t fractal_max_depth = 0;
+
+    // Scratch buffer for f32 accumulation during fractal reconstruction
+    std::vector<float> fractal_accum_buf;
 
     // -- thread safety --
     std::mutex mtx;
