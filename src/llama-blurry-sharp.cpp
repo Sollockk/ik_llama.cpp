@@ -6979,26 +6979,31 @@ int32_t llama_blurry_sharp_apply_delta_gpu_experts(
 
         size_t original_bytes = ggml_nbytes(base);
 
-        // 1. Download GPU tensor data to CPU
         std::vector<uint8_t> gpu_data(original_bytes);
         ggml_backend_tensor_get(base, gpu_data.data(), 0, original_bytes);
 
-        // 2. Dequant blurry to f32
-        std::vector<float> base_f32(n_elements);
-        bt.to_float(gpu_data.data(), base_f32.data(), n_elements);
+        // Dequant both, add, requant — process per-expert-slice for large tensors
+        const int64_t n_experts = (dinfo.ne[2] > 0) ? dinfo.ne[2] : 1;
+        const int64_t elems_per_expert = n_elements / n_experts;
+        const size_t blurry_bytes_per_expert = original_bytes / n_experts;
+        const size_t delta_bytes_per_expert = dinfo.nbytes / n_experts;
 
-        // 3. Dequant delta to f32 and add
-        std::vector<float> delta_f32(n_elements);
-        dt.to_float(delta_data, delta_f32.data(), n_elements);
+        #pragma omp parallel for schedule(dynamic) num_threads(8)
+        for (int64_t ei = 0; ei < n_experts; ei++) {
+            std::vector<float> bf(elems_per_expert);
+            std::vector<float> df(elems_per_expert);
 
-        for (int64_t i = 0; i < n_elements; i++) {
-            base_f32[i] += delta_f32[i];
+            bt.to_float(gpu_data.data()  + ei * blurry_bytes_per_expert, bf.data(), elems_per_expert);
+            dt.to_float(delta_data       + ei * delta_bytes_per_expert,  df.data(), elems_per_expert);
+
+            for (int64_t i = 0; i < elems_per_expert; i++) {
+                bf[i] += df[i];
+            }
+
+            bt.from_float(bf.data(), gpu_data.data() + ei * blurry_bytes_per_expert, elems_per_expert);
         }
 
-        // 4. Requant to base type
-        bt.from_float(base_f32.data(), gpu_data.data(), n_elements);
-
-        // 5. Upload corrected data back to GPU
+        // Upload corrected data to GPU (single transfer, no round-trip)
         ggml_backend_tensor_set(base, gpu_data.data(), 0, original_bytes);
 
         n_upgraded++;

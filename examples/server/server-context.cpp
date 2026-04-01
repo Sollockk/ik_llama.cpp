@@ -332,10 +332,12 @@ bool server_context::load_model(const gpt_params& params_) {
                 int32_t n_wired = llama_blurry_sharp_wire_delta_tensors(bsctx);
                 LOG_INFO("Delta tensors wired for ray march PIM", {{"n_wired", n_wired}});
 
-                // Permanently upgrade GPU expert tensors with delta correction.
-                // Downloads weights, adds correction, uploads back. Same VRAM, better quality.
-                int32_t n_gpu = llama_blurry_sharp_apply_delta_gpu_experts(bsctx);
-                LOG_INFO("GPU expert tensors upgraded with delta", {{"n_upgraded", n_gpu}});
+                // GPU expert upgrade: only in delta-only mode (no --sharp).
+                // When --sharp is present, the permanent sharp overlay handles GPU
+                // tensors directly (loads Q8_0 data, much better than delta requant).
+                // Delta GPU upgrade (dequant+add+requant) is pointless when sharp
+                // overlay is available — requant destroys the correction.
+                LOG_INFO("GPU tensors will be handled by --sharp permanent overlay", {});
             }
 
             // Determine mode
@@ -496,20 +498,44 @@ bool server_context::load_model(const gpt_params& params_) {
                 // For different-type tensors, a new buffer is allocated but no backup
                 // of the blurry data is kept, so peak memory ≈ max(blurry, sharp)
                 // instead of sum(blurry, sharp).
-                LOG_INFO("Applying sharp overlay to all layers (static/permanent mode, no backup)", {});
+                // When gpu-delta-priority is active, only sharpen layers that have
+                // GPU expert tensors. CPU expert layers use PIM delta kernel instead.
+                // Non-expert tensors (attention, norms) on GPU still get sharpened.
+                if (params_base.gpu_delta_priority && params_base.ncmoe > 0) {
+                    LOG_INFO("Sharp overlay: skipping CPU expert layers (PIM delta handles them)", {
+                        {"ncmoe", params_base.ncmoe},
+                    });
+                    // Apply only to non-CPU-moe layers: sharpen layers ncmoe..n_layers
+                    // For layers 0..ncmoe-1, only non-expert tensors are on GPU (attention),
+                    // expert tensors are on CPU. apply_non_expert_permanent handles those.
+                    llama_blurry_sharp_apply_non_expert_permanent(bsctx);
+
+                    // Now sharpen GPU expert layers (layers beyond ncmoe)
+                    int n_layer = llama_n_layer(model);
+                    for (int il = params_base.ncmoe; il < n_layer; il++) {
+                        llama_blurry_sharp_apply_layer(bsctx, il);
+                    }
+                } else {
+                    LOG_INFO("Applying sharp overlay to all layers (static/permanent mode, no backup)", {});
+                }
 
                 const auto t_start = ggml_time_us();
-                int32_t n_sharpened = llama_blurry_sharp_apply_all(bsctx);
+                int32_t n_sharpened = 0;
+                if (!params_base.gpu_delta_priority || params_base.ncmoe == 0) {
+                    // Full apply_all for non-delta-priority mode
+                    n_sharpened = llama_blurry_sharp_apply_all(bsctx);
+                }
                 const auto t_end = ggml_time_us();
 
                 llama_blurry_sharp_warm_live_pages(bsctx);
 
                 llama_blurry_sharp_state st = llama_blurry_sharp_get_state(bsctx);
-                LOG_INFO("Sharp overlay applied (permanent mode, no per-token overhead)", {
+                LOG_INFO("Sharp overlay applied", {
                     {"n_sharpened", n_sharpened},
                     {"n_layers_total", st.n_layers_total},
                     {"time_ms", (t_end - t_start) / 1000.0},
                     {"permanent", true},
+                    {"gpu_delta_priority", params_base.gpu_delta_priority},
                 });
 
                 if (st.n_device_tensors_skipped > 0) {
