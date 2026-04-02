@@ -233,8 +233,11 @@ struct llama_layer {
     // normalization
     struct ggml_tensor * ffn_norm = nullptr;
     struct ggml_tensor * ffn_norm_b = nullptr;
-    struct ggml_tensor * ffn_post_norm = nullptr;
-    struct ggml_tensor * layer_out_norm = nullptr;
+    struct ggml_tensor * ffn_post_norm   = nullptr;
+    struct ggml_tensor * ffn_post_norm_1 = nullptr; // gemma4
+    struct ggml_tensor * ffn_post_norm_2 = nullptr; // gemma4
+    struct ggml_tensor * ffn_pre_norm_2  = nullptr; // gemma4
+    struct ggml_tensor * layer_out_norm  = nullptr;
     struct ggml_tensor * layer_out_norm_b = nullptr;
     struct ggml_tensor * ffn_norm_exps = nullptr;
     struct ggml_tensor * ffn_norm_enc = nullptr;
@@ -254,7 +257,8 @@ struct llama_layer {
     llama_split_tensor split_ffn_up_gate;
 
     // ff MoE
-    struct ggml_tensor * ffn_gate_inp = nullptr;
+    struct ggml_tensor * ffn_gate_inp   = nullptr;
+    struct ggml_tensor * ffn_gate_inp_s = nullptr; // gemma4 router scale
     struct ggml_tensor * ffn_gate_exps = nullptr;
     struct ggml_tensor * ffn_down_exps = nullptr;
     struct ggml_tensor * ffn_up_exps  = nullptr;
@@ -339,6 +343,14 @@ struct llama_layer {
 
     llama_split_tensor split_rope_freqs;
 
+    // gemma4 layer output scale
+    struct ggml_tensor * out_scale = nullptr;
+
+    // gemma4 per-layer embeddings
+    struct ggml_tensor * per_layer_inp_gate  = nullptr;
+    struct ggml_tensor * per_layer_proj      = nullptr;
+    struct ggml_tensor * per_layer_post_norm = nullptr;
+
     // bitnet scale
     struct ggml_tensor * wq_scale = nullptr;
     struct ggml_tensor * wk_scale = nullptr;
@@ -385,6 +397,11 @@ struct llama_model {
     struct ggml_tensor * output;
     struct ggml_tensor * output_b;
     struct ggml_tensor * output_norm_enc;
+
+    // gemma4 per-layer embeddings (global tensors)
+    struct ggml_tensor * tok_embd_per_layer   = nullptr;
+    struct ggml_tensor * per_layer_model_proj = nullptr;
+    struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
     llama_split_tensor split_output;
     llama_split_tensor split_output_norm;

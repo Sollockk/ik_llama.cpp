@@ -138,14 +138,18 @@ static ggml_type parse_quant_type(const char * s) {
 
 static void print_usage(const char * prog) {
     fprintf(stderr,
-        "Usage: %s --blurry <path> --sharp <path> --levels <N> [--quant <type>] --out-prefix <prefix> [--threads N]\n\n"
+        "Usage: %s --blurry <path> --sharp <path> --levels <N> [--quant <type>] --out-prefix <prefix> [options]\n\n"
         "  --blurry     Path to the blurry (low-quality) GGUF model\n"
         "  --sharp      Path to the sharp (high-quality) GGUF model (supports splits)\n"
         "  --levels     Number of delta correction levels to generate (1-8)\n"
         "  --quant      Quantization type for deltas (default: Q2_K)\n"
         "  --out-prefix Output prefix: produces <prefix>_1.gguf, <prefix>_2.gguf, ...\n"
         "  --layers     Layer range to process (e.g. 3-50, default: all)\n"
-        "  --threads    Number of parallel threads (default: 4)\n",
+        "  --threads    Number of parallel threads (default: 4)\n"
+        "  --sparse <t> Generate sparse delta with threshold t (e.g. 0.01 = keep blocks\n"
+        "               with RMS >= 1%% of max). Outputs <prefix>_sparse_1.gguf alongside\n"
+        "               the full delta. Sparse deltas store only significant blocks +\n"
+        "               a block index, reducing file size and I/O by up to 80%%.\n",
         prog);
 }
 
@@ -162,6 +166,7 @@ int main(int argc, char ** argv) {
     int          n_threads    = 4;
     int          layer_min    = 0;
     int          layer_max    = INT32_MAX;
+    float        sparse_threshold = 0.0f; // 0 = disabled, >0 = sparse mode (e.g. 0.01)
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--blurry")     && i+1 < argc) blurry_path = argv[++i];
@@ -170,6 +175,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--quant")      && i+1 < argc) quant_str   = argv[++i];
         else if (!strcmp(argv[i], "--levels")     && i+1 < argc) n_levels    = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threads")    && i+1 < argc) n_threads   = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--sparse")     && i+1 < argc) sparse_threshold = atof(argv[++i]);
         else if (!strcmp(argv[i], "--layers")     && i+1 < argc) {
             sscanf(argv[++i], "%d-%d", &layer_min, &layer_max);
         }
@@ -181,6 +187,10 @@ int main(int argc, char ** argv) {
 
     const ggml_type delta_type = parse_quant_type(quant_str);
     fprintf(stderr, "Delta quantization: %s, levels: %d, threads: %d\n", quant_str, n_levels, n_threads);
+    if (sparse_threshold > 0) {
+        fprintf(stderr, "Sparse mode: threshold=%.4f (blocks below %.2f%% of max importance will be pruned)\n",
+                sparse_threshold, sparse_threshold * 100.0f);
+    }
 
     // ---- mmap models ----
     MappedFile blurry_mmap;
@@ -320,7 +330,9 @@ int main(int argc, char ** argv) {
             int64_t ne2 = sinfo.ne[2] > 0 ? sinfo.ne[2] : 1;
             int64_t ne3 = sinfo.ne[3] > 0 ? sinfo.ne[3] : 1;
 
-            ggml_tensor * t = ggml_new_tensor_4d(ctx, delta_type, ne0, ne1, ne2, ne3);
+            const int64_t blk_sz = (int64_t)ggml_blck_size(delta_type);
+            const ggml_type eff_type = (blk_sz > 0 && ne0 < blk_sz) ? GGML_TYPE_F32 : delta_type;
+            ggml_tensor * t = ggml_new_tensor_4d(ctx, eff_type, ne0, ne1, ne2, ne3);
             if (t) {
                 ggml_set_name(t, shared_tensors[ti].c_str());
                 gguf_add_tensor(hdr, t);
@@ -372,6 +384,18 @@ int main(int argc, char ** argv) {
     int64_t t_start = ggml_time_us();
     std::mutex write_mtx;  // protects file writes
 
+    // Sparse mode: accumulate per-tensor block indices for Phase 2.5
+    struct SparseInfo {
+        std::string name;
+        std::vector<uint16_t> block_indices; // significant block positions
+        int64_t n_blocks_total;              // total blocks per expert
+        int64_t n_blocks_stored;             // significant blocks
+        int64_t n_per_row;                   // ne00
+        int64_t rows_per_expert;
+        int64_t n_experts;
+    };
+    std::vector<SparseInfo> sparse_infos;
+
     for (int ti = 0; ti < n_tensors; ti++) {
         const auto & tname = shared_tensors[ti];
         const auto & binfo = blurry_index[tname];
@@ -390,7 +414,12 @@ int main(int argc, char ** argv) {
 
         const size_t sharp_bpe  = sinfo.nbytes / n_experts;
         const size_t blurry_bpe = binfo.nbytes / n_experts;
-        const size_t delta_bpe  = ggml_row_size(delta_type, n_per_row) * rows_per_expert;
+
+        // Use F32 for tensors too small for the target quant block size (e.g. scalar layer_output_scale)
+        const int64_t blk_size_check = (int64_t)ggml_blck_size(delta_type);
+        const ggml_type effective_delta_type = (blk_size_check > 0 && n_per_row < blk_size_check) ? GGML_TYPE_F32 : delta_type;
+
+        const size_t delta_bpe  = ggml_row_size(effective_delta_type, n_per_row) * rows_per_expert;
         const size_t delta_total = delta_bpe * n_experts;
 
         if (n_elements == 0 || n_per_row == 0) {
@@ -417,6 +446,17 @@ int main(int argc, char ** argv) {
 
         std::vector<std::vector<double>> level_mse(n_levels, std::vector<double>(n_experts, 0.0));
 
+        // Block importance analysis for sparse mode (level 1 only)
+        // Per-expert adaptive threshold: each expert decides which blocks are
+        // significant relative to ITS OWN max importance. A block survives if
+        // ANY expert considers it significant (union). This preserves niche
+        // knowledge in specialized experts that have small but meaningful deltas.
+        const int64_t blk_size = (int64_t)ggml_blck_size(delta_type);
+        const int64_t n_blocks_per_expert = (blk_size > 0 && elems_per_expert > 0) ? elems_per_expert / blk_size : 0;
+        // Per-expert, per-block importance [n_experts][n_blocks]
+        std::vector<std::vector<float>> expert_block_importance(n_experts);
+        for (int64_t ei = 0; ei < n_experts; ei++) expert_block_importance[ei].resize(n_blocks_per_expert, 0.0f);
+
         // Parallel across experts
         #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
         for (int64_t ei = 0; ei < n_experts; ei++) {
@@ -432,9 +472,21 @@ int main(int argc, char ** argv) {
             for (int level = 0; level < n_levels; level++) {
                 for (int64_t i = 0; i < elems_per_expert; i++) re[i] = sf[i] - ap[i];
 
-                ggml_quantize_chunk(delta_type, re.data(), dq.data(), 0, rows_per_expert, n_per_row, nullptr);
+                ggml_quantize_chunk(effective_delta_type, re.data(), dq.data(), 0, rows_per_expert, n_per_row, nullptr);
 
                 memcpy(level_deltas[level].data() + ei * delta_bpe, dq.data(), delta_bpe);
+
+                // Block importance analysis for level 1 sparse output (per-expert)
+                if (level == 0 && sparse_threshold > 0 && n_blocks_per_expert > 0) {
+                    for (int64_t b = 0; b < n_blocks_per_expert; b++) {
+                        float sum_sq = 0.0f;
+                        for (int64_t j = 0; j < blk_size; j++) {
+                            float v = re[b * blk_size + j];
+                            sum_sq += v * v;
+                        }
+                        expert_block_importance[ei][b] = sqrtf(sum_sq / (float)blk_size);
+                    }
+                }
 
                 dequant_to_f32(dq.data(), delta_type, elems_per_expert, df.data());
                 double mse = 0.0;
@@ -462,12 +514,192 @@ int main(int argc, char ** argv) {
             level_files[level].count++;
         }
 
+        // Build sparse index for this tensor (level 1)
+        // Per-expert adaptive threshold: a block is kept if ANY expert considers
+        // it significant relative to that expert's own max importance.
+        if (sparse_threshold > 0 && n_blocks_per_expert > 0) {
+            // Per-expert threshold
+            std::vector<float> expert_max(n_experts, 0.0f);
+            for (int64_t ei = 0; ei < n_experts; ei++) {
+                for (int64_t b = 0; b < n_blocks_per_expert; b++) {
+                    if (expert_block_importance[ei][b] > expert_max[ei])
+                        expert_max[ei] = expert_block_importance[ei][b];
+                }
+            }
+
+            // Union: block survives if ANY expert says it's important
+            std::vector<bool> block_significant(n_blocks_per_expert, false);
+            for (int64_t b = 0; b < n_blocks_per_expert; b++) {
+                for (int64_t ei = 0; ei < n_experts; ei++) {
+                    float thresh = expert_max[ei] * sparse_threshold;
+                    if (expert_block_importance[ei][b] >= thresh) {
+                        block_significant[b] = true;
+                        break;
+                    }
+                }
+            }
+
+            SparseInfo si;
+            si.name = tname;
+            si.n_blocks_total = n_blocks_per_expert;
+            si.n_per_row = n_per_row;
+            si.rows_per_expert = rows_per_expert;
+            si.n_experts = n_experts;
+            for (int64_t b = 0; b < n_blocks_per_expert; b++) {
+                if (block_significant[b]) {
+                    si.block_indices.push_back((uint16_t)b);
+                }
+            }
+            si.n_blocks_stored = (int64_t)si.block_indices.size();
+
+            sparse_infos.push_back(std::move(si));
+        }
+
         double elapsed = (ggml_time_us() - t_start) / 1e6;
         double eta = (elapsed / (ti + 1)) * (n_tensors - ti - 1);
-        fprintf(stderr, "\r  [%d/%d] %.0fs ETA %.0fs  (%s: %.1fM elems, %lld experts)          ",
-                ti+1, n_tensors, elapsed, eta, tname.c_str(),
-                n_elements / 1e6, (long long)n_experts);
+        if (sparse_threshold > 0 && n_blocks_per_expert > 0 && !sparse_infos.empty()) {
+            auto & last = sparse_infos.back();
+            fprintf(stderr, "  [%d/%d] %s: %lld→%lld blocks kept (%.0f%% pruned) [%.0fs ETA %.0fs]\n",
+                    ti+1, n_tensors, tname.c_str(),
+                    (long long)last.n_blocks_total, (long long)last.n_blocks_stored,
+                    100.0 * (1.0 - (double)last.n_blocks_stored / last.n_blocks_total),
+                    elapsed, eta);
+        } else {
+            fprintf(stderr, "\r  [%d/%d] %.0fs ETA %.0fs  (%s: %.1fM elems, %lld experts)          ",
+                    ti+1, n_tensors, elapsed, eta, tname.c_str(),
+                    n_elements / 1e6, (long long)n_experts);
+        }
     }
+
+    // ==================================================================
+    // Phase 2.5: Generate sparse delta GGUF (if --sparse was given)
+    // ==================================================================
+    if (sparse_threshold > 0 && !sparse_infos.empty() && level_files[0].fp) {
+        fclose(level_files[0].fp);
+        level_files[0].fp = nullptr;
+
+        fprintf(stderr, "\n\nPhase 2.5: Generating sparse delta GGUF...\n");
+
+        // Open the full level-1 delta we just wrote for reading
+        FILE * full_fp = fopen(level_files[0].path, "rb");
+        if (!full_fp) {
+            fprintf(stderr, "  ERROR: cannot reopen %s for sparse conversion\n", level_files[0].path);
+            goto skip_sparse;
+        }
+
+        char sparse_path[512];
+        snprintf(sparse_path, sizeof(sparse_path), "%s_sparse_1.gguf", out_prefix);
+
+        // Build GGUF header with sparse tensors
+        gguf_context * shdr = gguf_init_empty();
+        gguf_set_val_str(shdr, "general.architecture", model_arch.c_str());
+        gguf_set_val_str(shdr, "general.type", "delta_correction_sparse");
+        gguf_set_val_i32(shdr, "bs.delta.level", 1);
+        gguf_set_val_str(shdr, "bs.delta.quant_type", quant_str);
+        gguf_set_val_bool(shdr, "bs.delta.sparse", true);
+        gguf_set_val_f32(shdr, "bs.delta.sparse_threshold", sparse_threshold);
+
+        const size_t sctx_size = sparse_infos.size() * 2 * ggml_tensor_overhead() + 16*1024*1024;
+        ggml_init_params sip = { .mem_size = sctx_size, .mem_buffer = nullptr, .no_alloc = true };
+        ggml_context * sctx = ggml_init(sip);
+
+        for (auto & si : sparse_infos) {
+            // Packed delta tensor: n_stored_blocks * block_elems per expert row dimension
+            int64_t packed_elems_per_expert = si.n_blocks_stored * ggml_blck_size(delta_type);
+            ggml_tensor * td = ggml_new_tensor_3d(sctx, delta_type,
+                packed_elems_per_expert > 0 ? packed_elems_per_expert : 1,
+                si.rows_per_expert > 0 ? 1 : 1,  // packed: 1 "row" of packed blocks
+                si.n_experts);
+            ggml_set_name(td, si.name.c_str());
+            gguf_add_tensor(shdr, td);
+
+            // Index tensor: uint16 array of block positions
+            std::string idx_name = si.name + ".idx";
+            ggml_tensor * ti_t = ggml_new_tensor_1d(sctx, GGML_TYPE_I16,
+                si.n_blocks_stored > 0 ? si.n_blocks_stored : 1);
+            ggml_set_name(ti_t, idx_name.c_str());
+            gguf_add_tensor(shdr, ti_t);
+
+            // Store metadata
+            char key[256];
+            snprintf(key, sizeof(key), "bs.delta.%s.n_blocks_total", si.name.c_str());
+            gguf_set_val_i32(shdr, key, (int32_t)si.n_blocks_total);
+            snprintf(key, sizeof(key), "bs.delta.%s.n_blocks_stored", si.name.c_str());
+            gguf_set_val_i32(shdr, key, (int32_t)si.n_blocks_stored);
+        }
+
+        gguf_write_to_file(shdr, sparse_path, true);
+        size_t sparse_data_offset = gguf_get_meta_size(shdr);
+        gguf_free(shdr);
+        ggml_free(sctx);
+
+        // Write sparse data
+        FILE * sfp = fopen(sparse_path, "r+b");
+        if (!sfp) { fprintf(stderr, "  ERROR: cannot open %s for writing\n", sparse_path); fclose(full_fp); goto skip_sparse; }
+        fseek(sfp, (long)sparse_data_offset, SEEK_SET);
+
+        // Read full delta and pack significant blocks
+        size_t full_data_offset = level_files[0].data_offset;
+        size_t full_cursor = full_data_offset;
+
+        for (size_t si_idx = 0; si_idx < sparse_infos.size(); si_idx++) {
+            auto & si = sparse_infos[si_idx];
+            const size_t block_bytes = ggml_type_size(delta_type); // bytes per quantization block
+            const size_t full_expert_bytes = ggml_row_size(delta_type, si.n_per_row) * si.rows_per_expert;
+            const size_t packed_expert_bytes = si.n_blocks_stored * block_bytes;
+
+            std::vector<uint8_t> full_expert(full_expert_bytes);
+            std::vector<uint8_t> packed(packed_expert_bytes);
+
+            for (int64_t ei = 0; ei < si.n_experts; ei++) {
+                // Read full expert from level-1 output
+                fseek(full_fp, (long)(full_cursor + ei * full_expert_bytes), SEEK_SET);
+                fread(full_expert.data(), 1, full_expert_bytes, full_fp);
+
+                // Pack significant blocks
+                for (int64_t bi = 0; bi < si.n_blocks_stored; bi++) {
+                    int64_t src_block = si.block_indices[bi];
+                    memcpy(packed.data() + bi * block_bytes,
+                           full_expert.data() + src_block * block_bytes,
+                           block_bytes);
+                }
+                fwrite(packed.data(), 1, packed_expert_bytes, sfp);
+            }
+
+            // Pad packed tensor
+            size_t total_packed = packed_expert_bytes * si.n_experts;
+            size_t pad = (32 - (total_packed % 32)) % 32;
+            if (pad > 0) { uint8_t z[32] = {0}; fwrite(z, 1, pad, sfp); }
+
+            // Write index tensor
+            fwrite(si.block_indices.data(), sizeof(uint16_t), si.n_blocks_stored, sfp);
+            size_t idx_bytes = si.n_blocks_stored * sizeof(uint16_t);
+            pad = (32 - (idx_bytes % 32)) % 32;
+            if (pad > 0) { uint8_t z[32] = {0}; fwrite(z, 1, pad, sfp); }
+
+            // Advance past this tensor in the full file
+            size_t full_tensor_bytes = full_expert_bytes * si.n_experts;
+            size_t full_pad = (32 - (full_tensor_bytes % 32)) % 32;
+            full_cursor += full_tensor_bytes + full_pad;
+
+            fprintf(stderr, "  [%zu/%zu] %s: %lld→%lld blocks (%.0f%% reduction)\n",
+                    si_idx + 1, sparse_infos.size(), si.name.c_str(),
+                    (long long)si.n_blocks_total, (long long)si.n_blocks_stored,
+                    100.0 * (1.0 - (double)si.n_blocks_stored / si.n_blocks_total));
+        }
+
+        fclose(sfp);
+        fclose(full_fp);
+
+        struct stat sst;
+        stat(sparse_path, &sst);
+        struct stat fst;
+        stat(level_files[0].path, &fst);
+        fprintf(stderr, "  Sparse delta: %s (%.1f GB, %.0f%% of full %.1f GB)\n",
+                sparse_path, sst.st_size / 1e9,
+                100.0 * sst.st_size / fst.st_size, fst.st_size / 1e9);
+    }
+skip_sparse:
 
     // ==================================================================
     // Phase 3: Close files and report

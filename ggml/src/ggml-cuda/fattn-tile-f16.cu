@@ -54,7 +54,7 @@ static __global__ void flash_attn_tile_ext_f16(
         const int ne3) {
 #ifdef FP16_AVAILABLE
     // Skip unused kernel variants for faster compilation:
-    if (use_softcap && !(D == 128 || D == 256)) {
+    if (use_softcap && !(D == 128 || D == 256 || D == 512)) {
         NO_DEVICE_CODE;
         return;
     }

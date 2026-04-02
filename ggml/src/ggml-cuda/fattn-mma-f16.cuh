@@ -44,7 +44,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 
     // If cp.async is available, load up to the highest power of 2 in D asynchronously:
 #ifdef CP_ASYNC_AVAILABLE
-    static_assert(D >= 64 && D < 512, "bad D");
+    static_assert(D >= 64 && D <= 512, "bad D");
     constexpr int k0_sync_start = D/2 < 64 ? 32 : (D/2 < 128 ? 64 : 128);
 
     const unsigned int tile_KV_32 = __cvta_generic_to_shared(tile_KV);
@@ -917,7 +917,7 @@ static __global__ void flash_attn_mma_ext_f16(
 #if defined(INT8_MMA_AVAILABLE)
 
     // Skip unused kernel variants for faster compilation:
-    if (use_logit_softcap && !(D == 128 || D == 256)) {
+    if (use_logit_softcap && !(D == 128 || D == 256 || D == 512)) {
         NO_DEVICE_CODE;
         return;
     }
@@ -1546,6 +1546,8 @@ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 96,   8)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(112,   8)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(128,   8)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(256,   8)
+extern DECL_FATTN_MMA_F16_CASE(512,  2,  4);
+extern DECL_FATTN_MMA_F16_CASE(512,  1,  8);
 
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 64,  16)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 80,  16)
@@ -1553,6 +1555,8 @@ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 96,  16)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(112,  16)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(128,  16)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(256,  16)
+extern DECL_FATTN_MMA_F16_CASE(512,  4,  4);
+extern DECL_FATTN_MMA_F16_CASE(512,  2,  8);
 
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 64,  32)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 80,  32)
@@ -1560,6 +1564,8 @@ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 96,  32)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(112,  32)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(128,  32)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(256,  32)
+extern DECL_FATTN_MMA_F16_CASE(512,  8,  4);
+extern DECL_FATTN_MMA_F16_CASE(512,  4,  8);
 
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 64,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 80,  64)
@@ -1567,6 +1573,8 @@ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 96,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(112,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(128,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(256,  64)
+extern DECL_FATTN_MMA_F16_CASE(512, 16,  4);
+extern DECL_FATTN_MMA_F16_CASE(512,  8,  8);
 
 // Kernels with ncols == 128 are only 4% faster due to register pressure.
 // DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 64, 128)

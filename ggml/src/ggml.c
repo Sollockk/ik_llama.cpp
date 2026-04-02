@@ -16952,6 +16952,183 @@ static int ggml_compute_forward_mul_mat(
 
     const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
 
+    // ---- Dense delta correction path (PIM ray march) ----
+    // When src0 has a delta cache wired, bypass IQK/gemv fast paths and do
+    // blurry + delta correction in f32.  Mirrors the mul_mat_id delta path
+    // but without expert routing (always expert 0, ne[2]=1).
+    const bool has_delta_dense = (src0->ray_march_delta_cache != NULL);
+    if (has_delta_dense) {
+        const enum ggml_type ray_march_delta_type = src0->ray_march_delta_type;
+        const bool delta_use_raymarch = (ne11 > 1);  // batch = ray march, single token = fast 2-dot
+
+        // Block size = max of blurry and delta quant block sizes
+        const int rm_block_size = ((int)ggml_blck_size(src0->type) > (int)ggml_blck_size(ray_march_delta_type)
+            ? (int)ggml_blck_size(src0->type) : (int)ggml_blck_size(ray_march_delta_type));
+        const bool rm_aligned = rm_block_size > 0 && (ne00 % rm_block_size == 0);
+        const int rm_n_blocks = (delta_use_raymarch && rm_aligned) ? (int)(ne00 / rm_block_size) : 0;
+
+        // Delta traits
+        ggml_type_traits_t delta_traits = ggml_internal_get_type_traits(ray_march_delta_type);
+        const enum ggml_type delta_input_type = GGML_TYPE_Q8_0;
+
+        // Get delta data (always expert 0 for dense models)
+        const char * delta_data = pim_delta_cache_get(
+            (struct pim_delta_cache *)src0->ray_march_delta_cache, 0);
+        const size_t delta_row_stride = ggml_row_size(ray_march_delta_type, ne00);
+
+        // One-time diagnostic
+        static int rm_dense_diag = 0;
+        if (rm_dense_diag < 3 && ith == 0) {
+            rm_dense_diag++;
+            fprintf(stderr, "[pim-delta-dense] src0=%s ne00=%lld ne01=%lld batch=%lld mode=%s blurry=%s delta=%s blk=%d\n",
+                    src0->name, (long long)ne00, (long long)ne01, (long long)ne11,
+                    delta_use_raymarch ? (rm_n_blocks > 0 ? "raymarch" : "fullrow") : "fast2dot",
+                    ggml_type_name(src0->type), ggml_type_name(ray_march_delta_type),
+                    rm_block_size);
+        }
+
+        ggml_vec_dot_t const vec_dot = type_traits[type].vec_dot;
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+        const bool src1_cont = ggml_is_contiguous(src1);
+
+        // broadcast factors
+        const int64_t r2 = ne12 / ne02;
+        const int64_t r3 = ne13 / ne03;
+
+        // Thread distribution (same as one_chunk fallback)
+        const int64_t nr0 = ne0;
+        const int64_t nr1 = ne1 * ne2 * ne3;
+
+        const int64_t nth0 = nr0 > nr1 ? nth : 1;
+        const int64_t nth1 = nr0 > nr1 ? 1 : nth;
+
+        const int64_t ith0 = ith % nth0;
+        const int64_t ith1 = ith / nth0;
+
+        const int64_t dr0 = (nr0 + nth0 - 1) / nth0;
+        const int64_t dr1 = (nr1 + nth1 - 1) / nth1;
+
+        const int64_t ir0_start = dr0 * ith0;
+        const int64_t ir0_end   = MIN(ir0_start + dr0, nr0);
+        const int64_t ir1_start = dr1 * ith1;
+        const int64_t ir1_end   = MIN(ir1_start + dr1, nr1);
+
+        if (ir0_start >= ir0_end || ir1_start >= ir1_end) return node_n;
+
+        const int64_t blck_0 = 16;
+        const int64_t blck_1 = 16;
+        float tmp[16];
+
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+            for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+                for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
+                    const int64_t i13 = (ir1 / (ne12 * ne1));
+                    const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
+                    const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+
+                    const int64_t i03 = i13 / r3;
+                    const int64_t i02 = i12 / r2;
+
+                    const char * src0_row = (const char *)src0->data + (i02 * nb02 + i03 * nb03);
+
+                    const char * src1_col = (const char *)wdata +
+                        (src1_cont || src1->type != vec_dot_type
+                            ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
+                            : (i11 * nb11 + i12 * nb12 + i13 * nb13));
+
+                    float * dst_col = (float *)((char *)dst->data + (i11 * nb1 + i12 * nb2 + i13 * nb3));
+
+                    // Re-quantize input for delta's vec_dot_type if needed
+                    const void * dinput = src1_col;
+                    char dinput_stack[16384];
+                    void * dinput_heap = NULL;
+
+                    if (delta_input_type != vec_dot_type && src1->type == GGML_TYPE_F32) {
+                        const float * src1_f32 = (const float *)((const char *)src1->data
+                            + i11 * nb11 + i12 * nb12 + i13 * nb13);
+                        size_t dinput_size = ggml_row_size(delta_input_type, ne00);
+                        void * dinput_buf = (dinput_size <= sizeof(dinput_stack))
+                            ? dinput_stack : (dinput_heap = malloc(dinput_size));
+                        if (dinput_buf) {
+                            ggml_type_traits_t dit = ggml_internal_get_type_traits(delta_input_type);
+                            if (dit.from_float) {
+                                dit.from_float(src1_f32, dinput_buf, ne00);
+                            }
+                            dinput = dinput_buf;
+                        }
+                    }
+
+                    if (delta_use_raymarch && rm_n_blocks > 0) {
+                        // --- Prompt batch: ray march with block energy skipping ---
+                        const float * src1_f32 = (src1->type == GGML_TYPE_F32)
+                            ? (const float *)((const char *)src1->data + i11*nb11 + i12*nb12 + i13*nb13)
+                            : NULL;
+
+                        float rm_energies_buf[512];
+                        int   rm_blurry_buf[512];
+                        int   rm_sharp_buf[512];
+
+                        struct ggml_ray_march_tiers tiers;
+                        tiers.blurry_blocks = rm_blurry_buf;
+                        tiers.sharp_blocks  = rm_sharp_buf;
+                        tiers.n_blurry = 0;
+                        tiers.n_sharp  = 0;
+                        tiers.n_skip   = 0;
+                        tiers.n_total  = rm_n_blocks;
+
+                        if (src1_f32 && rm_n_blocks <= 512) {
+                            ggml_ray_march_block_energies(src1_f32, rm_energies_buf, (int)ne00, rm_block_size);
+
+                            float e_sum = 0.0f, e_sum_sq = 0.0f;
+                            for (int b = 0; b < rm_n_blocks; b++) {
+                                e_sum    += rm_energies_buf[b];
+                                e_sum_sq += rm_energies_buf[b] * rm_energies_buf[b];
+                            }
+                            float e_mean = e_sum / rm_n_blocks;
+                            float e_var  = (e_sum_sq / rm_n_blocks) - (e_mean * e_mean);
+                            float e_std  = e_var > 0.0f ? sqrtf(e_var) : 0.0f;
+
+                            size_t dsup = (delta_traits.blck_size > 0)
+                                ? (size_t)rm_block_size / delta_traits.blck_size : 1;
+
+                            ggml_ray_march_partition_blocks(
+                                rm_energies_buf, rm_n_blocks,
+                                e_mean * 0.01f, e_mean + 0.5f * e_std,
+                                &tiers, delta_data, dsup * delta_traits.type_size);
+                        } else {
+                            for (int b = 0; b < rm_n_blocks; b++) rm_blurry_buf[tiers.n_blurry++] = b;
+                        }
+
+                        for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                            ggml_vec_dot_ray_march_3tier(
+                                (int)ne00, &tmp[ir0 - iir0],
+                                src0_row + ir0 * nb01, (int)src0->type,
+                                delta_data + ir0 * delta_row_stride, (int)ray_march_delta_type,
+                                src1_col, dinput,
+                                &tiers, rm_block_size);
+                        }
+                    } else {
+                        // --- Generation (single token): fast two full-row vec_dots ---
+                        for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                            float blurry_dot = 0.0f, delta_dot = 0.0f;
+                            vec_dot(ne00, &blurry_dot, 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
+                            if (delta_traits.vec_dot) {
+                                delta_traits.vec_dot((int)ne00, &delta_dot, 0,
+                                    delta_data + ir0 * delta_row_stride, 0,
+                                    dinput, 0, 1);
+                            }
+                            tmp[ir0 - iir0] = blurry_dot + delta_dot;
+                        }
+                    }
+
+                    if (dinput_heap) free(dinput_heap);
+                    memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                }
+            }
+        }
+        return node_n;
+    }
+
     if (src1->type != vec_dot_type && dst->type == GGML_TYPE_F32) {
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
         if (iqk_mul_mat_4d(ne01, ne11, ne00,

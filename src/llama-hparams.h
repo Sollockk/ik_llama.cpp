@@ -30,6 +30,9 @@ struct llama_hparams {
     uint32_t n_swa_pattern = 1; // by default, all layers use non-sliding-window attention
     uint32_t n_embd_head_k; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
     uint32_t n_embd_head_v; // dimension of values (d_v) aka n_embd_head
+    uint32_t n_embd_head_k_swa = 0; // gemma4: SWA head dim (0 = same as n_embd_head_k)
+    uint32_t n_embd_head_v_swa = 0; // gemma4: SWA head dim (0 = same as n_embd_head_v)
+    uint32_t n_embd_per_layer = 0;  // gemma4: per-layer embedding dimension
     uint32_t n_expert = 0;
     uint32_t n_expert_used = 0;
     uint32_t n_vocab_type = 0; // for BERT-style token types
@@ -239,16 +242,41 @@ struct llama_hparams {
         return n_head/n_head_kv;
     }
 
+    // gemma4: per-layer head dimensions (SWA layers may have different head dims)
+    bool is_swa(uint32_t il) const {
+        return il < n_layer && swa_layers[il] != 0;
+    }
+
+    bool has_kv(uint32_t il) const {
+        return n_layer_kv_from_start < 0 || (int32_t)il < n_layer_kv_from_start;
+    }
+
+    uint32_t n_embd_head_k_l(uint32_t il = 0) const {
+        if (n_embd_head_k_swa > 0 && is_swa(il)) return n_embd_head_k_swa;
+        return n_embd_head_k;
+    }
+
+    uint32_t n_embd_head_v_l(uint32_t il = 0) const {
+        if (n_embd_head_v_swa > 0 && is_swa(il)) return n_embd_head_v_swa;
+        return n_embd_head_v;
+    }
+
+    uint32_t n_rot_l(uint32_t il = 0) const {
+        if (il < n_layer && rope_dim_per_layer[il] > 0) return rope_dim_per_layer[il];
+        if (n_embd_head_k_swa > 0 && is_swa(il)) return n_embd_head_k_swa; // SWA uses full head dim for rope
+        return n_rot;
+    }
+
     uint32_t n_embd_k_gqa(uint32_t il = 0) const { // dimension of key embeddings across all k-v heads
         const uint32_t n_head_kv = this->n_head_kv(il);
 
-        return n_embd_head_k * n_head_kv;
+        return n_embd_head_k_l(il) * n_head_kv;
     }
 
     uint32_t n_embd_v_gqa(uint32_t il = 0) const { // dimension of value embeddings across all k-v heads
         const uint32_t n_head_kv = this->n_head_kv(il);
 
-        return n_embd_head_v * n_head_kv;
+        return n_embd_head_v_l(il) * n_head_kv;
     }
 
     uint32_t n_embd_k_s() const { // dimension of the rolling state embeddings

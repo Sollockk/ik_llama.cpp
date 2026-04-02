@@ -197,6 +197,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_hs(ggml_backend_cuda_context
         case 256:
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<256, ncols2>(ctx, dst);
             break;
+        case 512:
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, ncols2>(ctx, dst);
+            break;
         default:
             GGML_ABORT("fatal error");
             break;
@@ -223,6 +226,19 @@ void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tens
         return;
     }
 
+    // D=512 only has ncols2=4 and ncols2=8 template instances.
+    if (Q->ne[0] == 512) {
+        if (use_gqa_opt && gqa_ratio % 8 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, 8>(ctx, dst);
+        } else if (use_gqa_opt && gqa_ratio % 4 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, 4>(ctx, dst);
+        } else {
+            // Fallback: use ncols2=4 for non-GQA or odd GQA ratios
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<512, 4>(ctx, dst);
+        }
+        return;
+    }
+
     if (use_gqa_opt && gqa_ratio % 8 == 0) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_hs<8>(ctx, dst);
         return;
@@ -245,5 +261,5 @@ bool ggml_cuda_fattn_mma_f16_is_supported([[maybe_unused]] ggml_backend_cuda_con
     auto K = dst->src[1];
     auto V = dst->src[1];
     if (K->ne[0] != V->ne[0]) return false;
-    return K->ne[0] == 64 || K->ne[0] == 80 || K->ne[0] == 96 || K->ne[0] == 112 || K->ne[0] == 128 || K->ne[0] == 192 || K->ne[0] == 256;
+    return K->ne[0] == 64 || K->ne[0] == 80 || K->ne[0] == 96 || K->ne[0] == 112 || K->ne[0] == 128 || K->ne[0] == 192 || K->ne[0] == 256 || K->ne[0] == 512;
 }
