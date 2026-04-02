@@ -97,6 +97,14 @@ struct DataInfo {
     const mmid_row_mapping * row_mapping = nullptr;
     size_t        bs2 = 0;
     bool          accumulate = false; // true = add to dst instead of overwrite (for delta correction)
+    const uint64_t * skip_mask = nullptr; // bitmask: bit set = skip this block (ray march)
+    int           skip_mask_stride = 1;   // kernel blocks per mask bit (for block size mismatch)
+
+    inline bool should_skip_block(int b) const {
+        if (!skip_mask) return false;
+        int mb = b / skip_mask_stride;
+        return (skip_mask[mb >> 6] & ((uint64_t)1 << (mb & 63))) != 0;
+    }
 
     inline const char * src1_row(int iy) const {
         if (!row_mapping) return cy + (cur_y + iy)*by;

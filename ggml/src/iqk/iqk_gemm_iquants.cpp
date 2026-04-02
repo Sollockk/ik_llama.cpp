@@ -738,6 +738,7 @@ static void mul_mat_qX_K_q8_K_IQ_1(int n, const void * vx, size_t bx, const Data
         deq.new_row(ix);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
 
             __m256i sumi[2], all_scales[Dequantizer::num_blocks/8];
             deq.new_block(i, all_scales);
@@ -799,6 +800,7 @@ static void mul_mat_qX_K_q8_K_IQ_N(int n, const void * vx, size_t bx, const Data
         deq.new_row(ix);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
 
             __m256i sumi[nrc_y], all_scales[Dequantizer::num_blocks/8];
             //for (int iy = 0; iy < nrc_y; ++iy) sumi[iy] = _mm256_setzero_si256();
@@ -903,6 +905,7 @@ static void mul_mat_qX_K_q8_2_IQ_N(int n, const void * vx, size_t bx, const Data
         deq.new_row(ix);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
 
             deq.new_block_f(i, scales);
             if constexpr (!use_1_row) {
@@ -958,6 +961,7 @@ static void mul_mat_iq2_xxs_q8_2_IQ_N(int n, const void * vx, size_t bx, const D
         const block_iq2_xxs * x = (const block_iq2_xxs *)((const char *)vx + ix*bx);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             const float d = GGML_FP16_TO_FP32(x[i].d)*0.125f;
             const uint16_t * a16 = x[i].qs;
             auto sc16 = _mm_set_epi16(a16[31], a16[27], a16[23], a16[19], a16[15], a16[11], a16[7], a16[3]);
@@ -1039,6 +1043,7 @@ static void mul_mat_iq2_xxs_r4_q8_k(int n, const void * vx, size_t bx, const Dat
     for (int ix = 0; ix < nrc_x; ix += 4) {
         auto iq2 = (const block_iq2_xxs_r4 *)((const char *)vx + (ix+0)*bx);
         for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            if (info.should_skip_block(ibl)) continue;
             auto dl = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)iq2[ibl].d));
             auto d4 = _mm256_set_m128(dl, dl);
             auto qs = iq2[ibl].qs;
@@ -1140,6 +1145,7 @@ static void mul_mat_iq2_xs_r4_q8_k(int n, const void * vx, size_t bx, const Data
     for (int ix = 0; ix < nrc_x; ix += 4) {
         auto iq2 = (const block_iq2_xs_r4 *)((const char *)vx + (ix+0)*bx);
         for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            if (info.should_skip_block(ibl)) continue;
             auto dl = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)iq2[ibl].d));
             auto d4 = _mm256_set_m128(dl, dl);
             auto s32 = (const uint32_t *)iq2[ibl].scales;
@@ -1265,6 +1271,7 @@ static void mul_mat_iq2_xs_r4_q8_k_16(int n, const void * vx, size_t bx, const D
     for (int ix = 0; ix < nrc_x; ix += 4) {
         auto iq2 = (const block_iq2_xs_r4 *)((const char *)vx + (ix+0)*bx);
         for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            if (info.should_skip_block(ibl)) continue;
             auto dl = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)iq2[ibl].d));
             auto d4 = _mm256_set_m128(dl, dl);
             auto s32 = (const uint32_t *)iq2[ibl].scales;
@@ -1423,6 +1430,7 @@ static void mul_mat_iq2_s_r4_q8_k(int n, const void * vx, size_t bx, const DataI
     for (int ix = 0; ix < nrc_x; ix += 4) {
         auto iq2 = (const block_iq2_s_r4 *)((const char *)vx + (ix+0)*bx);
         for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            if (info.should_skip_block(ibl)) continue;
             auto dl = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)iq2[ibl].d));
             auto d4 = _mm256_set_m128(dl, dl);
             auto s32 = (const uint32_t *)iq2[ibl].scales;
@@ -1545,6 +1553,7 @@ static void mul_mat_iq2_s_r4_q8_k_16(int n, const void * vx, size_t bx, const Da
     for (int ix = 0; ix < nrc_x; ix += 4) {
         auto iq2 = (const block_iq2_s_r4 *)((const char *)vx + (ix+0)*bx);
         for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            if (info.should_skip_block(ibl)) continue;
             auto dl = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)iq2[ibl].d));
             auto d4 = _mm256_set_m128(dl, dl);
             auto s32 = (const uint32_t *)iq2[ibl].scales;
@@ -1681,6 +1690,7 @@ static void mul_mat_iq3_xxs_r4_q8_k(int n, const void * vx, size_t bx, const Dat
     for (int ix = 0; ix < nrc_x; ix += 4) {
         auto iq3 = (const block_iq3_xxs_r4 *)((const char *)vx + (ix+0)*bx);
         for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            if (info.should_skip_block(ibl)) continue;
             auto dl = _mm_mul_ps(_mm_set1_ps(0.25f), _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)iq3[ibl].d))); // TODO: absorb the 0.25 factor into d when quantizing/repacking
             auto d4 = _mm256_set_m128(dl, dl);
             for (int ib = 0; ib < QK_K/32; ++ib) {
@@ -1779,6 +1789,7 @@ static void mul_mat_iq3_s_r4_q8_k(int n, const void * vx, size_t bx, const DataI
     for (int ix = 0; ix < nrc_x; ix += 4) {
         auto iq3 = (const block_iq3_s_r4 *)((const char *)vx + (ix+0)*bx);
         for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            if (info.should_skip_block(ibl)) continue;
             auto dl = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)iq3[ibl].d));
             auto d4 = _mm256_set_m128(dl, dl);
             auto qs = iq3[ibl].qs;
@@ -2129,6 +2140,7 @@ static void mul_mat_iq2_xs_q8_2_X4(int n, const void * vx, size_t bx, const Data
         deq.new_row(ix);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
 
             deq.d = 0.125f * GGML_FP16_TO_FP32(deq.x[i].d);
             auto vd = _mm256_set1_ps(deq.d);
@@ -2369,6 +2381,7 @@ static void mul_mat_iq2_s_q8_2_X4(int n, const void * vx, size_t bx, const DataI
         deq.new_row(ix);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
 
             deq.d = 0.125f * GGML_FP16_TO_FP32(deq.x[i].d);
             auto vd = _mm256_set1_ps(deq.d);
@@ -3084,6 +3097,7 @@ static void mul_mat_iq2_xxs_r4_q8_k(int n, const void * vx, size_t bx, const Dat
     for (int ix = 0; ix < nrc_x; ix += 4) {
         auto iq2 = (const block_iq2_xxs_r4 *)((const char *)vx + (ix+0)*bx);
         for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            if (info.should_skip_block(ibl)) continue;
             auto d4 = vcvt_f32_f16(vld1_f16((const float16_t *)iq2[ibl].d));
             auto qs = iq2[ibl].qs;
             for (int ib = 0; ib < QK_K/32; ++ib) {
@@ -3137,6 +3151,7 @@ static void mul_mat_iq2_xs_r4_q8_k(int n, const void * vx, size_t bx, const Data
     for (int ix = 0; ix < nrc_x; ix += 4) {
         auto iq2 = (const block_iq2_xs_r4 *)((const char *)vx + (ix+0)*bx);
         for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            if (info.should_skip_block(ibl)) continue;
             auto d4 = vcvt_f32_f16(vld1_f16((const float16_t *)iq2[ibl].d));
             auto qs = iq2[ibl].qs;
             for (int is = 0; is < 2; ++is) {
@@ -3202,6 +3217,7 @@ static void mul_mat_iq2_s_r4_q8_k(int n, const void * vx, size_t bx, const DataI
     for (int ix = 0; ix < nrc_x; ix += 4) {
         auto iq2 = (const block_iq2_s_r4 *)((const char *)vx + (ix+0)*bx);
         for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            if (info.should_skip_block(ibl)) continue;
             auto d4 = vcvt_f32_f16(vld1_f16((const float16_t *)iq2[ibl].d));
             auto qs = iq2[ibl].qs;
             auto qh = iq2[ibl].qh;
@@ -3267,6 +3283,7 @@ static void mul_mat_iq3_xxs_r4_q8_k(int n, const void * vx, size_t bx, const Dat
     for (int ix = 0; ix < nrc_x; ix += 4) {
         auto iq3 = (const block_iq3_xxs_r4 *)((const char *)vx + (ix+0)*bx);
         for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            if (info.should_skip_block(ibl)) continue;
             auto d4 = vmulq_f32(vdupq_n_f32(0.25f), vcvt_f32_f16(vld1_f16((const float16_t *)iq3[ibl].d)));
             auto qs = iq3[ibl].qs;
             for (int ib = 0; ib < QK_K/32; ++ib) {
@@ -3319,6 +3336,7 @@ static void mul_mat_iq3_s_r4_q8_k(int n, const void * vx, size_t bx, const DataI
     for (int ix = 0; ix < nrc_x; ix += 4) {
         auto iq3 = (const block_iq3_s_r4 *)((const char *)vx + (ix+0)*bx);
         for (int ibl = 0; ibl < nbl; ++ibl) { // Block of 256
+            if (info.should_skip_block(ibl)) continue;
             auto d4 = vcvt_f32_f16(vld1_f16((const float16_t *)iq3[ibl].d));
             auto qs = iq3[ibl].qs;
             auto qh = iq3[ibl].qh;

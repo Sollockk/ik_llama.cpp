@@ -476,6 +476,7 @@ void mul_mat_iq2_kt_F32_T(int n, const void * vx, size_t bx, const DataInfo& inf
         for (int iy = 0; iy < k_acc; ++iy) accd[iy] = _mm256_setzero_ps();
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             const uint16_t * ql = (const uint16_t *)x[i].ql;
             auto s8 = _mm_set1_epi32(*(const uint32_t *)x[i].scales);
             s8 = _mm_and_si128(_mm_srlv_epi32(s8, shifts), _mm_set1_epi8(0xf));
@@ -619,6 +620,7 @@ void mul_mat_iq1_kt_q8_2_x4_T(int n, const void * vx, size_t bx, const DataInfo&
         for (int iy = 0; iy < k_acc; ++iy) accd[iy] = _mm256_setzero_ps();
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             auto sh = _mm_loadl_epi64((const __m128i *)x[i].sh);
             auto s32 = _mm256_cvtepi8_epi32(_mm_shuffle_epi8(values, _mm_and_si128(sh, _mm_set1_epi8(0xf))));
             auto all_scales = _mm256_mul_ps(d, _mm256_cvtepi32_ps(s32));
@@ -708,6 +710,7 @@ void mul_mat_iq2_kt_q8_2_x4_T(int n, const void * vx, size_t bx, const DataInfo&
         for (int iy = 0; iy < k_acc; ++iy) accd[iy] = _mm256_setzero_ps();
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             const uint16_t * ql = (const uint16_t *)x[i].ql;
             auto s8 = _mm_set1_epi32(*(const uint32_t *)x[i].scales);
             s8 = _mm_and_si128(_mm_srlv_epi32(s8, shifts), _mm_set1_epi8(0xf));
@@ -852,6 +855,7 @@ void mul_mat_iq3_kt_q8_2_x4_T(int n, const void * vx, size_t bx, const DataInfo&
         for (int iy = 0; iy < k_acc; ++iy) accd[iy] = _mm256_setzero_ps();
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             auto ql = (const uint16_t *)x[i].ql;
             auto sign_bits = _mm256_loadu_si256((const __m256i *)x[i].qh);
             auto s8 = _mm_set1_epi32(*(const uint32_t *)x[i].scales);
@@ -967,6 +971,7 @@ void mul_mat_iq3_kt_F32_T(int n, const void * vx, size_t bx, const DataInfo& inf
         for (int iy = 0; iy < nrc_y; ++iy) accd[iy] = _mm256_setzero_ps();
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             const uint16_t * ql = (const uint16_t *)x[i].ql;
             const uint8_t * qh = x[i].qh;
             auto s8 = _mm_set1_epi32(*(const uint32_t *)x[i].scales);
@@ -1153,6 +1158,7 @@ void mul_mat_iq4_kt_q8_2_x4_T(int n, const void * vx, size_t bx, const DataInfo&
         for (int iy = 0; iy < k_acc; ++iy) accd[iy] = _mm256_setzero_ps();
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             auto vshb = _mm256_loadu_si256((const __m256i *)x[i].qs);
             const uint32_t * shb = x[i].qs;
             const uint8_t * ql = (const uint8_t *)(shb + 8);
@@ -1229,6 +1235,7 @@ void mul_mat_iq4_kt_F32_T(int n, const void * vx, size_t bx, const DataInfo& inf
         for (int iy = 0; iy < k_acc; ++iy) accd[iy] = _mm256_setzero_ps();
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             auto vshb = _mm256_loadu_si256((const __m256i *)x[i].qs);
             const uint32_t * shb = x[i].qs;
             const uint8_t * ql = (const uint8_t *)(shb + 8);
@@ -1498,6 +1505,7 @@ void mul_mat_iq2_kt_F16_T(int n, const void * vx, size_t bx, const DataInfo& inf
         for (int iy = 0; iy < k_acc; ++iy) accd[iy] = vdupq_n_f16(0);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             const uint16_t * ql = (const uint16_t *)x[i].ql;
             auto u32 = *(const uint32_t *)x[i].scales;
             auto s8_u32 = uint32x2_t{u32, u32 >> 4};
@@ -1615,6 +1623,7 @@ void mul_mat_iq3_kt_F16_T(int n, const void * vx, size_t bx, const DataInfo& inf
         for (int iy = 0; iy < nrc_y; ++iy) accd[iy] = vdupq_n_f16(0);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             const uint16_t * ql = (const uint16_t *)x[i].ql;
             const uint8_t * qh = x[i].qh;
             auto u32 = *(const uint32_t *)x[i].scales;
@@ -1740,6 +1749,7 @@ void mul_mat_iq4_kt_F16_T(int n, const void * vx, size_t bx, const DataInfo& inf
         for (int iy = 0; iy < k_acc; ++iy) accd[iy] = vdupq_n_f16(0);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             const uint32_t * shb = x[i].qs;
             auto vshb = vld1q_u32_x2(shb);
             auto vshb16 = vcombine_u16(vmovn_u32(vandq_u32(vshb.val[0], vdupq_n_u32(0xff))), vmovn_u32(vandq_u32(vshb.val[1], vdupq_n_u32(0xff))));
@@ -1822,6 +1832,7 @@ void mul_mat_iq4_kt_F32_T(int n, const void * vx, size_t bx, const DataInfo& inf
         for (int iy = 0; iy < nrc_y * 2; ++iy) accd[iy] = vdupq_n_f32(0.0f);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             const uint32_t * shb = x[i].qs;
             const uint8_t * ql = (const uint8_t *)(shb + 8);
             const uint8_t * qh = ql + kNumGroups;
@@ -2077,6 +2088,7 @@ void mul_mat_iq4_kt_q8_0_x4_T(int n, const void * vx, size_t bx, const DataInfo&
         for (int iy = 0; iy < k_acc; ++iy) accd[iy] = vdupq_n_f32(0);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             auto vshb = vld1q_u32_x2(x[i].qs);
             const uint32_t * shb = x[i].qs;
             const uint8_t * ql = (const uint8_t *)(shb + 8);
@@ -2361,6 +2373,7 @@ void mul_mat_iq1_kt_q8_0_x4_T(int n, const void * vx, size_t bx, const DataInfo&
         for (int iy = 0; iy < k_acc; ++iy) accd[iy] = vdupq_n_f32(0);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             auto sh = vld1_u8(x[i].sh);
             auto s16 = vmovl_s8(vqtbl1_s8(values, vand_u8(sh, vdup_n_u8(0xf))));
             scales.val[0] = vmulq_f32(d, vcvtq_f32_s32(vmovl_s16(vget_low_s16 (s16))));
@@ -2484,6 +2497,7 @@ void mul_mat_iq2_kt_q8_0_x4_T(int n, const void * vx, size_t bx, const DataInfo&
         for (int iy = 0; iy < k_acc; ++iy) accd[iy] = vdupq_n_f32(0);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             auto u32 = *(const uint32_t *)x[i].scales;
             auto s8_u32 = uint32x2_t{u32, u32 >> 4};
             s8_u32 = vand_u8(s8_u32, vdup_n_u32(0x0f0f0f0f));
@@ -2586,6 +2600,7 @@ void mul_mat_iq3_kt_q8_0_x4_T(int n, const void * vx, size_t bx, const DataInfo&
         for (int iy = 0; iy < k_acc; ++iy) accd[iy] = vdupq_n_f32(0);
 
         for (int i = 0; i < nb; ++i) {
+            if (info.should_skip_block(i)) continue;
             auto u32 = *(const uint32_t *)x[i].scales;
             auto s8_u32 = uint32x2_t{u32, u32 >> 4};
             s8_u32 = vand_u8(s8_u32, vdup_n_u32(0x0f0f0f0f));

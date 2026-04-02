@@ -36,6 +36,15 @@ IQK_API bool iqk_mul_mat_moe_acc(long Nx, long Ny, long ne00, int ne11,
         int typeB, const void * B, long strideB,
         float * C, long nb1, long nb2, const void * vrow_mapping, int ith, int nth);
 
+// Extended: supports accumulate mode + ray march block skipping
+// skip_mask: bitmask where bit set = skip this block. NULL = no skipping.
+// skip_mask_stride: kernel blocks per mask bit (for block size mismatch)
+IQK_API bool iqk_mul_mat_moe_ex(long Nx, long Ny, long ne00, int ne11,
+        int typeA, const void * A, long strideA,
+        int typeB, const void * B, long strideB,
+        float * C, long nb1, long nb2, const void * vrow_mapping, int ith, int nth,
+        bool accumulate, const uint64_t * skip_mask, int skip_mask_stride);
+
 IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int ne11, int unary_op,
         int typeA, const void * Aup, const void * Agate, long strideA,
         int typeB, const void * B, long strideB,

@@ -712,7 +712,7 @@ static bool iqk_mul_mat_moe_impl(long Nx, long Ny, long ne00, int ne11,
         int typeA, const void * A, long strideA,
         int typeB, const void * B, long strideB,
         float * C, long nb1, long nb2, const void * vrow_mapping, int ith, int nth,
-        bool accumulate) {
+        bool accumulate, const uint64_t * skip_mask = nullptr, int skip_mask_stride = 1) {
     const mmid_row_mapping * row_mapping = (const mmid_row_mapping *)vrow_mapping;
     assert(row_mapping != nullptr);
 
@@ -739,6 +739,8 @@ static bool iqk_mul_mat_moe_impl(long Nx, long Ny, long ne00, int ne11,
         size_t row_size_qy = strideB;
 
         DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float), row_size_qy, 0, ne11, row_mapping, nb2/sizeof(float), accumulate};
+        info.skip_mask = skip_mask;
+        info.skip_mask_stride = skip_mask_stride;
 
         auto& f = thread_local_work_buffer();
 
@@ -771,6 +773,8 @@ static bool iqk_mul_mat_moe_impl(long Nx, long Ny, long ne00, int ne11,
     nrc_x *= num_rows;
     DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float),
         row_size_qy, 0, ne11, row_mapping, nb2/sizeof(float), accumulate};
+    info.skip_mask = skip_mask;
+    info.skip_mask_stride = skip_mask_stride;
     mm.mul_mat_NxM(ne00, (const char *)A + row_size_qx*first_x, row_size_qx, info, nrc_x, Ny);
     return true;
 }
@@ -789,6 +793,15 @@ extern "C" IQK_API bool iqk_mul_mat_moe_acc(long Nx, long Ny, long ne00, int ne1
         float * C, long nb1, long nb2, const void * vrow_mapping, int ith, int nth) {
     return iqk_mul_mat_moe_impl(Nx, Ny, ne00, ne11, typeA, A, strideA, typeB, B, strideB,
                                 C, nb1, nb2, vrow_mapping, ith, nth, true);
+}
+
+extern "C" IQK_API bool iqk_mul_mat_moe_ex(long Nx, long Ny, long ne00, int ne11,
+        int typeA, const void * A, long strideA,
+        int typeB, const void * B, long strideB,
+        float * C, long nb1, long nb2, const void * vrow_mapping, int ith, int nth,
+        bool accumulate, const uint64_t * skip_mask, int skip_mask_stride) {
+    return iqk_mul_mat_moe_impl(Nx, Ny, ne00, ne11, typeA, A, strideA, typeB, B, strideB,
+                                C, nb1, nb2, vrow_mapping, ith, nth, accumulate, skip_mask, skip_mask_stride);
 }
 
 extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int ne11, int unary_op,
@@ -1761,6 +1774,11 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long, long, long, int, int, const void *
 }
 extern "C" IQK_API bool iqk_mul_mat_moe_acc(long, long, long, int, int, const void *, long, int, const void *, long, float *, long, long,
         const void *, int, int) {
+    GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
+    return false;
+}
+extern "C" IQK_API bool iqk_mul_mat_moe_ex(long, long, long, int, int, const void *, long, int, const void *, long, float *, long, long,
+        const void *, int, int, bool, const uint64_t *, int) {
     GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
     return false;
 }

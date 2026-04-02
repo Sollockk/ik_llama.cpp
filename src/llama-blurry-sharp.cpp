@@ -12,6 +12,7 @@
 #include <array>
 
 #include "ggml.h"
+#include "ggml-pim-cache.h"
 #include "ggml-backend.h"
 
 #ifdef GGML_USE_CUDA
@@ -6732,10 +6733,17 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
         }
 
         if (dinfo.base_tensor && dinfo.split_idx < (int)level.mmaps.size() && level.mmaps[dinfo.split_idx]) {
-            // Point the base tensor's ray march data at the delta mmap
             const uint8_t * mmap_base = (const uint8_t *)level.mmaps[dinfo.split_idx]->addr();
-            dinfo.base_tensor->ray_march_delta_data = (void *)(mmap_base + dinfo.file_offset);
-            dinfo.base_tensor->ray_march_delta_type = dinfo.type;
+            const void * mmap_ptr = (const void *)(mmap_base + dinfo.file_offset);
+            int fd = level.files[dinfo.split_idx]->file_id();
+            int n_experts = (int)dinfo.base_tensor->ne[2];
+            size_t expert_bytes = ggml_row_size(dinfo.type, dinfo.base_tensor->ne[0]) * dinfo.base_tensor->ne[1];
+
+            struct pim_delta_cache * cache = pim_delta_cache_create(
+                mmap_ptr, fd, (int64_t)dinfo.file_offset, expert_bytes, n_experts);
+
+            dinfo.base_tensor->ray_march_delta_cache = (void *)cache;
+            dinfo.base_tensor->ray_march_delta_type  = dinfo.type;
             n_wired++;
         }
     }
@@ -6743,6 +6751,9 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
     if (n_wired > 0) {
         LLAMA_LOG_INFO("%s: wired %d expert tensors with delta correction data for ray march PIM\n",
                        __func__, n_wired);
+        // Delta mmap stays active for warm-page fallback.
+        // pread is used only when ray march determines which blocks are needed,
+        // but the OS page cache naturally retains pages after first access.
     }
 
     return n_wired;
@@ -7038,7 +7049,10 @@ int32_t llama_blurry_sharp_apply_delta_gpu_experts(
     for (auto & [name, dinfo] : level.delta_index) {
         if (dinfo.base_tensor && dinfo.base_tensor->buffer &&
             !ggml_backend_buffer_is_host(dinfo.base_tensor->buffer)) {
-            dinfo.base_tensor->ray_march_delta_data = NULL;
+            if (dinfo.base_tensor->ray_march_delta_cache) {
+                pim_delta_cache_free((struct pim_delta_cache *)dinfo.base_tensor->ray_march_delta_cache);
+                dinfo.base_tensor->ray_march_delta_cache = NULL;
+            }
         }
     }
 
@@ -7068,8 +7082,8 @@ int32_t llama_blurry_sharp_apply_delta_gpu_experts(
             if (base->type == GGML_TYPE_F32) {
                 n_gpu_f32_skip++;
             } else {
-                // Check if it was upgraded (delta_data pointer cleared = upgraded)
-                if (base->ray_march_delta_data == NULL) {
+                // Check if it was upgraded (delta cache pointer cleared = upgraded)
+                if (base->ray_march_delta_cache == NULL) {
                     n_gpu_upgraded++;
                 } else {
                     n_gpu_no_delta++;

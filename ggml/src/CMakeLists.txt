@@ -1519,6 +1519,8 @@ add_library(ggml
             ggml-quants.h
             ggml-ray-march.c
             ggml-ray-march.h
+            ggml-pim-cache.c
+            ggml-pim-cache.h
             ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
             ${GGML_SOURCES_METAL}     ${GGML_HEADERS_METAL}
             ${GGML_SOURCES_RPC}       ${GGML_HEADERS_RPC}

@@ -12,6 +12,7 @@
 #include "ggml.h"
 #include "ggml-aarch64.h"
 #include "ggml-ray-march.h"
+#include "ggml-pim-cache.h"
 #include "iqk/iqk_quantize.h"
 #include "iqk/iqk_cpu_ops.h"
 #if GGML_USE_IQK_MULMAT
@@ -5419,8 +5420,9 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
-        /*.ray_march_delta_data =*/ NULL,
-        /*.ray_march_delta_type =*/ (enum ggml_type)0,
+        /*.ray_march_delta_cache  =*/ NULL,
+        /*.ray_march_delta_type   =*/ (enum ggml_type)0,
+        /*.padding                =*/ { 0 },
         ///*.padding      =*/ { 0 },
     };
 
@@ -17182,7 +17184,7 @@ static void ggml_compute_forward_mul_mat_id(
     // PIM delta correction for CPU expert tensors.
     // Generation (1 token): two full-row vec_dots (fast, no overhead).
     // Prompt (batch): ray march 3tier with block skipping (saves bandwidth).
-    const bool has_delta = (src0->ray_march_delta_data != NULL);
+    const bool has_delta = (src0->ray_march_delta_cache != NULL);
     const enum ggml_type ray_march_delta_type = has_delta ? src0->ray_march_delta_type : (enum ggml_type)0;
     const int64_t n_batch_tokens = ids->ne[1];
     const bool delta_use_raymarch = has_delta && (n_batch_tokens > 1);
@@ -17234,24 +17236,114 @@ static void ggml_compute_forward_mul_mat_id(
                                   //
 #if GGML_USE_IQK_MULMAT
         if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
-           if (!iqk_mul_mat_moe(nr0, nr1, ne00, ne11,
+            // --- Ray march skip mask generation for IQK ---
+            const uint64_t * blurry_skip_ptr = NULL;
+            const uint64_t * delta_skip_ptr  = NULL;
+            int blurry_skip_stride = 1;
+            int delta_skip_stride  = 1;
+            uint64_t blurry_skip_mask[8] = {0};
+            uint64_t delta_skip_mask[8]  = {0};
+
+            if (has_delta && rm_block_size > 0 && rm_n_blocks > 0 && rm_n_blocks <= 512
+                && src1->type == GGML_TYPE_F32 && cne1 > 0) {
+                // Initialize masks to all-skip (all 1s)
+                const int n_words = (rm_n_blocks + 63) / 64;
+                for (int w = 0; w < n_words && w < 8; w++) {
+                    blurry_skip_mask[w] = ~(uint64_t)0;
+                    delta_skip_mask[w]  = ~(uint64_t)0;
+                }
+                // Mask out unused high bits in last word
+                int last_bits = rm_n_blocks & 63;
+                if (last_bits && n_words > 0) {
+                    blurry_skip_mask[n_words-1] &= ((uint64_t)1 << last_bits) - 1;
+                    delta_skip_mask[n_words-1]  &= ((uint64_t)1 << last_bits) - 1;
+                }
+
+                float rm_energies[512];
+                // AND across all tokens routed to this expert
+                for (int64_t t = 0; t < cne1; t++) {
+                    struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, t);
+                    const int64_t i11 = rm.i1 % ne11;
+                    const int64_t i12 = rm.i2;
+                    const float * src1_f32 = (const float *)((const char *)src1->data + i11*nb11 + i12*nb12);
+
+                    ggml_ray_march_block_energies(src1_f32, rm_energies, (int)ne00, rm_block_size);
+
+                    float e_sum = 0, e_sq = 0;
+                    for (int b = 0; b < rm_n_blocks; b++) { e_sum += rm_energies[b]; e_sq += rm_energies[b]*rm_energies[b]; }
+                    float e_mean = e_sum / rm_n_blocks;
+                    float e_var = (e_sq / rm_n_blocks) - (e_mean * e_mean);
+                    float e_std = e_var > 0 ? sqrtf(e_var) : 0;
+                    float skip_thresh  = e_mean * 0.01f;
+                    float sharp_thresh = e_mean + 0.5f * e_std;
+
+                    for (int b = 0; b < rm_n_blocks; b++) {
+                        int word = b >> 6;
+                        uint64_t bit = (uint64_t)1 << (b & 63);
+                        // Clear blurry skip bit if ANY token has energy >= skip_thresh
+                        if (rm_energies[b] >= skip_thresh)  blurry_skip_mask[word] &= ~bit;
+                        // Clear delta skip bit if ANY token has energy >= sharp_thresh
+                        if (rm_energies[b] >= sharp_thresh) delta_skip_mask[word]  &= ~bit;
+                    }
+                }
+
+                blurry_skip_ptr = blurry_skip_mask;
+                delta_skip_ptr  = delta_skip_mask;
+                // Stride: how many IQK kernel blocks per energy block
+                int blurry_blk = (int)ggml_blck_size(src0->type);
+                int delta_blk  = (int)ggml_blck_size(ray_march_delta_type);
+                blurry_skip_stride = (blurry_blk > 0 && rm_block_size >= blurry_blk) ? rm_block_size / blurry_blk : 1;
+                delta_skip_stride  = (delta_blk > 0 && rm_block_size >= delta_blk)   ? rm_block_size / delta_blk  : 1;
+
+                // One-time diagnostic for skip rates
+                static int skip_diag = 0;
+                if (skip_diag < 1 && ith == 0) {
+                    skip_diag++;
+                    int n_bskip = 0, n_dskip = 0;
+                    for (int b = 0; b < rm_n_blocks; b++) {
+                        int w = b >> 6; uint64_t bt = (uint64_t)1 << (b & 63);
+                        if (blurry_skip_mask[w] & bt) n_bskip++;
+                        if (delta_skip_mask[w] & bt)  n_dskip++;
+                    }
+                    fprintf(stderr, "[ray-march-iqk] expert=%d tokens=%lld blocks=%d blurry_skip=%d(%.0f%%) delta_skip=%d(%.0f%%) stride_b=%d stride_d=%d\n",
+                        (int)cur_a, (long long)cne1, rm_n_blocks,
+                        n_bskip, 100.0f*n_bskip/rm_n_blocks,
+                        n_dskip, 100.0f*n_dskip/rm_n_blocks,
+                        blurry_skip_stride, delta_skip_stride);
+                }
+            }
+
+           if (!iqk_mul_mat_moe_ex(nr0, nr1, ne00, ne11,
                        src0->type, (const char *)src0_cur, nb01,
                        vec_dot_type, (const char *)wdata, row_size,
                        (float *)dst->data, nb1, nb2,
-                       matrix_rows + cur_a*ne12, ith, nth)) goto IQK_MulMat_Not_Available;
+                       matrix_rows + cur_a*ne12, ith, nth,
+                       false, blurry_skip_ptr, blurry_skip_stride)) goto IQK_MulMat_Not_Available;
                 // IQK succeeded. Add delta correction via accumulating IQK call.
                 if (has_delta) {
-                    const size_t delta_expert_stride = ggml_row_size(ray_march_delta_type, ne00) * ne01;
-                    const char * delta_expert = (const char *)src0->ray_march_delta_data + cur_a * delta_expert_stride;
                     const size_t delta_row_stride = ggml_row_size(ray_march_delta_type, ne00);
+                    const size_t delta_expert_bytes = delta_row_stride * ne01;
 
-                    // IQK accumulate: adds delta result directly to dst (no temp buffer)
-                    // Uses same wdata input since both types share vec_dot_type (Q8_2_X4)
-                    iqk_mul_mat_moe_acc(nr0, nr1, ne00, ne11,
-                        ray_march_delta_type, delta_expert, delta_row_stride,
-                        vec_dot_type, (const char *)wdata, row_size,
-                        (float *)dst->data, nb1, nb2,
-                        matrix_rows + cur_a*ne12, ith, nth);
+                    // Check if ALL delta blocks are skipped (skip pread entirely)
+                    bool all_delta_skipped = false;
+                    if (delta_skip_ptr && rm_n_blocks > 0) {
+                        all_delta_skipped = true;
+                        for (int b = 0; b < rm_n_blocks && all_delta_skipped; b++) {
+                            if (!(delta_skip_ptr[b >> 6] & ((uint64_t)1 << (b & 63)))) all_delta_skipped = false;
+                        }
+                    }
+
+                    if (!all_delta_skipped) {
+                        const char * delta_weight_ptr = pim_delta_cache_get(
+                            (struct pim_delta_cache *)src0->ray_march_delta_cache, (int)cur_a);
+
+                        iqk_mul_mat_moe_ex(nr0, nr1, ne00, ne11,
+                            ray_march_delta_type, delta_weight_ptr, delta_row_stride,
+                            vec_dot_type, (const char *)wdata, row_size,
+                            (float *)dst->data, nb1, nb2,
+                            matrix_rows + cur_a*ne12, ith, nth,
+                            true, delta_skip_ptr, delta_skip_stride);
+                    }
                 }
                 continue;
         }
@@ -17375,9 +17467,9 @@ IQK_MulMat_Not_Available:;
 
                     if (has_delta) {
                         // Delta correction: additive blurry + delta in f32 accumulator
-                        const size_t delta_expert_stride = ggml_row_size(ray_march_delta_type, ne00) * ne01;
-                        const char * delta_expert = (const char *)src0->ray_march_delta_data + cur_a * delta_expert_stride;
                         const size_t delta_row_stride = ggml_row_size(ray_march_delta_type, ne00);
+                        const char * delta_expert = pim_delta_cache_get(
+                            (struct pim_delta_cache *)src0->ray_march_delta_cache, (int)cur_a);
 
                         // Re-quantize input for delta's vec_dot_type if different from blurry's
                         // Stack buffer up to 16KB, malloc for larger

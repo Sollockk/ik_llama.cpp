@@ -303,6 +303,7 @@ template <typename Minus, int nrc_y, bool is_multiple_of_4> struct AccumT {
         auto qx = unp.quants();
         __m256 dall[nrc_y];
         for (int i = 0; i < nb/4; ++i) {
+            if (info.should_skip_block(4*i)) continue;
             auto other_scales = unp.set_block_4(i);
             for (int iy = 0; iy < nrc_y; ++iy) {
                 auto s12 = scales.prepare4(other_scales, y[iy] + 4*i);
@@ -2566,6 +2567,7 @@ inline void mul_mat_qX_Y_q8_Y(int n, Dequantizer& deq, Q8& q8, const DataInfo& i
         for (int iy = 0; iy < Q8::nrc_y; ++iy) acc[iy] = vdupq_n_f32(0.f);
 
         for (int i = 0; i < nb/4; ++i) {
+            if (info.should_skip_block(4*i)) continue;
             q8.process_scales(i, deq, sc16, acc);
             sum_4(i, deq, q8, sc16, acc);
         }
@@ -2594,6 +2596,7 @@ inline void mul_mat_qX_Y_q8_Y_IK(int n, Dequantizer& deq1, Dequantizer& deq2, Q8
         for (int iy = 0; iy < 2*Q8::nrc_y; ++iy) acc[iy] = vdupq_n_f32(0.f);
 
         for (int i = 0; i < nb/4; ++i) {
+            if (info.should_skip_block(4*i)) continue;
             q8.process_scales(i, deq1, deq2, sc16, acc);
             sum_4(i, deq1, deq2, q8, sc16, acc);
         }
@@ -2622,6 +2625,7 @@ inline void mul_mat_qX_Y_q8_Y_1(int n, Dequantizer& deq1, Dequantizer& deq2, Q8&
         float32x4_t acc[2] = { vdupq_n_f32(0.f), vdupq_n_f32(0.f) };
 
         for (int i = 0; i < nb/8; ++i) {
+            if (info.should_skip_block(8*i)) continue;
             q8.process_scales(2*i+0, deq1, sc16+0, acc+0);
             q8.process_scales(2*i+1, deq2, sc16+1, acc+1);
             sum_4(2*i+0, deq1, q8, sc16+0, acc+0);
