@@ -6751,10 +6751,39 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
     if (n_wired > 0) {
         LLAMA_LOG_INFO("%s: wired %d expert tensors with delta correction data for ray march PIM\n",
                        __func__, n_wired);
-        // Delta mmap stays active for warm-page fallback.
-        // pread is used only when ray march determines which blocks are needed,
-        // but the OS page cache naturally retains pages after first access.
     }
+
+    // Pin delta caches for GPU tensors so CUDA kernels can read via PCIe zero-copy.
+    // This runs AFTER wiring, so all caches are freshly created.
+#ifdef GGML_USE_CUDA
+    int n_gpu_pinned = 0;
+    for (auto & [name, dinfo] : level.delta_index) {
+        if (!dinfo.base_tensor || !dinfo.base_tensor->ray_march_delta_cache) continue;
+        if (!dinfo.base_tensor->buffer || ggml_backend_buffer_is_host(dinfo.base_tensor->buffer)) continue;
+
+        // This tensor is on GPU — pin its delta cache for zero-copy
+        struct pim_delta_cache * cache =
+            (struct pim_delta_cache *)dinfo.base_tensor->ray_march_delta_cache;
+        if (cache && !cache->gpu_pinned) {
+            size_t total_bytes = 0;
+            char * heap = pim_delta_cache_get_heap_buf(cache, &total_bytes);
+            if (heap && total_bytes > 0) {
+                // Pre-populate ALL expert data before pinning (pread from disk)
+                for (int e = 0; e < cache->n_experts; e++) {
+                    pim_delta_cache_get(cache, e);
+                }
+                if (ggml_backend_cuda_pin_host_memory(heap, total_bytes)) {
+                    cache->gpu_pinned = true;
+                    n_gpu_pinned++;
+                }
+            }
+        }
+    }
+    if (n_gpu_pinned > 0) {
+        LLAMA_LOG_INFO("%s: pinned %d GPU tensor delta caches for zero-copy correction\n",
+                       __func__, n_gpu_pinned);
+    }
+#endif
 
     return n_wired;
 }
@@ -7044,16 +7073,61 @@ int32_t llama_blurry_sharp_apply_delta_gpu_experts(
     LLAMA_LOG_INFO("%s: upgraded %d GPU tensors (%.1f MiB), skipped %d\n",
                    __func__, n_upgraded, total_bytes / (1024.0 * 1024.0), n_skipped);
 
-    // Clear delta data pointers on upgraded GPU tensors — they no longer need
-    // runtime correction (the weights are already corrected).
+    // Handle delta data on GPU tensors.
+    // Check if the sharp overlay actually upgraded each tensor to a DIFFERENT type.
+    // If upgraded: clear delta (sharp weights are better, delta is redundant).
+    // If NOT upgraded (same type or no sharp): pin delta for GPU zero-copy correction.
+    int n_gpu_delta_pinned = 0;
+    int n_gpu_delta_cleared = 0;
     for (auto & [name, dinfo] : level.delta_index) {
         if (dinfo.base_tensor && dinfo.base_tensor->buffer &&
             !ggml_backend_buffer_is_host(dinfo.base_tensor->buffer)) {
-            if (dinfo.base_tensor->ray_march_delta_cache) {
-                pim_delta_cache_free((struct pim_delta_cache *)dinfo.base_tensor->ray_march_delta_cache);
-                dinfo.base_tensor->ray_march_delta_cache = NULL;
+            // Check if sharp actually upgraded this tensor to a higher-quality type
+            bool was_upgraded = false;
+            if (!bsctx->sharp_index.empty()) {
+                auto sit = bsctx->sharp_index.find(name);
+                if (sit != bsctx->sharp_index.end() && sit->second.type != dinfo.base_tensor->type) {
+                    // Sharp provided a different (presumably better) type → tensor was upgraded
+                    was_upgraded = true;
+                }
+            }
+
+            if (was_upgraded) {
+                // Sharp overlay corrected this GPU tensor — clear delta
+                if (dinfo.base_tensor->ray_march_delta_cache) {
+                    pim_delta_cache_free((struct pim_delta_cache *)dinfo.base_tensor->ray_march_delta_cache);
+                    dinfo.base_tensor->ray_march_delta_cache = NULL;
+                    n_gpu_delta_cleared++;
+                }
+            } else {
+                // Tensor NOT upgraded — pin delta for GPU zero-copy correction.
+                struct pim_delta_cache * cache =
+                    (struct pim_delta_cache *)dinfo.base_tensor->ray_march_delta_cache;
+                if (cache && !cache->gpu_pinned) {
+                    size_t total_bytes = 0;
+                    char * heap = pim_delta_cache_get_heap_buf(cache, &total_bytes);
+                    if (heap && total_bytes > 0) {
+#ifdef GGML_USE_CUDA
+                        // Pre-populate ALL expert data before pinning (pread from disk)
+                        for (int e = 0; e < cache->n_experts; e++) {
+                            pim_delta_cache_get(cache, e);
+                        }
+                        if (ggml_backend_cuda_pin_host_memory(heap, total_bytes)) {
+                            cache->gpu_pinned = true;
+                            n_gpu_delta_pinned++;
+                        } else {
+                            LLAMA_LOG_WARN("%s: failed to pin delta for %s\n",
+                                __func__, name.c_str());
+                        }
+#endif
+                    }
+                }
             }
         }
+    }
+    if (n_gpu_delta_pinned > 0 || n_gpu_delta_cleared > 0) {
+        LLAMA_LOG_INFO("%s: GPU delta: %d pinned for zero-copy, %d cleared (sharp-upgraded)\n",
+                       __func__, n_gpu_delta_pinned, n_gpu_delta_cleared);
     }
 
     // ---- Audit: find ALL GPU tensors and report which are NOT upgraded ----

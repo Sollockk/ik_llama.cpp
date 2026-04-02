@@ -24,6 +24,7 @@ struct pim_delta_cache * pim_delta_cache_create(
     cache->fd           = fd;
     cache->file_offset  = file_offset;
     cache->expert_bytes = expert_bytes;
+    cache->gpu_pinned   = false;
     cache->n_experts    = n_experts;
     memset(cache->populated, 0, sizeof(cache->populated));
 
@@ -41,6 +42,8 @@ struct pim_delta_cache * pim_delta_cache_create(
 
 void pim_delta_cache_free(struct pim_delta_cache * cache) {
     if (!cache) return;
+    // Note: if gpu_pinned was set, the caller (CUDA-aware code) must call
+    // cudaHostUnregister(cache->heap_buf) before calling this function.
     free(cache->heap_buf);
     free(cache);
 }
@@ -146,4 +149,12 @@ void pim_delta_cache_prefetch(struct pim_delta_cache * cache,
         pim_delta_cache_get(cache, expert_indices[i]);
     }
 #endif
+}
+
+char * pim_delta_cache_get_heap_buf(struct pim_delta_cache * cache, size_t * out_total_bytes) {
+    if (!cache || !cache->heap_buf) return NULL;
+    if (out_total_bytes) {
+        *out_total_bytes = cache->expert_bytes * (size_t)cache->n_experts;
+    }
+    return cache->heap_buf;
 }

@@ -60,6 +60,12 @@ GGML_API void ggml_backend_cuda_jit_upload(ggml_backend_t backend, struct ggml_t
                                             const void * data, size_t offset, size_t size);
 GGML_API void ggml_backend_cuda_jit_sync_uploads(ggml_backend_t backend);
 
+// Pin host memory for GPU zero-copy access (PCIe reads).
+// Unlike ggml_backend_cuda_register_host_buffer, not gated by env var.
+// Returns true on success. Memory must be unpinned before free.
+GGML_API bool ggml_backend_cuda_pin_host_memory(void * ptr, size_t size);
+GGML_API void ggml_backend_cuda_unpin_host_memory(void * ptr);
+
 #ifdef  __cplusplus
 }
 #endif

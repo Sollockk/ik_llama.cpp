@@ -42,7 +42,8 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
                    /* ids_nb0  */ uint64_t(ids_nb0),
                    /* bias_nb1 */ uint64_t(bias_nb1),
                    /* unary_op */ unary_op,
-                   /* limit    */ limit > 1e-6f ? limit : INFINITY
+                   /* limit    */ limit > 1e-6f ? limit : INFINITY,
+                   /* accumulate */ false
     };
 
     switch (type) {
@@ -141,6 +142,27 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
             break;
     }
 
+}
+
+// Public dispatch: run MMVQ for a given type using pre-built args.
+// Used by GPU delta correction to launch the accumulating second pass.
+void ggml_cuda_mmvq_dispatch(ggml_type type, const mmvq_args & args, cudaStream_t stream) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:  mul_mat_vec_q4_0_q8_1_cuda(args, stream); break;
+        case GGML_TYPE_Q4_1:  mul_mat_vec_q4_1_q8_1_cuda(args, stream); break;
+        case GGML_TYPE_Q5_0:  mul_mat_vec_q5_0_q8_1_cuda(args, stream); break;
+        case GGML_TYPE_Q5_1:  mul_mat_vec_q5_1_q8_1_cuda(args, stream); break;
+        case GGML_TYPE_Q6_0:  mul_mat_vec_q6_0_q8_1_cuda(args, stream); break;
+        case GGML_TYPE_Q8_0:  mul_mat_vec_q8_0_q8_1_cuda(args, stream); break;
+        case GGML_TYPE_Q2_K:  mul_mat_vec_q2_K_q8_1_cuda(args, stream); break;
+        case GGML_TYPE_Q3_K:  mul_mat_vec_q3_K_q8_1_cuda(args, stream); break;
+        case GGML_TYPE_Q4_K:  mul_mat_vec_q4_K_q8_1_cuda(args, stream); break;
+        case GGML_TYPE_Q5_K:  mul_mat_vec_q5_K_q8_1_cuda(args, stream); break;
+        case GGML_TYPE_Q6_K:  mul_mat_vec_q6_K_q8_1_cuda(args, stream); break;
+        default:
+            fprintf(stderr, "[gpu-delta] unsupported delta type %s for MMVQ\n", ggml_type_name(type));
+            break;
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q_3D(

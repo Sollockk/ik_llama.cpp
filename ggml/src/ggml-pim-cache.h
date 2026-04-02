@@ -25,6 +25,7 @@ struct pim_delta_cache {
     int          n_experts;       // number of experts (ne02)
     uint64_t     populated[4];    // bitmask: bit set = expert slice has been pread into heap
                                   // supports up to 256 experts
+    bool         gpu_pinned;      // true if heap_buf is pinned for GPU zero-copy access
 };
 
 // Allocate and initialize a cache. heap_buf is allocated but not populated.
@@ -51,6 +52,10 @@ bool pim_delta_cache_is_warm(struct pim_delta_cache * cache, int expert_idx);
 // n_experts_to_prefetch = number of entries in expert_indices array.
 void pim_delta_cache_prefetch(struct pim_delta_cache * cache,
     const int * expert_indices, int n_experts_to_prefetch);
+
+// Get heap buffer pointer and total size (for GPU pinning by external code).
+// Returns NULL if no heap buffer (mmap fallback mode).
+char * pim_delta_cache_get_heap_buf(struct pim_delta_cache * cache, size_t * out_total_bytes);
 
 #ifdef __cplusplus
 }

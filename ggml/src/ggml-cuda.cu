@@ -27,6 +27,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-pim-cache.h"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
@@ -2359,6 +2360,75 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
         ++node_n;
     }
 
+    // ---- GPU Delta Correction: additive pass via zero-copy from pinned host memory ----
+    // After blurry matmul computed dst, add delta@input using MMVQ with accumulate=true.
+    // Delta weights are read from pinned CPU RAM via PCIe (zero VRAM cost).
+    // Only applies to the FIRST src0 (the original tensor, not fused successors).
+    {
+        // Use the original src0 (weight tensor), not dst->src[0] which may point
+        // to a fused successor's src0 (an intermediate tensor like Qcur).
+        const ggml_tensor * delta_src0 = src0;
+
+        if (delta_src0 && delta_src0->ray_march_delta_cache != NULL) {
+            struct pim_delta_cache * cache = (struct pim_delta_cache *)delta_src0->ray_march_delta_cache;
+            if (cache->gpu_pinned && cache->heap_buf) {
+                const ggml_type delta_type = delta_src0->ray_march_delta_type;
+
+                if (is_gemv && ggml_cuda_mmvq_type_supported(delta_type)) {
+                    const char * delta_ptr = pim_delta_cache_get(cache, 0);
+                    if (delta_ptr) {
+                        const size_t delta_row_stride = ggml_row_size(delta_type, delta_src0->ne[0]);
+
+                        // Re-quantize src1 for the delta type (may differ from blurry type)
+                        ggml_cuda_pool_alloc<char> src1_delta_q(ctx.pool(),
+                            GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1) / QK8_1 * ggml_nrows(src1));
+                        auto ne10_pad = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+                        quantize_row_q8_1_cuda(
+                            (const float *)src1->data, (void *)src1_delta_q.get(),
+                            src1->ne[0], src1->ne[1], src1->ne[2], ne10_pad,
+                            delta_type, stream);
+                        CUDA_CHECK(cudaGetLastError());
+
+                        mmvq_args delta_args{
+                            /* vx_u      */ delta_ptr,
+                            /* vx_g      */ nullptr,
+                            /* bias_u    */ nullptr,
+                            /* bias_g    */ nullptr,
+                            /* vy        */ src1_delta_q.get(),
+                            /* dst       */ (float *)dst->data,
+                            /* ids_data  */ nullptr,
+                            /* ncols_x   */ int(delta_src0->ne[0]),
+                            /* nrows_x   */ int(delta_src0->ne[1]),
+                            /* nrows_y   */ int(ne10_pad),
+                            /* ncols_y   */ int(src1->ne[1]),
+                            /* nrows_dst */ int(dst->ne[0]),
+                            /* ne2       */ 1,
+                            /* nb02      */ uint64_t(delta_src0->ne[1] * delta_row_stride),
+                            /* nb12      */ uint64_t(ne10_pad * sizeof(block_q8_1) / QK8_1 * src1->ne[1]),
+                            /* nb2       */ uint64_t(dst->nb[2]),
+                            /* ids_nb0   */ 0,
+                            /* bias_nb1  */ 0,
+                            /* unary_op  */ GGML_UNARY_OP_COUNT,
+                            /* limit     */ INFINITY,
+                            /* accumulate*/ true
+                        };
+
+                        ggml_cuda_mmvq_dispatch(delta_type, delta_args, stream);
+                        CUDA_CHECK(cudaGetLastError());
+
+                        static int gpu_delta_diag = 0;
+                        if (gpu_delta_diag < 3) {
+                            gpu_delta_diag++;
+                            fprintf(stderr, "[gpu-delta] src0=%s ne=[%lld,%lld] delta_type=%s zero-copy accumulate\n",
+                                    delta_src0->name, (long long)delta_src0->ne[0], (long long)delta_src0->ne[1],
+                                    ggml_type_name(delta_type));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     return node_n;
 
 }
@@ -2476,6 +2546,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         if (debug) printf("%s(%s, %s): ggml_cuda_op_mul_mat(ggml_cuda_op_mul_mat_cublas)\n", __func__, dst->name, ggml_type_name(src0->type));
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
+
     return node_n;
 }
 
@@ -5084,6 +5155,30 @@ GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     cudaError_t err = cudaHostUnregister(buffer);
     if (err != cudaSuccess) {
         // clear the error
+        cudaGetLastError();
+    }
+}
+
+bool ggml_backend_cuda_pin_host_memory(void * ptr, size_t size) {
+    if (!ptr || size == 0) return false;
+#if CUDART_VERSION >= 11100 || defined(GGML_USE_MUSA)
+    cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        GGML_CUDA_LOG_WARN("%s: failed to pin %.2f MiB: %s\n", __func__,
+                           size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+void ggml_backend_cuda_unpin_host_memory(void * ptr) {
+    if (!ptr) return;
+    cudaError_t err = cudaHostUnregister(ptr);
+    if (err != cudaSuccess) {
         cudaGetLastError();
     }
 }

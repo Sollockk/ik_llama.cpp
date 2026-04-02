@@ -6,8 +6,12 @@
 //
 
 #include "common.cuh"
+#include "mmvq-args.h"
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+
+// Direct MMVQ dispatch by type from pre-built args (for GPU delta correction).
+void ggml_cuda_mmvq_dispatch(ggml_type type, const mmvq_args & args, cudaStream_t stream);
 
 void ggml_cuda_op_mul_mat_vec_q_biased(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const ggml_tensor * bias,
