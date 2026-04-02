@@ -245,17 +245,14 @@ int main(int argc, char ** argv) {
     float sharp_thresh = e_mean + 0.5f * e_std;
 
     // Partition
-    std::vector<int> blurry_blocks(n_blocks), sharp_blocks(n_blocks);
+    std::vector<int> active_blocks(n_blocks);
     struct ggml_ray_march_tiers tiers;
-    tiers.blurry_blocks = blurry_blocks.data();
-    tiers.sharp_blocks  = sharp_blocks.data();
-    ggml_ray_march_partition_blocks(energies.data(), n_blocks, skip_thresh, sharp_thresh,
-                                    &tiers, nullptr, 0);
+    tiers.active_blocks = active_blocks.data();
+    ggml_ray_march_partition_blocks(energies.data(), n_blocks, skip_thresh, &tiers);
 
-    fprintf(stderr, "\nBlock partition: %d skip (%.0f%%), %d blurry (%.0f%%), %d sharp (%.0f%%) of %d\n",
+    fprintf(stderr, "\nBlock partition: %d skip (%.0f%%), %d active (%.0f%%) of %d\n",
             tiers.n_skip, 100.0f*tiers.n_skip/n_blocks,
-            tiers.n_blurry, 100.0f*tiers.n_blurry/n_blocks,
-            tiers.n_sharp, 100.0f*tiers.n_sharp/n_blocks,
+            tiers.n_active, 100.0f*tiers.n_active/n_blocks,
             n_blocks);
 
     // ---- Test using f32 dequant (works for ANY tensor, any alignment) ----
@@ -387,7 +384,7 @@ int main(int argc, char ** argv) {
             }
 
             float raymarch = 0;
-            ggml_vec_dot_ray_march_3tier(
+            ggml_vec_dot_ray_march(
                 (int)n_cols, &raymarch,
                 blurry_data + r * blurry_row_bytes, (int)blurry_loc.type,
                 delta_data  + r * delta_row_bytes,  (int)delta_loc.type,

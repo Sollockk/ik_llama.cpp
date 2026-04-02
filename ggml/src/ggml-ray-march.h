@@ -1,11 +1,10 @@
 #pragma once
 
-// ggml-ray-march.h — Neural Raymarcher: Three-Tier PIM Kernel
+// ggml-ray-march.h — Neural Raymarcher: Two-Tier PIM Kernel
 //
-// Three tiers of computation based on input activation energy per block:
-//   SKIP:        energy ≈ 0 → zero memory reads, zero compute
-//   BLURRY ONLY: medium energy → read base weights only (fast, always cached)
-//   SHARP:       high energy → read base + delta (additive correction)
+// Two tiers of computation based on input activation energy per block:
+//   SKIP:   energy ≈ 0 → zero memory reads, zero compute
+//   ACTIVE: energy > 0 → read base + delta (additive correction in f32)
 //
 // Block size is dynamic — adapts to the delta quantization type's blck_size.
 // Q4_0: 32-element blocks (works with ne[0]=1408). K-quants: 256-element blocks.
@@ -32,14 +31,12 @@ void ggml_ray_march_block_energies(
     int           block_size); // elements per block (e.g. 32 or 256)
 
 // ---------------------------------------------------------------------------
-// Three-tier gather: partition blocks into skip / blurry / sharp
+// Two-tier partition: blocks into skip / active
 // ---------------------------------------------------------------------------
 
 struct ggml_ray_march_tiers {
-    int * blurry_blocks;    // indices of blurry-only blocks
-    int   n_blurry;
-    int * sharp_blocks;     // indices of sharp (blurry+delta) blocks
-    int   n_sharp;
+    int * active_blocks;    // indices of non-skip blocks (blurry+delta computed)
+    int   n_active;
     int   n_skip;           // count of skipped blocks (for stats)
     int   n_total;
 };
@@ -48,18 +45,15 @@ void ggml_ray_march_partition_blocks(
     const float * energies,
     int           n_blocks,
     float         skip_threshold,
-    float         sharp_threshold,
-    struct ggml_ray_march_tiers * tiers,
-    const void  * delta_mmap,
-    size_t        delta_block_stride);
+    struct ggml_ray_march_tiers * tiers);
 
 // ---------------------------------------------------------------------------
-// Three-tier vec_dot with dynamic block size
+// Two-tier vec_dot with dynamic block size
 // ---------------------------------------------------------------------------
 
-// Computes: result = full_blurry_baseline + sparse_delta_correction(non-skip blocks)
-// block_size determines the granularity of delta block skipping.
-void ggml_vec_dot_ray_march_3tier(
+// Computes: result = sum of (blurry + delta) for active blocks only.
+// Skip blocks contribute zero. block_size determines skip granularity.
+void ggml_vec_dot_ray_march(
     int                    n,
     float                * s,
     const void           * blurry_row,

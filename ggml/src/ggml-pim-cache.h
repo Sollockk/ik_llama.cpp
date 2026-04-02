@@ -43,6 +43,15 @@ void pim_delta_cache_free(struct pim_delta_cache * cache);
 // Concurrent calls for the SAME expert may redundantly pread (harmless).
 const char * pim_delta_cache_get(struct pim_delta_cache * cache, int expert_idx);
 
+// Check if expert data is already cached (no I/O).
+bool pim_delta_cache_is_warm(struct pim_delta_cache * cache, int expert_idx);
+
+// Prefetch multiple experts in parallel using background threads.
+// Non-blocking: returns immediately after launching background preads.
+// n_experts_to_prefetch = number of entries in expert_indices array.
+void pim_delta_cache_prefetch(struct pim_delta_cache * cache,
+    const int * expert_indices, int n_experts_to_prefetch);
+
 #ifdef __cplusplus
 }
 #endif

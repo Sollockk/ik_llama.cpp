@@ -1,4 +1,4 @@
-// ggml-ray-march.c — Neural Raymarcher: Three-Tier PIM Kernel
+// ggml-ray-march.c — Neural Raymarcher: Two-Tier PIM Kernel
 //
 // Dynamic block size: adapts to the delta quantization type.
 // Q4_0 (blck_size=32): 44 blocks for ne[0]=1408 — compatible with all tensors.
@@ -10,8 +10,8 @@
 #include <math.h>
 #include <string.h>
 
-#ifndef _WIN32
-#include <sys/mman.h>
+#if defined(__AVX2__) || defined(__AVX__)
+#include <immintrin.h>
 #endif
 
 // ---------------------------------------------------------------------------
@@ -25,6 +25,48 @@ void ggml_ray_march_block_energies(
         int           block_size) {
     if (block_size <= 0) block_size = 256;
     const int n_blocks = n / block_size;
+
+#if defined(__AVX2__) || defined(__AVX__)
+    // AVX: process 8 floats at a time, clear sign bit for absolute value
+    const __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+
+    for (int b = 0; b < n_blocks; b++) {
+        const float * xb = x + b * block_size;
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+
+        int j = 0;
+        // Unroll 2x for better throughput (16 floats per iteration)
+        for (; j + 15 < block_size; j += 16) {
+            __m256 v0 = _mm256_loadu_ps(xb + j);
+            __m256 v1 = _mm256_loadu_ps(xb + j + 8);
+            acc0 = _mm256_add_ps(acc0, _mm256_and_ps(v0, sign_mask));
+            acc1 = _mm256_add_ps(acc1, _mm256_and_ps(v1, sign_mask));
+        }
+        // Handle remaining 8-float chunk
+        for (; j + 7 < block_size; j += 8) {
+            __m256 v = _mm256_loadu_ps(xb + j);
+            acc0 = _mm256_add_ps(acc0, _mm256_and_ps(v, sign_mask));
+        }
+
+        // Horizontal sum
+        acc0 = _mm256_add_ps(acc0, acc1);
+        __m128 hi = _mm256_extractf128_ps(acc0, 1);
+        __m128 lo = _mm256_castps256_ps128(acc0);
+        __m128 sum4 = _mm_add_ps(lo, hi);
+        sum4 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+        sum4 = _mm_add_ss(sum4, _mm_movehdup_ps(sum4));
+
+        float energy = _mm_cvtss_f32(sum4);
+
+        // Scalar tail
+        for (; j < block_size; j++) {
+            energy += fabsf(xb[j]);
+        }
+        energies[b] = energy;
+    }
+#else
+    // Scalar fallback
     for (int b = 0; b < n_blocks; b++) {
         float energy = 0.0f;
         const float * xb = x + b * block_size;
@@ -33,57 +75,37 @@ void ggml_ray_march_block_energies(
         }
         energies[b] = energy;
     }
+#endif
 }
 
 // ---------------------------------------------------------------------------
-// Three-tier partition + async prefetch
+// Two-tier partition: skip vs active
 // ---------------------------------------------------------------------------
 
 void ggml_ray_march_partition_blocks(
         const float * energies,
         int           n_blocks,
         float         skip_threshold,
-        float         sharp_threshold,
-        struct ggml_ray_march_tiers * tiers,
-        const void  * delta_mmap,
-        size_t        delta_block_stride) {
+        struct ggml_ray_march_tiers * tiers) {
 
-    tiers->n_blurry = 0;
-    tiers->n_sharp  = 0;
+    tiers->n_active = 0;
     tiers->n_skip   = 0;
     tiers->n_total  = n_blocks;
-
-    uint64_t page_hints[64] = {0};
 
     for (int b = 0; b < n_blocks; b++) {
         if (energies[b] < skip_threshold) {
             tiers->n_skip++;
-        } else if (energies[b] >= sharp_threshold) {
-            tiers->sharp_blocks[tiers->n_sharp++] = b;
-#ifndef _WIN32
-            if (delta_mmap && delta_block_stride > 0) {
-                size_t offset = (size_t)b * delta_block_stride;
-                size_t page_idx = offset >> 12;
-                size_t word = page_idx >> 6;
-                uint64_t bit = (uint64_t)1 << (page_idx & 63);
-                if (word < 64 && !(page_hints[word] & bit)) {
-                    page_hints[word] |= bit;
-                    size_t page_start = offset & ~(size_t)0xFFF;
-                    posix_madvise((char *)delta_mmap + page_start, 4096, POSIX_MADV_WILLNEED);
-                }
-            }
-#endif
         } else {
-            tiers->blurry_blocks[tiers->n_blurry++] = b;
+            tiers->active_blocks[tiers->n_active++] = b;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Three-tier vec_dot — dynamic block size
+// Two-tier vec_dot — dynamic block size
 // ---------------------------------------------------------------------------
 
-void ggml_vec_dot_ray_march_3tier(
+void ggml_vec_dot_ray_march(
         int                    n,
         float                * s,
         const void           * blurry_row,
@@ -104,7 +126,6 @@ void ggml_vec_dot_ray_march_3tier(
     // Bytes per block for delta type
     const int    delta_blk_elems = delta_traits.blck_size;
     const size_t delta_blk_bytes = delta_traits.type_size;
-    // How many quant blocks per energy block
     const size_t delta_qblocks_per_eblock = (delta_blk_elems > 0) ? block_size / delta_blk_elems : 1;
 
     // Same for delta input type
@@ -125,13 +146,13 @@ void ggml_vec_dot_ray_march_3tier(
     const size_t input_qblocks_per_eblock = (input_blk_elems > 0) ? block_size / input_blk_elems : 1;
 
     // --- TRUE RAY MARCH: skip BOTH blurry and delta for zero-energy blocks ---
-    // Only non-skip blocks are computed. The ray flies through empty space.
+    // Only active blocks are computed. The ray flies through empty space.
     float total = 0.0f;
     const void * delta_input = input_row_delta ? input_row_delta : input_row;
 
-    // Blurry-tier blocks: blurry + delta
-    for (int g = 0; g < tiers->n_blurry; g++) {
-        int b = tiers->blurry_blocks[g];
+    // Active blocks: blurry + delta correction
+    for (int g = 0; g < tiers->n_active; g++) {
+        int b = tiers->active_blocks[g];
 
         // Blurry contribution
         if (blurry_traits.vec_dot) {
@@ -144,29 +165,6 @@ void ggml_vec_dot_ray_march_3tier(
         }
 
         // Delta correction
-        if (delta_row && delta_traits.vec_dot) {
-            float dv = 0.0f;
-            delta_traits.vec_dot(
-                block_size, &dv, 0,
-                (const char *)delta_row   + b * delta_qblocks_per_eblock  * delta_blk_bytes, 0,
-                (const char *)delta_input + b * dinput_qblocks_per_eblock * dinput_blk_bytes, 0, 1);
-            total += dv;
-        }
-    }
-
-    // Sharp-tier blocks: blurry + delta (same computation, different list)
-    for (int g = 0; g < tiers->n_sharp; g++) {
-        int b = tiers->sharp_blocks[g];
-
-        if (blurry_traits.vec_dot) {
-            float bv = 0.0f;
-            blurry_traits.vec_dot(
-                block_size, &bv, 0,
-                (const char *)blurry_row + b * blurry_qblocks_per_eblock * blurry_blk_bytes, 0,
-                (const char *)input_row  + b * input_qblocks_per_eblock  * input_blk_bytes, 0, 1);
-            total += bv;
-        }
-
         if (delta_row && delta_traits.vec_dot) {
             float dv = 0.0f;
             delta_traits.vec_dot(
