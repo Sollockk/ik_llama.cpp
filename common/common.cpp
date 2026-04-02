@@ -3588,6 +3588,23 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         llama_lora_adapters_apply(lctx, iparams.lora_adapters);
     }
 
+    // Delta correction: wire delta tensors for PIM if --delta was specified
+    if (!params.delta_paths.empty()) {
+        struct llama_blurry_sharp_params bs_params = llama_blurry_sharp_default_params();
+        std::vector<const char *> delta_cstrs;
+        for (auto & p : params.delta_paths) delta_cstrs.push_back(p.c_str());
+        bs_params.delta_paths    = delta_cstrs.data();
+        bs_params.n_delta_levels = (int32_t)delta_cstrs.size();
+
+        iparams.bsctx = llama_blurry_sharp_init(model, bs_params);
+        if (iparams.bsctx) {
+            int32_t n_wired = llama_blurry_sharp_wire_delta_tensors(iparams.bsctx);
+            fprintf(stderr, "%s: delta correction wired %d expert tensors for PIM\n", __func__, n_wired);
+        } else {
+            fprintf(stderr, "%s: warning: failed to initialize delta correction\n", __func__);
+        }
+    }
+
     if (params.ignore_eos) {
         params.sparams.logit_bias[llama_token_eos(model)] = -INFINITY;
     }

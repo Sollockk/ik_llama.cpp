@@ -17179,33 +17179,41 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->shared);
 
-    // Ray march PIM: delta correction for CPU expert tensors.
-    // Block size adapts to delta quant type (32 for Q4_0, 256 for K-quants).
-    // When vec_dot_type differs between blurry and delta, the input is re-quantized
-    // for the delta's vec_dot_type (one-time cost per input column).
+    // PIM delta correction for CPU expert tensors.
+    // Generation (1 token): two full-row vec_dots (fast, no overhead).
+    // Prompt (batch): ray march 3tier with block skipping (saves bandwidth).
     const bool has_delta = (src0->ray_march_delta_data != NULL);
-    const int rm_block_size = has_delta ? ggml_blck_size(src0->ray_march_delta_type) : 0;
-    const bool ray_march_active = has_delta && rm_block_size > 0 && (ne00 % rm_block_size == 0);
-    const bool ray_march_fullrow = has_delta && !ray_march_active;
-    const enum ggml_type ray_march_delta_type = src0->ray_march_delta_type;
+    const enum ggml_type ray_march_delta_type = has_delta ? src0->ray_march_delta_type : (enum ggml_type)0;
+    const int64_t n_batch_tokens = ids->ne[1];
+    const bool delta_use_raymarch = has_delta && (n_batch_tokens > 1);
 
-    // Per-expert scratch for ray march
-    float * rm_energies = NULL;
-    int   * rm_gather   = NULL;
-    int     rm_n_blocks = 0;
-    if (ray_march_active) {
-        rm_n_blocks = (int)(ne00 / rm_block_size);
+    // Energy block must be >= both quant block sizes (K-quants need 256, Q4_0 needs 32)
+    const int rm_block_size = has_delta
+        ? ((int)ggml_blck_size(src0->type) > (int)ggml_blck_size(ray_march_delta_type)
+           ? (int)ggml_blck_size(src0->type) : (int)ggml_blck_size(ray_march_delta_type))
+        : 0;
+    const bool rm_aligned = has_delta && rm_block_size > 0 && (ne00 % rm_block_size == 0);
+    const int rm_n_blocks = (delta_use_raymarch && rm_aligned) ? (int)(ne00 / rm_block_size) : 0;
+
+    // Delta vec_dot function + traits (computed once)
+    // NOTE: ik_llama overrides vec_dot_type to IK-specific types (Q8_2_X4 etc)
+    // for IQK acceleration, but vec_dot still expects standard Q8_0 input.
+    // For delta correction we always use standard Q8_0.
+    ggml_type_traits_t delta_traits = {0};
+    enum ggml_type delta_input_type = GGML_TYPE_Q8_0; // standard, not IK-extended
+    if (has_delta) {
+        delta_traits = ggml_internal_get_type_traits(ray_march_delta_type);
     }
 
     // One-time diagnostic
     static int rm_diag_count = 0;
     if (rm_diag_count < 3 && has_delta) {
         rm_diag_count++;
-        fprintf(stderr, "[ray-march-diag] mul_mat_id: src0=%s ne00=%lld mode=%s delta=%s blk=%d blocks=%d\n",
-                src0->name, (long long)ne00,
-                ray_march_active ? "3tier" : (ray_march_fullrow ? "fullrow" : "off"),
-                ggml_type_name(ray_march_delta_type),
-                rm_block_size, rm_n_blocks);
+        fprintf(stderr, "[pim-delta] src0=%s ne00=%lld batch=%lld mode=%s blurry=%s delta=%s blk=%d\n",
+                src0->name, (long long)ne00, (long long)n_batch_tokens,
+                delta_use_raymarch ? (rm_n_blocks > 0 ? "raymarch" : "fullrow") : "fast2dot",
+                ggml_type_name(src0->type), ggml_type_name(ray_march_delta_type),
+                rm_block_size);
     }
 
     // compute each matrix multiplication in sequence
@@ -17227,10 +17235,24 @@ static void ggml_compute_forward_mul_mat_id(
 #if GGML_USE_IQK_MULMAT
         if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
            if (!iqk_mul_mat_moe(nr0, nr1, ne00, ne11,
-                       src0->type, (const char *)src0_cur, nb01, ///ggml_type_size(src0->type),
-                       vec_dot_type, (const char *)wdata, row_size, ///ggml_type_size(vec_dot_type),
+                       src0->type, (const char *)src0_cur, nb01,
+                       vec_dot_type, (const char *)wdata, row_size,
                        (float *)dst->data, nb1, nb2,
                        matrix_rows + cur_a*ne12, ith, nth)) goto IQK_MulMat_Not_Available;
+                // IQK succeeded. Add delta correction via accumulating IQK call.
+                if (has_delta) {
+                    const size_t delta_expert_stride = ggml_row_size(ray_march_delta_type, ne00) * ne01;
+                    const char * delta_expert = (const char *)src0->ray_march_delta_data + cur_a * delta_expert_stride;
+                    const size_t delta_row_stride = ggml_row_size(ray_march_delta_type, ne00);
+
+                    // IQK accumulate: adds delta result directly to dst (no temp buffer)
+                    // Uses same wdata input since both types share vec_dot_type (Q8_2_X4)
+                    iqk_mul_mat_moe_acc(nr0, nr1, ne00, ne11,
+                        ray_march_delta_type, delta_expert, delta_row_stride,
+                        vec_dot_type, (const char *)wdata, row_size,
+                        (float *)dst->data, nb1, nb2,
+                        matrix_rows + cur_a*ne12, ith, nth);
+                }
                 continue;
         }
 IQK_MulMat_Not_Available:;
@@ -17351,171 +17373,94 @@ IQK_MulMat_Not_Available:;
                     //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
                     //}
 
-                    if (ray_march_active && rm_n_blocks > 0) {
-                        // --- Neural Raymarcher: Three-Tier PIM ---
-                        //
-                        // SKIP (energy ≈ 0):   zero reads, zero compute (ray in empty space)
-                        // BLURRY (medium):     TQ1_0 only (coarse sampling)
-                        // SHARP (high energy): TQ1_0 + delta (fine sampling, additive)
-
-                        // Delta row layout
+                    if (has_delta) {
+                        // Delta correction: additive blurry + delta in f32 accumulator
                         const size_t delta_expert_stride = ggml_row_size(ray_march_delta_type, ne00) * ne01;
                         const char * delta_expert = (const char *)src0->ray_march_delta_data + cur_a * delta_expert_stride;
                         const size_t delta_row_stride = ggml_row_size(ray_march_delta_type, ne00);
 
-                        // Get f32 input for block energy computation
-                        const float * src1_f32 = NULL;
-                        if (src1->type == GGML_TYPE_F32) {
-                            src1_f32 = (const float *)((const char *)src1->data + i11*nb11 + i12*nb12);
-                        }
-
-                        // Partition blocks into three tiers (once per input column)
-                        float rm_energies_buf[512];
-                        int   rm_blurry_buf[512];
-                        int   rm_sharp_buf[512];
-
-                        struct ggml_ray_march_tiers tiers;
-                        tiers.blurry_blocks = rm_blurry_buf;
-                        tiers.sharp_blocks  = rm_sharp_buf;
-                        tiers.n_blurry = 0;
-                        tiers.n_sharp  = 0;
-                        tiers.n_skip   = 0;
-                        tiers.n_total  = rm_n_blocks;
-
-                        if (src1_f32) {
-                            float * rm_energies = (rm_n_blocks <= 512) ? rm_energies_buf
-                                : (float *)malloc(rm_n_blocks * sizeof(float));
-
-                            ggml_ray_march_block_energies(src1_f32, rm_energies, (int)ne00, rm_block_size);
-
-                            // Compute adaptive thresholds from energy distribution
-                            float e_sum = 0.0f, e_sum_sq = 0.0f;
-                            for (int b = 0; b < rm_n_blocks; b++) {
-                                e_sum    += rm_energies[b];
-                                e_sum_sq += rm_energies[b] * rm_energies[b];
-                            }
-                            float e_mean = e_sum / rm_n_blocks;
-                            float e_var  = (e_sum_sq / rm_n_blocks) - (e_mean * e_mean);
-                            float e_std  = e_var > 0.0f ? sqrtf(e_var) : 0.0f;
-
-                            // skip_threshold: blocks contributing < 1% of mean → skip entirely
-                            // sharp_threshold: blocks above mean + 0.5σ → need delta correction
-                            float skip_threshold  = e_mean * 0.01f;
-                            float sharp_threshold = e_mean + 0.5f * e_std;
-
-                            // Delta block stride for MADV_WILLNEED
-                            ggml_type_traits_t dt = ggml_internal_get_type_traits(ray_march_delta_type);
-                            size_t dsup = (dt.blck_size > 0) ? (size_t)rm_block_size / dt.blck_size : 1;
-                            size_t dstride = dsup * dt.type_size;
-
-                            if (rm_n_blocks > 512) {
-                                tiers.blurry_blocks = (int *)malloc(rm_n_blocks * sizeof(int));
-                                tiers.sharp_blocks  = (int *)malloc(rm_n_blocks * sizeof(int));
-                            }
-
-                            ggml_ray_march_partition_blocks(
-                                rm_energies, rm_n_blocks,
-                                skip_threshold, sharp_threshold,
-                                &tiers, delta_expert, dstride);
-
-                            if (rm_energies != rm_energies_buf) free(rm_energies);
-                        } else {
-                            // No f32 input available — fall back to all-blurry (no skip)
-                            for (int b = 0; b < rm_n_blocks; b++) {
-                                rm_blurry_buf[tiers.n_blurry++] = b;
-                            }
-                        }
-
-                        // One-time tier distribution logging
-                        {
-                            static int tier_diag_done = 0;
-                            if (!tier_diag_done && tiers.n_total > 0) {
-                                tier_diag_done = 1;
-                                fprintf(stderr, "[ray-march-diag] tiers: %d skip (%.0f%%), %d blurry (%.0f%%), %d sharp (%.0f%%) of %d blocks\n",
-                                        tiers.n_skip,   100.0f * tiers.n_skip   / tiers.n_total,
-                                        tiers.n_blurry, 100.0f * tiers.n_blurry / tiers.n_total,
-                                        tiers.n_sharp,  100.0f * tiers.n_sharp  / tiers.n_total,
-                                        tiers.n_total);
-                            }
-                        }
-
-                        // Re-quantize input for delta's vec_dot_type if different from blurry's.
-                        // This is a one-time cost per input column, reused across all output rows.
-                        const void * input_for_delta = src1_col;
-                        void * delta_input_alloc = NULL;
-                        {
-                            ggml_type_traits_t dt = ggml_internal_get_type_traits(ray_march_delta_type);
-                            if (dt.vec_dot_type != vec_dot_type && src1->type == GGML_TYPE_F32) {
-                                // Re-quantize from f32 source to delta's vec_dot_type
-                                size_t dinput_size = ggml_row_size(dt.vec_dot_type, ne00);
-                                delta_input_alloc = malloc(dinput_size);
-                                if (delta_input_alloc) {
-                                    ggml_type_traits_t dit = ggml_internal_get_type_traits(dt.vec_dot_type);
-                                    if (dit.from_float) {
-                                        const float * src1_f32_col = (src1_f32 != NULL) ? src1_f32
-                                            : (const float *)((const char *)src1->data + i11*nb11 + i12*nb12);
-                                        dit.from_float(src1_f32_col, delta_input_alloc, ne00);
-                                    }
-                                    input_for_delta = delta_input_alloc;
-                                }
-                            }
-                        }
-
-                        for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ++ir0) {
-                            const char * delta_row = delta_expert + ir0 * delta_row_stride;
-
-                            ggml_vec_dot_ray_march_3tier(
-                                (int)ne00, &tmp[ir0 - iir0],
-                                src0_cur + ir0*nb01, (int)src0->type,
-                                delta_row, (int)ray_march_delta_type,
-                                src1_col, input_for_delta,
-                                &tiers, rm_block_size);
-                        }
-
-                        if (delta_input_alloc) free(delta_input_alloc);
-                        if (tiers.blurry_blocks != rm_blurry_buf) free(tiers.blurry_blocks);
-                        if (tiers.sharp_blocks  != rm_sharp_buf)  free(tiers.sharp_blocks);
-                    } else if (ray_march_fullrow) {
-                        // --- Full-row additive delta (non-aligned tensors) ---
-                        // No block skipping, but still adds delta correction for quality.
-                        const size_t delta_expert_stride = ggml_row_size(ray_march_delta_type, ne00) * ne01;
-                        const char * delta_expert = (const char *)src0->ray_march_delta_data + cur_a * delta_expert_stride;
-                        const size_t delta_row_stride = ggml_row_size(ray_march_delta_type, ne00);
-
-                        // Quantize input for delta's vec_dot_type if needed
-                        ggml_type_traits_t dt = ggml_internal_get_type_traits(ray_march_delta_type);
+                        // Re-quantize input for delta's vec_dot_type if different from blurry's
+                        // Stack buffer up to 16KB, malloc for larger
                         const void * dinput = src1_col;
-                        void * dinput_alloc = NULL;
+                        char dinput_stack[16384];
+                        void * dinput_heap = NULL;
 
-                        if (dt.vec_dot_type != vec_dot_type && src1->type == GGML_TYPE_F32) {
-                            size_t dinput_size = ggml_row_size(dt.vec_dot_type, ne00);
-                            dinput_alloc = malloc(dinput_size);
-                            if (dinput_alloc) {
-                                ggml_type_traits_t dit = ggml_internal_get_type_traits(dt.vec_dot_type);
+                        if (delta_input_type != vec_dot_type && src1->type == GGML_TYPE_F32) {
+                            const float * src1_f32 = (const float *)((const char *)src1->data + i11*nb11 + i12*nb12);
+                            size_t dinput_size = ggml_row_size(delta_input_type, ne00);
+                            void * dinput_buf = (dinput_size <= sizeof(dinput_stack)) ? dinput_stack : (dinput_heap = malloc(dinput_size));
+                            if (dinput_buf) {
+                                ggml_type_traits_t dit = ggml_internal_get_type_traits(delta_input_type);
                                 if (dit.from_float) {
-                                    dit.from_float(
-                                        (const float *)((const char *)src1->data + i11*nb11 + i12*nb12),
-                                        dinput_alloc, ne00);
+                                    dit.from_float(src1_f32, dinput_buf, ne00);
                                 }
-                                dinput = dinput_alloc;
+                                dinput = dinput_buf;
                             }
                         }
 
-                        for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ++ir0) {
-                            // Full blurry baseline
-                            vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                        if (delta_use_raymarch && rm_n_blocks > 0) {
+                            // --- Prompt batch: ray march with block skipping ---
+                            const float * src1_f32 = (src1->type == GGML_TYPE_F32)
+                                ? (const float *)((const char *)src1->data + i11*nb11 + i12*nb12) : NULL;
 
-                            // Full delta correction (additive)
-                            if (dt.vec_dot) {
-                                float correction = 0.0f;
-                                const char * delta_row = delta_expert + ir0 * delta_row_stride;
-                                dt.vec_dot((int)ne00, &correction, 0, delta_row, 0, dinput, 0, 1);
-                                tmp[ir0 - iir0] += correction;
+                            float rm_energies_buf[512];
+                            int   rm_blurry_buf[512];
+                            int   rm_sharp_buf[512];
+
+                            struct ggml_ray_march_tiers tiers;
+                            tiers.blurry_blocks = rm_blurry_buf;
+                            tiers.sharp_blocks  = rm_sharp_buf;
+                            tiers.n_blurry = 0;
+                            tiers.n_sharp  = 0;
+                            tiers.n_skip   = 0;
+                            tiers.n_total  = rm_n_blocks;
+
+                            if (src1_f32 && rm_n_blocks <= 512) {
+                                ggml_ray_march_block_energies(src1_f32, rm_energies_buf, (int)ne00, rm_block_size);
+
+                                float e_sum = 0.0f, e_sum_sq = 0.0f;
+                                for (int b = 0; b < rm_n_blocks; b++) {
+                                    e_sum    += rm_energies_buf[b];
+                                    e_sum_sq += rm_energies_buf[b] * rm_energies_buf[b];
+                                }
+                                float e_mean = e_sum / rm_n_blocks;
+                                float e_var  = (e_sum_sq / rm_n_blocks) - (e_mean * e_mean);
+                                float e_std  = e_var > 0.0f ? sqrtf(e_var) : 0.0f;
+
+                                size_t dsup = (delta_traits.blck_size > 0) ? (size_t)rm_block_size / delta_traits.blck_size : 1;
+
+                                ggml_ray_march_partition_blocks(
+                                    rm_energies_buf, rm_n_blocks,
+                                    e_mean * 0.01f, e_mean + 0.5f * e_std,
+                                    &tiers, delta_expert, dsup * delta_traits.type_size);
+                            } else {
+                                for (int b = 0; b < rm_n_blocks; b++) rm_blurry_buf[tiers.n_blurry++] = b;
+                            }
+
+                            for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ++ir0) {
+                                ggml_vec_dot_ray_march_3tier(
+                                    (int)ne00, &tmp[ir0 - iir0],
+                                    src0_cur + ir0*nb01, (int)src0->type,
+                                    delta_expert + ir0 * delta_row_stride, (int)ray_march_delta_type,
+                                    src1_col, dinput,
+                                    &tiers, rm_block_size);
+                            }
+                        } else {
+                            // --- Generation: fast two full-row vec_dots ---
+                            for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ++ir0) {
+                                float blurry_dot = 0.0f, delta_dot = 0.0f;
+                                vec_dot(ne00, &blurry_dot, 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                                if (delta_traits.vec_dot) {
+                                    delta_traits.vec_dot((int)ne00, &delta_dot, 0,
+                                        delta_expert + ir0 * delta_row_stride, 0,
+                                        dinput, 0, 1);
+                                }
+                                tmp[ir0 - iir0] = blurry_dot + delta_dot;
                             }
                         }
-                        if (dinput_alloc) free(dinput_alloc);
+                        if (dinput_heap) free(dinput_heap);
                     } else {
-                        // --- Standard path ---
+                        // --- Standard path (no delta) ---
                         for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ++ir0) {
                             vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
                         }

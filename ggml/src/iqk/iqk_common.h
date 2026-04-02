@@ -96,6 +96,7 @@ struct DataInfo {
     int           ne11;
     const mmid_row_mapping * row_mapping = nullptr;
     size_t        bs2 = 0;
+    bool          accumulate = false; // true = add to dst instead of overwrite (for delta correction)
 
     inline const char * src1_row(int iy) const {
         if (!row_mapping) return cy + (cur_y + iy)*by;
@@ -105,24 +106,33 @@ struct DataInfo {
     }
 
     inline void store(int ix, int iy, float result) const {
-        *(dst_row(iy) + ix) = result;
+        if (accumulate) *(dst_row(iy) + ix) += result;
+        else            *(dst_row(iy) + ix)  = result;
     }
 #ifdef __AVX__
     inline void store(int ix, int iy, __m128 result) const {
-        _mm_storeu_ps(dst_row(iy) + ix, result);
+        float * dst = dst_row(iy) + ix;
+        if (accumulate) _mm_storeu_ps(dst, _mm_add_ps(_mm_loadu_ps(dst), result));
+        else            _mm_storeu_ps(dst, result);
     }
     inline void store(int ix, int iy, __m256 result) const {
-        _mm256_storeu_ps(dst_row(iy) + ix, result);
+        float * dst = dst_row(iy) + ix;
+        if (accumulate) _mm256_storeu_ps(dst, _mm256_add_ps(_mm256_loadu_ps(dst), result));
+        else            _mm256_storeu_ps(dst, result);
     }
 #endif
 #ifdef __AVX512F__
     inline void store(int ix, int iy, __m512 result) const {
-        _mm512_storeu_ps(dst_row(iy) + ix, result);
+        float * dst = dst_row(iy) + ix;
+        if (accumulate) _mm512_storeu_ps(dst, _mm512_add_ps(_mm512_loadu_ps(dst), result));
+        else            _mm512_storeu_ps(dst, result);
     }
 #endif
 #ifdef __ARM_NEON
     inline void store(int ix, int iy, float32x4_t result) const {
-        vst1q_f32(dst_row(iy) + ix, result);
+        float * dst = dst_row(iy) + ix;
+        if (accumulate) vst1q_f32(dst, vaddq_f32(vld1q_f32(dst), result));
+        else            vst1q_f32(dst, result);
     }
 #endif
     inline float * dst_row(int iy) const {

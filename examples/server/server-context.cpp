@@ -577,9 +577,9 @@ bool server_context::load_model(const gpt_params& params_) {
             int32_t n_wired = llama_blurry_sharp_wire_delta_tensors(bsctx);
             LOG_INFO("Delta-only PIM: expert tensors wired", {{"n_wired", n_wired}});
 
-            // Permanently upgrade GPU expert tensors with delta correction.
-            int32_t n_gpu = llama_blurry_sharp_apply_delta_gpu_experts(bsctx);
-            LOG_INFO("Delta-only PIM: GPU expert tensors upgraded", {{"n_upgraded", n_gpu}});
+            // Note: GPU delta upgrade via requantization is disabled — requanting
+            // dequant(blurry)+dequant(delta) back to blurry type destroys the correction.
+            // Real GPU delta correction requires a CUDA kernel that combines on-the-fly.
 
             // TODO: apply delta to non-expert tensors at startup for full --sharp replacement.
             // Currently crashes on CPU-only configs due to mmap/requant issues.

@@ -697,6 +697,7 @@ struct llama_init_result {
     struct llama_model   * model   = nullptr;
     struct llama_context * context = nullptr;
     std::vector<llama_lora_adapter_container> lora_adapters;
+    struct llama_blurry_sharp_context * bsctx = nullptr; // delta correction context (kept alive for mmap)
 };
 
 struct llama_init_result    llama_init_from_gpt_params(gpt_params & params);

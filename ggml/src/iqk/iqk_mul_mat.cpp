@@ -708,21 +708,18 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
     return true;
 }
 
-extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
+static bool iqk_mul_mat_moe_impl(long Nx, long Ny, long ne00, int ne11,
         int typeA, const void * A, long strideA,
         int typeB, const void * B, long strideB,
-        float * C, long nb1, long nb2, const void * vrow_mapping, int ith, int nth) {
+        float * C, long nb1, long nb2, const void * vrow_mapping, int ith, int nth,
+        bool accumulate) {
     const mmid_row_mapping * row_mapping = (const mmid_row_mapping *)vrow_mapping;
     assert(row_mapping != nullptr);
 
     MulMat mm;
 
     auto etypeA = ggml_type(typeA);
-    //auto etypeB = ggml_type(typeB);
     auto dequant_type = MulMat::is_dequant_better(etypeA, Ny);
-    //if (etypeB != GGML_TYPE_F32) {
-    //    if (ith == 0) printf("%s: typeA = %s, typeB = %s, dequant_type = %s\n", __func__, ggml_type_name(etypeA), ggml_type_name(etypeB), ggml_type_name(dequant_type));
-    //}
     if (dequant_type != etypeA) {
         if (!MulMat::prepare(dequant_type, typeB, ne00, mm, Ny)) {
             return false;
@@ -741,7 +738,7 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
         size_t row_size_qx = ggml_row_size(dequant_type, ne00);
         size_t row_size_qy = strideB;
 
-        DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float), row_size_qy, 0, ne11, row_mapping, nb2/sizeof(float)};
+        DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float), row_size_qy, 0, ne11, row_mapping, nb2/sizeof(float), accumulate};
 
         auto& f = thread_local_work_buffer();
 
@@ -773,9 +770,25 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
     first_x *= num_rows;
     nrc_x *= num_rows;
     DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float),
-        row_size_qy, 0, ne11, row_mapping, nb2/sizeof(float)};
+        row_size_qy, 0, ne11, row_mapping, nb2/sizeof(float), accumulate};
     mm.mul_mat_NxM(ne00, (const char *)A + row_size_qx*first_x, row_size_qx, info, nrc_x, Ny);
     return true;
+}
+
+extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
+        int typeA, const void * A, long strideA,
+        int typeB, const void * B, long strideB,
+        float * C, long nb1, long nb2, const void * vrow_mapping, int ith, int nth) {
+    return iqk_mul_mat_moe_impl(Nx, Ny, ne00, ne11, typeA, A, strideA, typeB, B, strideB,
+                                C, nb1, nb2, vrow_mapping, ith, nth, false);
+}
+
+extern "C" IQK_API bool iqk_mul_mat_moe_acc(long Nx, long Ny, long ne00, int ne11,
+        int typeA, const void * A, long strideA,
+        int typeB, const void * B, long strideB,
+        float * C, long nb1, long nb2, const void * vrow_mapping, int ith, int nth) {
+    return iqk_mul_mat_moe_impl(Nx, Ny, ne00, ne11, typeA, A, strideA, typeB, B, strideB,
+                                C, nb1, nb2, vrow_mapping, ith, nth, true);
 }
 
 extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int ne11, int unary_op,
@@ -1742,6 +1755,11 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long /*Nx*/, long /*Ny*/, long /*ne00*/,
 }
 
 extern "C" IQK_API bool iqk_mul_mat_moe(long, long, long, int, int, const void *, long, int, const void *, long, float *, long, long,
+        const void *, int, int) {
+    GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
+    return false;
+}
+extern "C" IQK_API bool iqk_mul_mat_moe_acc(long, long, long, int, int, const void *, long, int, const void *, long, float *, long, long,
         const void *, int, int) {
     GGML_ABORT("Unsupported CPU. You may need to manually set compilation flags\n");
     return false;

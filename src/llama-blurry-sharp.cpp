@@ -1016,13 +1016,19 @@ llama_blurry_sharp_context * llama_blurry_sharp_init(
         LLAMA_LOG_ERROR("%s: model is null\n", __func__);
         return nullptr;
     }
-    if (!params.sharp_model_path || params.sharp_model_path[0] == '\0') {
-        LLAMA_LOG_ERROR("%s: sharp_model_path is empty\n", __func__);
+    const bool has_sharp = params.sharp_model_path && params.sharp_model_path[0] != '\0';
+    const bool has_delta = params.n_delta_levels > 0 && params.delta_paths;
+    if (!has_sharp && !has_delta) {
+        LLAMA_LOG_ERROR("%s: neither sharp_model_path nor delta_paths specified\n", __func__);
         return nullptr;
     }
 
-    LLAMA_LOG_INFO("%s: initializing blurry-sharp overlay system\n", __func__);
-    LLAMA_LOG_INFO("%s: sharp model path: %s\n", __func__, params.sharp_model_path);
+    if (has_delta && !has_sharp) {
+        LLAMA_LOG_INFO("%s: initializing delta-only correction (no sharp model)\n", __func__);
+    } else {
+        LLAMA_LOG_INFO("%s: initializing blurry-sharp overlay system\n", __func__);
+        LLAMA_LOG_INFO("%s: sharp model path: %s\n", __func__, params.sharp_model_path);
+    }
     if (params.permanent) {
         LLAMA_LOG_INFO("%s: PERMANENT mode enabled — sharp overlay is one-way, blurry data will be discarded\n", __func__);
         LLAMA_LOG_INFO("%s:   same-type GPU tensors: in-place overwrite (zero extra VRAM)\n", __func__);
@@ -1041,6 +1047,11 @@ llama_blurry_sharp_context * llama_blurry_sharp_init(
     bsctx->params = params;
     bsctx->retain_device_buffers = params.retain_device_buffers;
     bsctx->lazy_swap_enabled     = params.lazy_swap;
+
+    // -----------------------------------------------------------------------
+    // Sharp model loading (steps 1-7) — only when --sharp is specified
+    // -----------------------------------------------------------------------
+    if (has_sharp) {
 
     // -----------------------------------------------------------------------
     // 1) Open the primary sharp GGUF and read metadata (no tensor data alloc)
@@ -1528,6 +1539,8 @@ llama_blurry_sharp_context * llama_blurry_sharp_init(
     }
 #endif
 
+    } // end if (has_sharp)
+
     // -----------------------------------------------------------------------
     // Fractal delta correction chain loading
     // -----------------------------------------------------------------------
@@ -1621,8 +1634,10 @@ llama_blurry_sharp_context * llama_blurry_sharp_init(
 
     bsctx->initialized = true;
 
-    LLAMA_LOG_INFO("%s: blurry-sharp overlay system initialized successfully\n", __func__);
-    llama_blurry_sharp_log_index_summary(bsctx);
+    LLAMA_LOG_INFO("%s: overlay system initialized successfully\n", __func__);
+    if (has_sharp) {
+        llama_blurry_sharp_log_index_summary(bsctx);
+    }
 
     // -----------------------------------------------------------------------
     // Pre-flight GPU budget analysis
