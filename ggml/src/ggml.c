@@ -5421,6 +5421,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
         /*.ray_march_delta_cache  =*/ NULL,
+        /*.sparse_delta_gpu       =*/ NULL,
         /*.ray_march_delta_type   =*/ (enum ggml_type)0,
         /*.padding                =*/ { 0 },
         ///*.padding      =*/ { 0 },

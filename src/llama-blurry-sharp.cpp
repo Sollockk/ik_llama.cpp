@@ -7195,3 +7195,84 @@ int32_t llama_blurry_sharp_apply_delta_gpu_experts(
 
     return n_upgraded;
 }
+
+// ---------------------------------------------------------------------------
+// Create ggml_tensor objects backed by mmap'd delta data for graph inclusion
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_create_graph_delta_tensors(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || !bsctx->fractal_mode || bsctx->correction_levels.empty()) {
+        return 0;
+    }
+
+    auto & level = bsctx->correction_levels[0];
+    if (level.delta_index.empty() || level.mmaps.empty()) {
+        return 0;
+    }
+
+    // Create a CPU buffer wrapping the entire mmap
+    if (!level.mmaps[0]) return 0;
+    void * mmap_addr = (void *)level.mmaps[0]->addr();
+    size_t mmap_size = level.mmaps[0]->size();
+
+    bsctx->delta_tensor_buf = ggml_backend_cpu_buffer_from_ptr(mmap_addr, mmap_size);
+    if (!bsctx->delta_tensor_buf) {
+        LLAMA_LOG_ERROR("%s: failed to create CPU buffer for delta tensors\n", __func__);
+        return 0;
+    }
+
+    // Create a ggml context for the delta tensor metadata
+    size_t n_tensors = level.delta_index.size();
+    struct ggml_init_params ctx_params = {
+        /*.mem_size   =*/ n_tensors * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    bsctx->delta_tensor_ctx = ggml_init(ctx_params);
+    if (!bsctx->delta_tensor_ctx) {
+        LLAMA_LOG_ERROR("%s: failed to create ggml context for delta tensors\n", __func__);
+        return 0;
+    }
+
+    int32_t n_created = 0;
+
+    for (auto & [name, dinfo] : level.delta_index) {
+        if (bs_is_expert_tensor_name(name)) continue;
+        if (dinfo.split_idx != 0) continue;
+        if (dinfo.nbytes == 0) continue;
+
+        int64_t ne[4] = {
+            dinfo.ne[0] > 0 ? dinfo.ne[0] : 1,
+            dinfo.ne[1] > 0 ? dinfo.ne[1] : 1,
+            dinfo.ne[2] > 0 ? dinfo.ne[2] : 1,
+            dinfo.ne[3] > 0 ? dinfo.ne[3] : 1,
+        };
+
+        ggml_tensor * dt = ggml_new_tensor_4d(bsctx->delta_tensor_ctx, dinfo.type, ne[0], ne[1], ne[2], ne[3]);
+        if (!dt) continue;
+
+        dt->data = (void *)((uint8_t *)mmap_addr + dinfo.file_offset);
+        dt->buffer = bsctx->delta_tensor_buf;
+
+        std::string delta_name = name + "_delta";
+        ggml_set_name(dt, delta_name.c_str());
+
+        bsctx->delta_graph_tensors[name] = dt;
+        n_created++;
+    }
+
+    LLAMA_LOG_INFO("%s: created %d graph-level delta tensors in CPU buffer (%.1f MiB mmap)\n",
+                   __func__, n_created, mmap_size / (1024.0 * 1024.0));
+
+    return n_created;
+}
+
+ggml_tensor * llama_blurry_sharp_get_delta_tensor(
+        llama_blurry_sharp_context * bsctx,
+        const char * name) {
+    if (!bsctx || !name) return nullptr;
+    auto it = bsctx->delta_graph_tensors.find(name);
+    if (it == bsctx->delta_graph_tensors.end()) return nullptr;
+    return it->second;
+}

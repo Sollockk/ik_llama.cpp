@@ -662,6 +662,14 @@ struct llama_blurry_sharp_context {
 
     // Skip GPU tensors in apply_non_expert_permanent (saves VRAM)
     bool skip_non_expert_gpu = false;
+
+    // -- graph-level delta tensors --
+    // ggml_tensor objects backed by mmap'd delta data in a CPU buffer.
+    // Used by the graph builder to emit separate CPU-side delta matmul nodes.
+    // Created by llama_blurry_sharp_create_graph_delta_tensors().
+    ggml_context *          delta_tensor_ctx  = nullptr;  // owns the ggml_tensor metadata
+    ggml_backend_buffer_t   delta_tensor_buf  = nullptr;  // CPU buffer wrapping mmap
+    std::unordered_map<std::string, ggml_tensor *> delta_graph_tensors;  // name → delta tensor
 };
 
 // ---------------------------------------------------------------------------

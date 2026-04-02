@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-context.h"
 #include "llama-delta-net.h"
+#include "llama-blurry-sharp.h"
 
 #include "ggml.h"
 
@@ -6215,14 +6216,48 @@ ggml_cgraph * llm_build_context::build_gemma4() {
             cur = ggml_add(ctx0, cur_mlp, cur_moe);
             cb(cur, "ffn_moe_combined", il);
         } else {
-            // Dense FFN
-            cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, attn_out,
-                    model.layers[il].ffn_up,   NULL, NULL,
-                    model.layers[il].ffn_gate, NULL, NULL,
-                    model.layers[il].ffn_down, NULL, NULL,
-                    NULL,
-                    LLM_FFN_GELU, LLM_FFN_PAR, cb, il);
-            cb(cur, "ffn_out", il);
+            // Dense FFN with optional per-matmul CPU delta correction
+            cur = llm_build_norm(ctx0, attn_out, hparams, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, cb, il);
+            cb(cur, "ffn_norm", il);
+
+            // Check if we have graph-level delta tensors for CPU-side correction
+            auto * bsctx_ptr = lctx.jit_bsctx;
+            ggml_tensor * delta_gate = bsctx_ptr ? llama_blurry_sharp_get_delta_tensor(bsctx_ptr, model.layers[il].ffn_gate->name) : nullptr;
+            ggml_tensor * delta_up   = bsctx_ptr ? llama_blurry_sharp_get_delta_tensor(bsctx_ptr, model.layers[il].ffn_up->name)   : nullptr;
+            ggml_tensor * delta_down = bsctx_ptr ? llama_blurry_sharp_get_delta_tensor(bsctx_ptr, model.layers[il].ffn_down->name) : nullptr;
+
+            // gate: GPU blurry + optional CPU delta
+            ggml_tensor * gate_out = llm_build_lora_mm(lctx, ctx0, model.layers[il].ffn_gate, cur);
+            if (delta_gate) {
+                ggml_tensor * gate_delta = ggml_mul_mat(ctx0, delta_gate, cur);
+                cb(gate_delta, "ffn_gate_delta", il);
+                gate_out = ggml_add(ctx0, gate_out, gate_delta);
+            }
+            cb(gate_out, "ffn_gate", il);
+
+            // up: GPU blurry + optional CPU delta
+            ggml_tensor * up_out = llm_build_lora_mm(lctx, ctx0, model.layers[il].ffn_up, cur);
+            if (delta_up) {
+                ggml_tensor * up_delta = ggml_mul_mat(ctx0, delta_up, cur);
+                cb(up_delta, "ffn_up_delta", il);
+                up_out = ggml_add(ctx0, up_out, up_delta);
+            }
+            cb(up_out, "ffn_up", il);
+
+            // activation: gelu(gate) * up
+            gate_out = ggml_gelu(ctx0, gate_out);
+            cur = ggml_mul(ctx0, gate_out, up_out);
+            cb(cur, "ffn_gate_par", il);
+
+            // down: GPU blurry + optional CPU delta
+            ggml_tensor * down_out = llm_build_lora_mm(lctx, ctx0, model.layers[il].ffn_down, cur);
+            if (delta_down) {
+                ggml_tensor * down_delta = ggml_mul_mat(ctx0, delta_down, cur);
+                cb(down_delta, "ffn_down_delta", il);
+                down_out = ggml_add(ctx0, down_out, down_delta);
+            }
+            cb(down_out, "ffn_out", il);
+            cur = down_out;
         }
 
         cur = llm_build_norm(ctx0, cur, hparams, model.layers[il].ffn_post_norm, NULL, LLM_NORM_RMS, cb, -1);

@@ -810,9 +810,10 @@ extern "C" {
         // that manages lazy pread of expert slices into anonymous heap memory.
         // On first access per expert: pread from SSD → heap buffer (pointer swap).
         // Subsequent accesses: direct heap access (anonymous, swappable under pressure).
-        void *         ray_march_delta_cache; // pim_delta_cache * (NULL = no delta)
+        void *         ray_march_delta_cache; // pim_delta_cache * (NULL = no delta, full delta CPU RAM)
+        void *         sparse_delta_gpu;     // pim_sparse_delta_gpu * (NULL = no sparse VRAM delta)
         enum ggml_type ray_march_delta_type;  // quantization type of the delta
-        char           padding[16];
+        char           padding[8];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);

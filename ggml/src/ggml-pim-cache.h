@@ -28,6 +28,19 @@ struct pim_delta_cache {
     bool         gpu_pinned;      // true if heap_buf is pinned for GPU zero-copy access
 };
 
+// Sparse delta data uploaded to GPU VRAM for fast speculative correction.
+// Packed format: only significant blocks stored, with uint16 index for scatter.
+struct pim_sparse_delta_gpu {
+    void *       dev_packed;      // VRAM: packed weight blocks (non-zero only)
+    void *       dev_index;       // VRAM: uint16 block indices [n_blocks_stored]
+    int          n_blocks_stored; // number of non-zero blocks per expert
+    int          n_blocks_total;  // total blocks per expert row (for bounds)
+    int          n_experts;       // number of experts
+    size_t       packed_expert_bytes; // bytes of packed data per expert
+    int          block_bytes;     // bytes per quantization block
+    int          block_elems;     // elements per quantization block (qk)
+};
+
 // Allocate and initialize a cache. heap_buf is allocated but not populated.
 struct pim_delta_cache * pim_delta_cache_create(
     const void * mmap_ptr,    // mmap pointer to tensor data

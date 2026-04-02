@@ -1880,6 +1880,19 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API int32_t llama_blurry_sharp_wire_delta_tensors(
             struct llama_blurry_sharp_context * bsctx);
 
+    // Create ggml_tensor objects backed by mmap'd delta data in a CPU buffer.
+    // These tensors can be included in the computation graph for CPU-side delta
+    // matmul, enabling async CPU delta correction while GPU computes blurry.
+    // Returns number of tensors created.
+    LLAMA_API int32_t llama_blurry_sharp_create_graph_delta_tensors(
+            struct llama_blurry_sharp_context * bsctx);
+
+    // Look up a delta tensor by the base model tensor name.
+    // Returns NULL if no delta exists for this tensor.
+    LLAMA_API struct ggml_tensor * llama_blurry_sharp_get_delta_tensor(
+            struct llama_blurry_sharp_context * bsctx,
+            const char * name);
+
     // -----------------------------------------------------------------------
     // Memory-tier management: VRAM > RAM > Swap > Disk
     //
