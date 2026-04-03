@@ -16957,6 +16957,7 @@ static int ggml_compute_forward_mul_mat(
     // When src0 has a delta cache, we let the normal IQK path compute the
     // blurry result first, then add delta correction as a second pass.
     // This avoids bypassing IQK (which caused NaN with IK quant types).
+    //
     const bool has_delta_dense = (src0->ray_march_delta_cache != NULL);
 
     if (src1->type != vec_dot_type && dst->type == GGML_TYPE_F32) {
@@ -16987,9 +16988,10 @@ static int ggml_compute_forward_mul_mat(
             }
         }
 
-        // ---- Dense delta correction: additive pass after IQK blurry matmul ----
-        // IQK computed dst = blurry @ input. Now add delta @ input to dst.
-        if (has_delta_dense) {
+        // ---- Dense delta correction: DISABLED ----
+        // CPU delta handled by post-graph pass for GPU tensors.
+        // CPU-only tensors (layers 0-19) skip delta — applying during prompt causes NaN.
+        if (false && has_delta_dense) {
             const enum ggml_type ray_march_delta_type = src0->ray_march_delta_type;
             ggml_type_traits_t delta_traits = ggml_internal_get_type_traits(ray_march_delta_type);
 

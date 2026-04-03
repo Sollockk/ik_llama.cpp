@@ -28,6 +28,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-pim-cache.h"
+#include "ggml-ray-march.h"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
@@ -2336,6 +2337,7 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
         }
         if (dst->op != GGML_OP_MUL_MAT || dst->src[1] != src1 || !ggml_is_quantized(dst->src[0]->type)) break;
         if (!is_gemv && mmq_get_q8_1_ds_layout(src0->type) != mmq_get_q8_1_ds_layout(dst->src[0]->type)) break;
+        // Note: fusion with delta-enabled tensors may need separate delta correction per tensor
         if (is_gemv) {
             if (fusion && node_n + 2 < cgraph->n_nodes &&
                 cgraph->nodes[node_n+2]->op == GGML_OP_ADD &&
@@ -2371,59 +2373,104 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
 
         if (delta_src0 && delta_src0->ray_march_delta_cache != NULL) {
             struct pim_delta_cache * cache = (struct pim_delta_cache *)delta_src0->ray_march_delta_cache;
-            if (cache->gpu_pinned && cache->heap_buf) {
+
+            // DISABLED — delta now handled in post-graph pass only.
+            // This inline path corrupts CUDA graph capture during warmup.
+            if (false && is_gemv && cache->heap_buf) {
                 const ggml_type delta_type = delta_src0->ray_march_delta_type;
+                const char * delta_ptr = pim_delta_cache_get(cache, 0);
+                if (delta_ptr) {
+                    const int64_t ne00 = delta_src0->ne[0]; // input dim
+                    const int64_t ne01 = delta_src0->ne[1]; // output dim
+                    const int64_t ne11 = src1->ne[1];       // n_tokens
 
-                if (is_gemv && ggml_cuda_mmvq_type_supported(delta_type)) {
-                    const char * delta_ptr = pim_delta_cache_get(cache, 0);
-                    if (delta_ptr) {
-                        const size_t delta_row_stride = ggml_row_size(delta_type, delta_src0->ne[0]);
+                    // 1. Copy input activations from GPU to CPU
+                    const size_t src1_bytes = ne00 * ne11 * sizeof(float);
+                    std::vector<float> input_f32(ne00 * ne11);
+                    CUDA_CHECK(cudaMemcpyAsync(input_f32.data(), src1->data, src1_bytes,
+                                               cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
 
-                        // Re-quantize src1 for the delta type (may differ from blurry type)
-                        ggml_cuda_pool_alloc<char> src1_delta_q(ctx.pool(),
-                            GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1) / QK8_1 * ggml_nrows(src1));
-                        auto ne10_pad = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
-                        quantize_row_q8_1_cuda(
-                            (const float *)src1->data, (void *)src1_delta_q.get(),
-                            src1->ne[0], src1->ne[1], src1->ne[2], ne10_pad,
-                            delta_type, stream);
-                        CUDA_CHECK(cudaGetLastError());
+                    // 2. Setup ray march
+                    const ggml_type_traits_t delta_traits = ggml_internal_get_type_traits(delta_type);
+                    const size_t delta_row_stride = ggml_row_size(delta_type, ne00);
+                    const int rm_block_size = (int)ggml_blck_size(delta_type);
+                    const int rm_n_blocks = (rm_block_size > 0 && ne00 % rm_block_size == 0)
+                        ? (int)(ne00 / rm_block_size) : 0;
 
-                        mmvq_args delta_args{
-                            /* vx_u      */ delta_ptr,
-                            /* vx_g      */ nullptr,
-                            /* bias_u    */ nullptr,
-                            /* bias_g    */ nullptr,
-                            /* vy        */ src1_delta_q.get(),
-                            /* dst       */ (float *)dst->data,
-                            /* ids_data  */ nullptr,
-                            /* ncols_x   */ int(delta_src0->ne[0]),
-                            /* nrows_x   */ int(delta_src0->ne[1]),
-                            /* nrows_y   */ int(ne10_pad),
-                            /* ncols_y   */ int(src1->ne[1]),
-                            /* nrows_dst */ int(dst->ne[0]),
-                            /* ne2       */ 1,
-                            /* nb02      */ uint64_t(delta_src0->ne[1] * delta_row_stride),
-                            /* nb12      */ uint64_t(ne10_pad * sizeof(block_q8_1) / QK8_1 * src1->ne[1]),
-                            /* nb2       */ uint64_t(dst->nb[2]),
-                            /* ids_nb0   */ 0,
-                            /* bias_nb1  */ 0,
-                            /* unary_op  */ GGML_UNARY_OP_COUNT,
-                            /* limit     */ INFINITY,
-                            /* accumulate*/ true
-                        };
+                    // Quantize input for delta's vec_dot_type (Q8_0)
+                    const ggml_type delta_input_type = delta_traits.vec_dot_type;
+                    const ggml_type_traits_t dit = ggml_internal_get_type_traits(delta_input_type);
+                    const size_t dinput_row_size = ggml_row_size(delta_input_type, ne00);
 
-                        ggml_cuda_mmvq_dispatch(delta_type, delta_args, stream);
-                        CUDA_CHECK(cudaGetLastError());
+                    std::vector<float> delta_result(ne01 * ne11, 0.0f);
+                    std::vector<uint8_t> dinput_buf(dinput_row_size * ne11);
 
-                        static int gpu_delta_diag = 0;
-                        if (gpu_delta_diag < 3) {
-                            gpu_delta_diag++;
-                            fprintf(stderr, "[gpu-delta] src0=%s ne=[%lld,%lld] delta_type=%s zero-copy accumulate\n",
-                                    delta_src0->name, (long long)delta_src0->ne[0], (long long)delta_src0->ne[1],
-                                    ggml_type_name(delta_type));
+                    for (int64_t t = 0; t < ne11; t++) {
+                        if (dit.from_float) {
+                            dit.from_float(input_f32.data() + t * ne00,
+                                           dinput_buf.data() + t * dinput_row_size, ne00);
                         }
                     }
+
+                    // 3. Compute block energies and partition (per token)
+                    for (int64_t t = 0; t < ne11; t++) {
+                        int rm_active_buf[512];
+                        struct ggml_ray_march_tiers tiers;
+                        tiers.active_blocks = rm_active_buf;
+                        tiers.n_active = 0;
+                        tiers.n_skip   = 0;
+                        tiers.n_total  = rm_n_blocks;
+
+                        if (rm_n_blocks > 0 && rm_n_blocks <= 512) {
+                            float rm_energies[512];
+                            ggml_ray_march_block_energies(input_f32.data() + t * ne00,
+                                                          rm_energies, (int)ne00, rm_block_size);
+                            float e_sum = 0.0f;
+                            for (int b = 0; b < rm_n_blocks; b++) e_sum += rm_energies[b];
+                            float skip_thresh = e_sum / rm_n_blocks * 0.01f;
+                            ggml_ray_march_partition_blocks(rm_energies, rm_n_blocks,
+                                                           skip_thresh, &tiers);
+                        } else {
+                            for (int b = 0; b < rm_n_blocks; b++) rm_active_buf[tiers.n_active++] = b;
+                        }
+
+                        const void * dinput_row = dinput_buf.data() + t * dinput_row_size;
+
+                        // 4. Parallel delta vec_dot across output rows
+                        #pragma omp parallel for schedule(static) num_threads(8)
+                        for (int64_t j = 0; j < ne01; j++) {
+                            float dv = 0.0f;
+                            // Pass delta as "blurry" with NULL delta — single vec_dot
+                            ggml_vec_dot_ray_march(
+                                (int)ne00, &dv,
+                                delta_ptr + j * delta_row_stride, (int)delta_type,
+                                nullptr, (ggml_ray_march_type)0,
+                                dinput_row, nullptr,
+                                &tiers, rm_block_size);
+                            delta_result[t * ne01 + j] = dv;
+                        }
+
+                        // Diagnostic (first few)
+                        static int rm_diag = 0;
+                        if (rm_diag < 3) {
+                            rm_diag++;
+                            fprintf(stderr, "[cpu-ray-delta] %s: ne=[%lld,%lld] blocks=%d skip=%d(%.0f%%) active=%d\n",
+                                    delta_src0->name, (long long)ne00, (long long)ne01,
+                                    rm_n_blocks, tiers.n_skip,
+                                    rm_n_blocks > 0 ? 100.0f * tiers.n_skip / rm_n_blocks : 0.0f,
+                                    tiers.n_active);
+                        }
+                    }
+
+                    // 5. Read GPU dst, add delta, write back
+                    const size_t dst_bytes = ne01 * ne11 * sizeof(float);
+                    std::vector<float> dst_data(ne01 * ne11);
+                    CUDA_CHECK(cudaMemcpy(dst_data.data(), dst->data, dst_bytes, cudaMemcpyDeviceToHost));
+                    for (int64_t i = 0; i < ne01 * ne11; i++) {
+                        dst_data[i] += delta_result[i];
+                    }
+                    CUDA_CHECK(cudaMemcpy(dst->data, dst_data.data(), dst_bytes, cudaMemcpyHostToDevice));
                 }
             }
         }
@@ -2545,6 +2592,119 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     } else {
         if (debug) printf("%s(%s, %s): ggml_cuda_op_mul_mat(ggml_cuda_op_mul_mat_cublas)\n", __func__, dst->name, ggml_type_name(src0->type));
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+    }
+
+    // CPU delta correction for non-quantized paths (f16/f32 weights)
+    if (src0->ray_march_delta_cache != NULL && src1->ne[1] <= 4) {
+        // Only for small batches (TG). For large batches (PP), skip delta.
+        const int64_t ne00 = src0->ne[0]; // input dim (n_embd or n_ff)
+        const int64_t ne01 = src0->ne[1]; // output dim (n_ff or n_embd)
+        const int64_t ne11 = src1->ne[1]; // n_tokens
+
+        // 1. Copy input activations from GPU to CPU (tiny: n_tokens × n_embd × 4 bytes)
+        const size_t src1_bytes = ne00 * ne11 * sizeof(float);
+        std::vector<float> input_f32(ne00 * ne11);
+        CUDA_CHECK(cudaMemcpyAsync(input_f32.data(), src1->data, src1_bytes,
+                                   cudaMemcpyDeviceToHost, ctx.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));  // need input before CPU compute
+
+        // 2. Get delta weights from PIM cache
+        struct pim_delta_cache * cache = (struct pim_delta_cache *)src0->ray_march_delta_cache;
+        const char * delta_data = pim_delta_cache_get(cache, 0);
+        if (!delta_data) goto delta_done;
+
+        {
+            const ggml_type delta_type = src0->ray_march_delta_type;
+            const ggml_type_traits_t delta_traits = ggml_internal_get_type_traits(delta_type);
+            if (!delta_traits.vec_dot) goto delta_done;
+
+            const size_t delta_row_stride = ggml_row_size(delta_type, ne00);
+            const int rm_block_size = (int)ggml_blck_size(delta_type);
+            const bool rm_aligned = rm_block_size > 0 && (ne00 % rm_block_size == 0);
+            const int rm_n_blocks = rm_aligned ? (int)(ne00 / rm_block_size) : 0;
+
+            // 3. Quantize input for delta's vec_dot_type
+            const ggml_type delta_input_type = GGML_TYPE_Q8_0;
+            const ggml_type_traits_t dit = ggml_internal_get_type_traits(delta_input_type);
+            const size_t dinput_row_size = ggml_row_size(delta_input_type, ne00);
+
+            // Allocate delta result and quantized input
+            std::vector<float> delta_result(ne01 * ne11, 0.0f);
+            std::vector<uint8_t> dinput_buf(dinput_row_size * ne11);
+
+            // Quantize each input row for delta vec_dot
+            for (int64_t t = 0; t < ne11; t++) {
+                if (dit.from_float) {
+                    dit.from_float(input_f32.data() + t * ne00,
+                                   dinput_buf.data() + t * dinput_row_size, ne00);
+                }
+            }
+
+            // 4. For each token and output row: ray march delta vec_dot
+            for (int64_t t = 0; t < ne11; t++) {
+                // Block energies from input activations
+                float rm_energies[512];
+                int   rm_active[512];
+                struct ggml_ray_march_tiers tiers;
+                tiers.active_blocks = rm_active;
+                tiers.n_active = 0;
+                tiers.n_skip   = 0;
+                tiers.n_total  = rm_n_blocks;
+
+                if (rm_n_blocks > 0 && rm_n_blocks <= 512) {
+                    ggml_ray_march_block_energies(input_f32.data() + t * ne00, rm_energies,
+                                                  (int)ne00, rm_block_size);
+                    float e_sum = 0.0f;
+                    for (int b = 0; b < rm_n_blocks; b++) e_sum += rm_energies[b];
+                    float skip_thresh = e_sum / rm_n_blocks * 0.01f;
+
+                    ggml_ray_march_partition_blocks(rm_energies, rm_n_blocks, skip_thresh, &tiers);
+                } else {
+                    // Fallback: all blocks active
+                    for (int b = 0; b < rm_n_blocks; b++) rm_active[tiers.n_active++] = b;
+                }
+
+                const void * dinput_row = dinput_buf.data() + t * dinput_row_size;
+
+                // Parallel across output rows
+                #pragma omp parallel for schedule(static) num_threads(8)
+                for (int64_t j = 0; j < ne01; j++) {
+                    float dv = 0.0f;
+                    // Pass delta weights as "blurry" with NULL delta — computes just one vec_dot
+                    ggml_vec_dot_ray_march(
+                        (int)ne00, &dv,
+                        delta_data + j * delta_row_stride, (int)delta_type,
+                        nullptr, (ggml_ray_march_type)0,
+                        dinput_row, nullptr,
+                        &tiers, rm_block_size);
+                    delta_result[t * ne01 + j] = dv;
+                }
+            }
+
+            // 5. Wait for GPU blurry kernel to finish
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+            // 6. Read GPU dst, add delta, write back
+            const size_t dst_bytes = ne01 * ne11 * sizeof(float);
+            std::vector<float> dst_data(ne01 * ne11);
+            CUDA_CHECK(cudaMemcpy(dst_data.data(), dst->data, dst_bytes, cudaMemcpyDeviceToHost));
+
+            for (int64_t i = 0; i < ne01 * ne11; i++) {
+                dst_data[i] += delta_result[i];
+            }
+
+            CUDA_CHECK(cudaMemcpy(dst->data, dst_data.data(), dst_bytes, cudaMemcpyHostToDevice));
+
+            // One-time diagnostic
+            static int delta_cuda_diag = 0;
+            if (delta_cuda_diag < 3) {
+                delta_cuda_diag++;
+                fprintf(stderr, "[cuda-delta] %s: ne=[%lld,%lld] tokens=%lld delta=%s blocks=%d\n",
+                        src0->name, (long long)ne00, (long long)ne01, (long long)ne11,
+                        ggml_type_name(delta_type), rm_n_blocks);
+            }
+        }
+delta_done:;
     }
 
     return node_n;
@@ -4179,6 +4339,9 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
             break;
         }
 
+        // Note: CPU ray march delta requires host sync, incompatible with CUDA graph capture.
+        // The GPU zero-copy MMVQ delta path IS compatible with graph capture.
+
         if (node->op == GGML_OP_MUL_MAT_ID && (node->ne[2] != 1 || node->src[2]->ne[0] != 1)) {
             use_cuda_graph = false; // This node type is not supported by CUDA graph capture
 #ifndef NDEBUG
@@ -4509,6 +4672,156 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     bool graph_evaluated_or_captured = false;
 
     evaluate_and_capture_cuda_graph(cuda_ctx, cgraph, graph_evaluated_or_captured, use_cuda_graph, cuda_graph_update_required);
+
+    // ---- Post-graph CPU ray march delta correction ----
+    // After the CUDA graph completes all blurry matmuls, apply delta corrections
+    // on CPU with ray march block-energy skipping. One sync point, all layers batched.
+    {
+        // Check if any node in this graph needs delta correction.
+        // Skip during warmup/graph-capture and prompt processing.
+        // Only apply delta during generation (small token count, after prompt is done).
+        bool has_any_delta = false;
+        // Only apply delta after init is complete — flag set externally via API.
+        // Also skip prompt batches: if ANY mul_mat node has src1 tokens > 4, it's prompt.
+        if (cuda_ctx->delta_post_graph_enabled) {
+            bool is_prompt_batch = false;
+            for (int i = 0; i < cgraph->n_nodes && !is_prompt_batch; i++) {
+                ggml_tensor * node = cgraph->nodes[i];
+                if (node->op == GGML_OP_MUL_MAT && node->src[1] && node->src[1]->ne[1] > 4) {
+                    is_prompt_batch = true;
+                }
+            }
+            if (!is_prompt_batch) {
+                for (int i = 0; i < cgraph->n_nodes && !has_any_delta; i++) {
+                    ggml_tensor * node = cgraph->nodes[i];
+                    if (node->op == GGML_OP_MUL_MAT && node->src[0] &&
+                        node->src[0]->ray_march_delta_cache != NULL &&
+                        node->src[1] && node->src[1]->ne[1] <= 4) {
+                        has_any_delta = true;
+                    }
+                }
+            }
+        }
+
+        if (has_any_delta) {
+            // Single GPU sync — wait for all blurry matmuls to complete
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+
+            int n_corrected = 0;
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                ggml_tensor * node = cgraph->nodes[i];
+                if (node->op != GGML_OP_MUL_MAT || !node->src[0] || !node->src[0]->ray_march_delta_cache) continue;
+
+                // FFN-only filter removed for debugging
+
+                const ggml_tensor * src0 = node->src[0];  // weights (GPU)
+                const ggml_tensor * src1 = node->src[1];   // input (GPU)
+                ggml_tensor * dst = node;                   // output (GPU)
+
+                if (!src1 || src1->ne[1] > 4) continue;  // skip large batches (PP)
+
+                struct pim_delta_cache * cache = (struct pim_delta_cache *)src0->ray_march_delta_cache;
+                if (!cache->heap_buf) continue;
+
+                const char * delta_ptr = pim_delta_cache_get(cache, 0);
+                if (!delta_ptr) continue;
+
+                const int64_t ne00 = src0->ne[0]; // input dim
+                const int64_t ne01 = src0->ne[1]; // output dim
+                const int64_t ne11 = src1->ne[1]; // n_tokens
+
+                const ggml_type delta_type = src0->ray_march_delta_type;
+                const ggml_type_traits_t delta_traits = ggml_internal_get_type_traits(delta_type);
+                if (!delta_traits.vec_dot) continue;
+
+                const size_t delta_row_stride = ggml_row_size(delta_type, ne00);
+                const int rm_block_size = (int)ggml_blck_size(delta_type);
+                const int rm_n_blocks = (rm_block_size > 0 && ne00 % rm_block_size == 0)
+                    ? (int)(ne00 / rm_block_size) : 0;
+
+                // Get input activations from GPU
+                const size_t src1_bytes = ne00 * ne11 * sizeof(float);
+                std::vector<float> input_f32(ne00 * ne11);
+                CUDA_CHECK(cudaMemcpy(input_f32.data(), src1->data, src1_bytes, cudaMemcpyDeviceToHost));
+
+                // Use standard Q8_0 for delta input — IK vec_dot accepts Q8_0 even on IK builds.
+                // (IK-extended vec_dot_type like Q8_2_X4 has incompatible block layout for ray march)
+                const ggml_type delta_input_type = GGML_TYPE_Q8_0;
+                const ggml_type_traits_t dit = ggml_internal_get_type_traits(delta_input_type);
+                const size_t dinput_row_size = ggml_row_size(delta_input_type, ne00);
+                std::vector<uint8_t> dinput_buf(dinput_row_size * ne11);
+
+                for (int64_t t = 0; t < ne11; t++) {
+                    if (dit.from_float) {
+                        dit.from_float(input_f32.data() + t * ne00,
+                                       dinput_buf.data() + t * dinput_row_size, ne00);
+                    }
+                }
+
+                // Read GPU dst
+                const size_t dst_bytes = ne01 * ne11 * sizeof(float);
+                std::vector<float> dst_data(ne01 * ne11);
+                CUDA_CHECK(cudaMemcpy(dst_data.data(), dst->data, dst_bytes, cudaMemcpyDeviceToHost));
+
+                // Per-token: block energy scan + ray march delta vec_dot
+                for (int64_t t = 0; t < ne11; t++) {
+                    int rm_active_buf[512];
+                    struct ggml_ray_march_tiers tiers;
+                    tiers.active_blocks = rm_active_buf;
+                    tiers.n_active = 0;
+                    tiers.n_skip   = 0;
+                    tiers.n_total  = rm_n_blocks;
+
+                    if (rm_n_blocks > 0 && rm_n_blocks <= 512) {
+                        float rm_energies[512];
+                        ggml_ray_march_block_energies(input_f32.data() + t * ne00,
+                                                      rm_energies, (int)ne00, rm_block_size);
+                        float e_sum = 0.0f;
+                        for (int b = 0; b < rm_n_blocks; b++) e_sum += rm_energies[b];
+                        float skip_thresh = e_sum / rm_n_blocks * 0.01f;
+                        ggml_ray_march_partition_blocks(rm_energies, rm_n_blocks, skip_thresh, &tiers);
+                    } else {
+                        for (int b = 0; b < rm_n_blocks; b++) rm_active_buf[tiers.n_active++] = b;
+                    }
+
+                    const void * dinput_row = dinput_buf.data() + t * dinput_row_size;
+
+                    // Parallel delta vec_dot across output rows using IK-compatible quantization
+                    #pragma omp parallel for schedule(static) num_threads(8)
+                    for (int64_t j = 0; j < ne01; j++) {
+                        float dv = 0.0f;
+                        ggml_vec_dot_ray_march(
+                            (int)ne00, &dv,
+                            delta_ptr + j * delta_row_stride, (int)delta_type,
+                            nullptr, (ggml_ray_march_type)0,
+                            dinput_row, nullptr,
+                            &tiers, rm_block_size);
+                        dst_data[t * ne01 + j] += dv;
+                    }
+                }
+
+                // Write corrected result back to GPU
+                CUDA_CHECK(cudaMemcpy(dst->data, dst_data.data(), dst_bytes, cudaMemcpyHostToDevice));
+                n_corrected++;
+
+                static int post_diag = 0;
+                if (post_diag < 3) {
+                    post_diag++;
+                    fprintf(stderr, "[post-graph-delta] %s: ne=[%lld,%lld] tokens=%lld delta=%s\n",
+                            src0->name, (long long)ne00, (long long)ne01, (long long)ne11,
+                            ggml_type_name(delta_type));
+                }
+            }
+
+            if (n_corrected > 0) {
+                static int batch_diag = 0;
+                if (batch_diag < 1) {
+                    batch_diag++;
+                    fprintf(stderr, "[post-graph-delta] corrected %d tensors in post-graph pass\n", n_corrected);
+                }
+            }
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -5180,6 +5493,14 @@ void ggml_backend_cuda_unpin_host_memory(void * ptr) {
     cudaError_t err = cudaHostUnregister(ptr);
     if (err != cudaSuccess) {
         cudaGetLastError();
+    }
+}
+
+void ggml_backend_cuda_enable_delta_post_graph(ggml_backend_t backend, bool enable) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)backend->context;
+    ctx->delta_post_graph_enabled = enable;
+    if (enable) {
+        fprintf(stderr, "[cuda-delta] post-graph delta correction ENABLED\n");
     }
 }
 

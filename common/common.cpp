@@ -3599,12 +3599,12 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         iparams.bsctx = llama_blurry_sharp_init(model, bs_params);
         if (iparams.bsctx) {
             int32_t n_wired = llama_blurry_sharp_wire_delta_tensors(iparams.bsctx);
-            fprintf(stderr, "%s: delta correction wired %d expert tensors for PIM\n", __func__, n_wired);
-
-            int32_t n_graph = llama_blurry_sharp_create_graph_delta_tensors(iparams.bsctx);
-            if (n_graph > 0) {
-                fprintf(stderr, "%s: created %d graph-level delta tensors for CPU-side correction\n", __func__, n_graph);
-            }
+            fprintf(stderr, "%s: delta correction wired %d tensors for PIM\n", __func__, n_wired);
+            // Graph-level delta tensors disabled — using inline cooperative CPU+GPU delta.
+            // int32_t n_graph = llama_blurry_sharp_create_graph_delta_tensors(iparams.bsctx);
+            // if (n_graph > 0) {
+            //     fprintf(stderr, "%s: created %d delta tensors for correction\n", __func__, n_graph);
+            // }
         } else {
             fprintf(stderr, "%s: warning: failed to initialize delta correction\n", __func__);
         }

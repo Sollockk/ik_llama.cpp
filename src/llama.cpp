@@ -6768,6 +6768,10 @@ const struct llama_vocab* llama_get_model_vocab(const struct llama_model* model)
     return &model->vocab;
 }
 
+std::vector<ggml_backend_t> & llama_get_backends(llama_context * ctx) {
+    return ctx->backends;
+}
+
 enum llama_rope_type llama_rope_type(const struct llama_model * model) {
     switch (model->arch) {
         // these models do not use RoPE

@@ -64,6 +64,7 @@ GGML_API void ggml_backend_cuda_jit_sync_uploads(ggml_backend_t backend);
 // Unlike ggml_backend_cuda_register_host_buffer, not gated by env var.
 // Returns true on success. Memory must be unpinned before free.
 GGML_API bool ggml_backend_cuda_pin_host_memory(void * ptr, size_t size);
+GGML_API void ggml_backend_cuda_enable_delta_post_graph(ggml_backend_t backend, bool enable);
 GGML_API void ggml_backend_cuda_unpin_host_memory(void * ptr);
 
 #ifdef  __cplusplus

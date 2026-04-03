@@ -6733,6 +6733,20 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
         }
 
         if (dinfo.base_tensor && dinfo.split_idx < (int)level.mmaps.size() && level.mmaps[dinfo.split_idx]) {
+            // Skip if already wired (double-init protection)
+            if (dinfo.base_tensor->ray_march_delta_cache != NULL) {
+                n_wired++;
+                continue;
+            }
+
+            // Skip non-weight tensors: norms, scales, biases (1D or scalar).
+            // Delta correction only works for MUL_MAT weight tensors (2D+).
+            // Wiring delta to norm/scale tensors confuses code that checks
+            // ray_march_delta_cache on non-matmul ops → NaN.
+            if (dinfo.base_tensor->ne[1] <= 1) {
+                continue;
+            }
+
             const uint8_t * mmap_base = (const uint8_t *)level.mmaps[dinfo.split_idx]->addr();
             const void * mmap_ptr = (const void *)(mmap_base + dinfo.file_offset);
             int fd = level.files[dinfo.split_idx]->file_id();
@@ -6753,36 +6767,10 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
                        __func__, n_wired);
     }
 
-    // Pin delta caches for GPU tensors so CUDA kernels can read via PCIe zero-copy.
-    // This runs AFTER wiring, so all caches are freshly created.
+    // GPU pinning disabled — post-graph CPU delta correction doesn't need pinned memory.
+    // Pinning 553 caches consumed too much CUDA address space and caused NaN.
 #ifdef GGML_USE_CUDA
-    int n_gpu_pinned = 0;
-    for (auto & [name, dinfo] : level.delta_index) {
-        if (!dinfo.base_tensor || !dinfo.base_tensor->ray_march_delta_cache) continue;
-        if (!dinfo.base_tensor->buffer || ggml_backend_buffer_is_host(dinfo.base_tensor->buffer)) continue;
-
-        // This tensor is on GPU — pin its delta cache for zero-copy
-        struct pim_delta_cache * cache =
-            (struct pim_delta_cache *)dinfo.base_tensor->ray_march_delta_cache;
-        if (cache && !cache->gpu_pinned) {
-            size_t total_bytes = 0;
-            char * heap = pim_delta_cache_get_heap_buf(cache, &total_bytes);
-            if (heap && total_bytes > 0) {
-                // Pre-populate ALL expert data before pinning (pread from disk)
-                for (int e = 0; e < cache->n_experts; e++) {
-                    pim_delta_cache_get(cache, e);
-                }
-                if (ggml_backend_cuda_pin_host_memory(heap, total_bytes)) {
-                    cache->gpu_pinned = true;
-                    n_gpu_pinned++;
-                }
-            }
-        }
-    }
-    if (n_gpu_pinned > 0) {
-        LLAMA_LOG_INFO("%s: pinned %d GPU tensor delta caches for zero-copy correction\n",
-                       __func__, n_gpu_pinned);
-    }
+    LLAMA_LOG_INFO("%s: GPU pinning skipped — using post-graph CPU delta correction\n", __func__);
 #endif
 
     return n_wired;

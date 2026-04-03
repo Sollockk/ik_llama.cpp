@@ -558,13 +558,10 @@ bool server_context::load_model(const gpt_params& params_) {
         // Create a minimal blurry-sharp context just for delta loading
         llama_blurry_sharp_params bs_params = llama_blurry_sharp_default_params();
 
-        // Use a dummy sharp path — the init needs it but we won't use sharp data.
-        // Actually, we need to bypass init and load deltas directly.
-        // Create context manually and load only deltas.
-        // For now, use the blurry model as "sharp" — apply_non_expert_permanent will be a no-op
-        // since types match, and we only care about delta loading.
-        bs_params.sharp_model_path = params_base.model.c_str(); // blurry == "sharp" → no-op overlay
-        bs_params.permanent = true;
+        // Delta-only mode: no sharp model, no permanent overlay.
+        // Set sharp_model_path to NULL so init skips the sharp GGUF loading entirely.
+        bs_params.sharp_model_path = nullptr;
+        bs_params.permanent = false;
         bs_params.use_mmap = true;
 
         std::vector<const char *> delta_cstrs;
@@ -574,8 +571,14 @@ bool server_context::load_model(const gpt_params& params_) {
 
         bsctx = llama_blurry_sharp_init(model, bs_params);
         if (bsctx) {
+            // Wire delta tensors — sets ray_march_delta_cache on base model tensors
+            // for post-graph CPU ray march correction.
             int32_t n_wired = llama_blurry_sharp_wire_delta_tensors(bsctx);
             LOG_INFO("Delta-only PIM: expert tensors wired", {{"n_wired", n_wired}});
+            // Graph-level delta tensors DISABLED — causes 338 graph splits and NaN.
+            // Using inline cooperative CPU+GPU delta in ggml_cuda_mul_mat_q instead.
+            // int32_t n_graph = llama_blurry_sharp_create_graph_delta_tensors(bsctx);
+            // LOG_INFO("Delta graph tensors created", {{"n_graph", n_graph}});
 
             // Note: GPU delta upgrade via requantization is disabled — requanting
             // dequant(blurry)+dequant(delta) back to blurry type destroys the correction.

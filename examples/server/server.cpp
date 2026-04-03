@@ -9,6 +9,9 @@
 #include "sampling.h"
 #include "llama.h"
 #include "llama-vocab.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 #include <fstream>
        
 
@@ -610,6 +613,21 @@ int main(int argc, char ** argv) {
     }
 
     LOG_INFO("model loaded", {});
+
+    // Enable post-graph delta correction now that all init/warmup is done.
+    // Must be after all graph captures to avoid corrupting captured CUDA graphs.
+#ifdef GGML_USE_CUDA
+    if (ctx_server.ctx) {
+        extern std::vector<ggml_backend_t> & llama_get_backends(llama_context * ctx);
+        for (auto * be : llama_get_backends(ctx_server.ctx)) {
+            if (!ggml_backend_is_cpu(be)) {
+                // Post-graph delta DISABLED — using inline cooperative CPU+GPU delta instead.
+                // Post-graph corrupts intermediate tensors (downstream ops already consumed them).
+                // ggml_backend_cuda_enable_delta_post_graph(be, true);
+            }
+        }
+    }
+#endif
 
     const auto model_meta = ctx_server.model_meta();
 
