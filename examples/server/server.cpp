@@ -620,6 +620,9 @@ int main(int argc, char ** argv) {
         extern std::vector<ggml_backend_t> & llama_get_backends(llama_context * ctx);
         for (auto * be : llama_get_backends(ctx_server.ctx)) {
             if (!ggml_backend_is_cpu(be)) {
+                if (params.delta_vram_mb > 0) {
+                    ggml_backend_cuda_set_delta_vram_budget(be, params.delta_vram_mb);
+                }
                 ggml_backend_cuda_enable_delta_post_graph(be, true);
             }
         }

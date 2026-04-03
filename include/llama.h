@@ -1030,6 +1030,10 @@ extern "C" {
             const int32_t        * layer_indices,
             int32_t                n_layers);
 
+    // Enable/disable delta correction on the CUDA backend.
+    // Used by self-speculative decoding: disable during draft, enable during verify.
+    LLAMA_API void llama_set_delta_enabled(struct llama_context * ctx, bool enabled);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

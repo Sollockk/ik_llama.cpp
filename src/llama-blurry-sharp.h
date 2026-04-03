@@ -664,12 +664,44 @@ struct llama_blurry_sharp_context {
     bool skip_non_expert_gpu = false;
 
     // -- graph-level delta tensors --
-    // ggml_tensor objects backed by mmap'd delta data in a CPU buffer.
-    // Used by the graph builder to emit separate CPU-side delta matmul nodes.
-    // Created by llama_blurry_sharp_create_graph_delta_tensors().
-    ggml_context *          delta_tensor_ctx  = nullptr;  // owns the ggml_tensor metadata
-    ggml_backend_buffer_t   delta_tensor_buf  = nullptr;  // CPU buffer wrapping mmap
-    std::unordered_map<std::string, ggml_tensor *> delta_graph_tensors;  // name → delta tensor
+    ggml_context *          delta_tensor_ctx  = nullptr;
+    ggml_backend_buffer_t   delta_tensor_buf  = nullptr;
+    std::unordered_map<std::string, ggml_tensor *> delta_graph_tensors;
+
+    // -- CPU JIT pre-merge: background merge of blurry+delta → Q8_0 --
+    struct {
+        std::vector<uint8_t> buf[4];                 // Q8_0 data per slot (4 rotating slots)
+        ggml_tensor *        tensor[4] = {};         // which tensor is in each slot
+        int                  next_slot = 0;          // round-robin
+
+        // Queue of CPU tensors to merge (built during first gen token)
+        struct merge_entry {
+            ggml_tensor *    base;                   // model tensor (to swap data ptr)
+            const char *     delta_host;             // delta mmap pointer
+            ggml_type        blurry_type;
+            ggml_type        delta_type;
+            int64_t          ne0, n_rows;
+            size_t           blurry_row_bytes;
+            size_t           delta_row_bytes;
+            size_t           q8_row_bytes;
+            size_t           q8_total_bytes;
+            void *           original_data;          // original blurry data ptr (for swap-back)
+        };
+        std::vector<merge_entry> queue;
+        int queue_pos = 0;                           // next to merge
+        bool queue_built = false;
+
+        // Worker thread
+        std::thread          worker;
+        std::mutex           mtx;
+        std::condition_variable cv;
+        std::atomic<bool>    has_work{false};
+        std::atomic<int>     ready_count{0};          // how many are merged and ready
+        std::atomic<bool>    stop{false};
+
+        // Lookup: tensor ptr → slot index
+        std::unordered_map<const ggml_tensor *, int> ready_map;
+    } jit_merge;
 };
 
 // ---------------------------------------------------------------------------

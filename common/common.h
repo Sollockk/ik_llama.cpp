@@ -512,6 +512,10 @@ struct gpt_params {
     int         bs_spec_draft          = 8;           // number of draft (blurry) tokens per batch
     bool        bs_retain_buffers      = false;       // keep GPU buffers across restore cycles (faster re-sharpen)
 
+    // Self-speculative delta: draft K tokens blurry-only, batch-verify with delta.
+    // For dense models where delta PCIe cost dominates. 0 = disabled.
+    int         spec_delta_k           = 0;
+
     // Combined mode: unified pipeline that merges entropy, probing, and speculative
     // verification.  Drafts up to bs_spec_draft tokens, uses entropy + periodic probes
     // to adaptively shorten the draft when quality is at risk, then verifies with sharp.
@@ -562,6 +566,9 @@ struct gpt_params {
     // --delta: fractal delta correction chain GGUFs (one per level)
     // Enables hierarchical weight reconstruction: base + sum(deltas)
     std::vector<std::string> delta_paths;
+
+    // --delta-vram: VRAM budget in MB for GPU delta ring buffer (0 = auto)
+    int delta_vram_mb = 0;
 
     // --gpu-delta-priority: skip auto --cpu-moe when --sharp is present.
     bool        gpu_delta_priority     = false;

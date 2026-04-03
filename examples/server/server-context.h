@@ -276,6 +276,12 @@ struct server_context {
     // After ~15 tokens the EMA stabilizes and reliably identifies critical layers.
     std::unordered_map<int32_t, float> streaming_ema_scores;
 
+    // Self-speculative delta: draft K tokens blurry-only, verify batch with delta.
+    // Amortizes 6GB delta PCIe cost across K tokens instead of paying per-token.
+    int32_t spec_delta_k = 0;           // 0 = disabled, >0 = draft length
+    int32_t spec_delta_n_accept = 0;    // accepted tokens (stats)
+    int32_t spec_delta_n_draft = 0;     // drafted tokens (stats)
+
     int32_t n_ctx; // total context for all clients / slots
 
     // system prompt
@@ -374,6 +380,9 @@ struct server_context {
     void context_shift_prompt(llama_context* ctx, server_slot& slot, bool exact = false);
 
     void update_slots();
+
+    // Self-speculative delta: draft K tokens blurry-only, batch-verify with delta.
+    bool spec_delta_step();
 
     void release_slots();
 

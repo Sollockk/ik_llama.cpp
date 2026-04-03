@@ -858,6 +858,7 @@ struct ggml_backend_cuda_context {
     int   offload_batch_size = GGML_CUDA_MIN_BATCH_OFFLOAD;
     bool delta_post_graph_enabled = false; // legacy — kept for compat
     bool    delta_ready = false;       // set true after warmup completes — gates GPU delta
+    int     delta_vram_budget = 0;   // MB, 0 = auto (set via --delta-vram)
     float * delta_staging = nullptr;   // device staging buffer (cudaMalloc)
     size_t  delta_staging_n = 0;       // allocated element count
 
@@ -899,30 +900,30 @@ struct ggml_backend_cuda_context {
         int64_t     pending_ne01 = 0;
     } delta_pipe;
 
-    // Delta prefetch: async DMA of next tensor into VRAM swing buffer
+    // Delta ring buffer: VRAM cache for delta tensors, filled once then reused.
+    // For generation (same layers every token), data persists — zero DMA after fill.
     struct {
-        void * buf[2] = {nullptr, nullptr};  // 2x VRAM swing buffers
-        size_t buf_size = 0;                  // bytes per buffer (80MB)
-        int    cur_buf = 0;                   // which buffer holds prefetched data
-        bool   pending = false;               // DMA in flight on JIT stream
-        cudaEvent_t done = nullptr;           // signaled when DMA completes
-        const ggml_tensor * prefetched_src0 = nullptr;
+        void * vram = nullptr;           // single cudaMalloc
+        size_t vram_size = 0;            // total allocated bytes
 
-        // Ordered queue of delta tensors (built during first token)
-        struct delta_entry {
+        // Tensor lookup: src0_ptr → offset in vram buffer
+        std::unordered_map<const ggml_tensor *, size_t> tensor_map;
+
+        // Layer info (built during first generation token)
+        struct layer_entry {
             const ggml_tensor * src0;
-            const char * host_ptr;            // pinned mmap pointer
+            const char * host_ptr;       // pinned mmap pointer
             size_t bytes;
         };
-        std::vector<delta_entry> queue;       // execution order
-        int queue_pos = 0;                    // current position (resets each token)
-        bool queue_built = false;             // set after first token
-        int  n_hits = 0;                      // prefetch hits this token
-        int  n_misses = 0;                    // prefetch misses this token
-
-        // Active prefetch map: tensor pointer → (buffer_idx, offset) for O(1) lookup
-        std::unordered_map<const ggml_tensor *, std::pair<int, size_t>> active_map;
-    } delta_prefetch;
+        std::vector<layer_entry> all_tensors; // all GPU delta tensors in execution order
+        bool   built = false;            // set after first gen token
+        bool   filled = false;           // set after VRAM fill complete
+        int    dispatch_count = 0;       // per-token dispatch counter
+        int    n_hits = 0;
+        int    n_misses = 0;
+        cudaEvent_t fill_done = nullptr; // signaled when initial fill completes
+        bool   fill_pending = false;
+    } delta_ring;
 
     int   mmq_id_thresh = 32;
     float fa_offset = 0.6931f; // ln(2)

@@ -142,6 +142,12 @@ bool server_context::load_model(const gpt_params& params_) {
         llama_model_set_n_expert_used(model, params_base.bs_moe_top_k_override);
     }
 
+    // Self-speculative delta correction
+    if (params_base.spec_delta_k > 0) {
+        spec_delta_k = params_base.spec_delta_k;
+        LOG_INFO("self-speculative delta enabled", {{"k", spec_delta_k}});
+    }
+
     add_bos_token = llama_should_add_bos_token(model);
     has_eos_token = llama_add_eos_token(model) != 1;
 
@@ -5200,6 +5206,163 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
     }
 }
 
+// Self-speculative delta: draft K tokens blurry-only, batch-verify with delta.
+// Returns true if it handled generation (caller should skip normal decode).
+bool server_context::spec_delta_step() {
+    if (spec_delta_k <= 0) return false;
+
+    // Only for single-slot generation with an active slot
+    server_slot * active_slot = nullptr;
+    for (auto & slot : slots) {
+        if (slot.state == SLOT_STATE_PROCESSING && slot.command == SLOT_COMMAND_NONE
+            && slot.task && slot.n_decoded > 0) {
+            // Slot is actively generating (has task, has decoded at least one token)
+            if (active_slot) return false; // multiple active slots — skip
+            active_slot = &slot;
+        }
+    }
+    if (!active_slot || active_slot->sampled == 0) return false;
+
+    const int K = std::min(spec_delta_k, 8); // cap at MMVQ_MAX_BATCH_SIZE
+    auto & slot = *active_slot;
+
+    // Save state before drafting
+    const llama_pos draft_start_pos = slot.cache_tokens.pos_next();
+    const size_t    draft_start_cache_size = slot.cache_tokens.size();
+
+    // ---- DRAFT PHASE: generate K tokens blurry-only ----
+    llama_set_delta_enabled(ctx, false);
+
+    std::vector<llama_token> drafted_tokens;
+    drafted_tokens.reserve(K);
+
+    for (int ki = 0; ki < K; ki++) {
+        common_batch_clear(batch);
+        common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
+        slot.cache_tokens.push_back(slot.sampled);
+
+        int32_t n_batch = llama_n_batch(ctx);
+        process_batch_tokens(n_batch);
+
+        // Sample from blurry logits
+        const float * logits = llama_get_logits_ith(ctx, 0);
+        if (!logits) break;
+
+        // Simple greedy sampling for draft (argmax)
+        llama_token draft_tok = 0;
+        float max_logit = -INFINITY;
+        const int n_vocab = llama_n_vocab(model);
+        for (int v = 0; v < n_vocab; v++) {
+            if (logits[v] > max_logit) {
+                max_logit = logits[v];
+                draft_tok = v;
+            }
+        }
+
+        drafted_tokens.push_back(draft_tok);
+        slot.sampled = draft_tok;
+
+        // Stop if EOS
+        if (llama_token_is_eog(model, draft_tok)) break;
+    }
+
+    const int n_drafted = (int)drafted_tokens.size();
+    if (n_drafted == 0) {
+        llama_set_delta_enabled(ctx, true);
+        return false;
+    }
+
+    // ---- VERIFY PHASE: roll back and re-evaluate with delta ----
+    llama_set_delta_enabled(ctx, true);
+
+    // Remove drafted tokens from KV cache
+    llama_kv_cache_seq_rm(ctx, slot.id, draft_start_pos, -1);
+
+    // Restore cache_tokens to pre-draft state
+    slot.cache_tokens.resize(draft_start_cache_size);
+
+    // Build verification batch with all drafted tokens
+    common_batch_clear(batch);
+    // First add the token that triggered drafting (the one before draft_start_pos)
+    // Actually, we need the token BEFORE draft — that's slot.sampled from before drafting.
+    // But we already consumed it. The KV cache already has it from the last real decode.
+    // We just need to re-evaluate the drafted tokens.
+    for (int ki = 0; ki < n_drafted; ki++) {
+        bool need_logits = true; // need logits at every position for verification
+        common_batch_add(batch, drafted_tokens[ki],
+                         draft_start_pos + ki, { slot.id }, need_logits);
+        slot.cache_tokens.push_back(drafted_tokens[ki]);
+    }
+
+    // Batched decode with delta enabled
+    int32_t n_batch_v = llama_n_batch(ctx);
+    process_batch_tokens(n_batch_v);
+
+    // ---- ACCEPT/REJECT ----
+    // Compare sharp logits at each position with drafted tokens
+    int n_accepted = 0;
+    const int n_vocab = llama_n_vocab(model);
+
+    for (int ki = 0; ki < n_drafted; ki++) {
+        const float * logits = llama_get_logits_ith(ctx, ki);
+        if (!logits) break;
+
+        // Greedy: what would the sharp model pick?
+        llama_token sharp_tok = 0;
+        float max_logit = -INFINITY;
+        for (int v = 0; v < n_vocab; v++) {
+            if (logits[v] > max_logit) {
+                max_logit = logits[v];
+                sharp_tok = v;
+            }
+        }
+
+        if (sharp_tok == drafted_tokens[ki]) {
+            n_accepted++;
+        } else {
+            // Mismatch: accept sharp token at this position, discard rest
+            // Remove remaining drafted tokens from KV cache
+            llama_kv_cache_seq_rm(ctx, slot.id, draft_start_pos + ki + 1, -1);
+            // Truncate cache_tokens to accepted prefix, replace last with sharp token
+            slot.cache_tokens.resize(draft_start_cache_size + ki);
+            slot.cache_tokens.push_back(sharp_tok);
+            // Set slot.sampled to the sharp token for next iteration
+            slot.sampled = sharp_tok;
+            n_accepted++; // the sharp token counts as accepted
+            break;
+        }
+    }
+
+    // If all matched, set sampled to last drafted token for next round
+    if (n_accepted == n_drafted) {
+        slot.sampled = drafted_tokens.back();
+    }
+
+    // Emit accepted tokens
+    for (int ki = 0; ki < n_accepted; ki++) {
+        llama_token tok = (ki < n_accepted - 1) ? drafted_tokens[ki] :
+                          slot.sampled; // last one might be sharp's correction
+        completion_token_output result;
+        result.tok = tok;
+        // TODO: fill probabilities if needed
+        process_token(result, slot);
+        slot.n_decoded++;
+    }
+
+    spec_delta_n_accept += n_accepted;
+    spec_delta_n_draft += n_drafted;
+
+    static int spec_diag = 0;
+    if (spec_diag < 10) {
+        spec_diag++;
+        fprintf(stderr, "[spec-delta] drafted=%d accepted=%d (%.0f%%) total_accept=%d total_draft=%d\n",
+                n_drafted, n_accepted, 100.0 * n_accepted / std::max(1, n_drafted),
+                spec_delta_n_accept, spec_delta_n_draft);
+    }
+
+    return true;
+}
+
 void server_context::update_slots() {
     if (system_need_update) {
         system_prompt_update();
@@ -5235,6 +5398,13 @@ void server_context::update_slots() {
                 prompt_kv_repair(slot);
             }
         }
+    }
+
+    // Self-speculative delta: draft K tokens blurry-only, batch-verify with delta.
+    // Handles its own batch creation, decode, and token emission.
+    if (spec_delta_step()) {
+        LOG_VERBOSE("run slots completed (spec-delta)", {});
+        return;
     }
 
     // start populating the batch for this iteration

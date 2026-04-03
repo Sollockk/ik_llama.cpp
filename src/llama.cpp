@@ -8614,6 +8614,18 @@ void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn) {
     ctx->cparams.causal_attn = causal_attn;
 }
 
+void llama_set_delta_enabled(struct llama_context * ctx, bool enabled) {
+#ifdef GGML_USE_CUDA
+    for (auto * be : ctx->backends) {
+        if (ggml_backend_is_cuda(be)) {
+            ggml_backend_cuda_set_delta_ready(be, enabled);
+        }
+    }
+#else
+    (void)ctx; (void)enabled;
+#endif
+}
+
 void llama_set_skip_layers(
         struct llama_context * ctx,
         const int32_t        * layer_indices,

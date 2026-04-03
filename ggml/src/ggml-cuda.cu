@@ -2420,37 +2420,38 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
                 }
             }
         }
-        // Priority 2: Prefetched swing buffer (VRAM, fast) or PCIe fallback (slow)
+        // Priority 2: Ring buffer (VRAM) or PCIe fallback
         else if (delta_src0 && delta_src0->ray_march_delta_cache != NULL
             && is_gemv && ctx.delta_ready
             && delta_src0->buffer && !ggml_backend_buffer_is_host(delta_src0->buffer)
             && !skip
-            && (!ctx.delta_prefetch.queue_built || ctx.delta_prefetch.queue_pos < (int)ctx.delta_prefetch.queue.size())) {
+            && ctx.delta_ring.vram
+            && (!ctx.delta_ring.built || ctx.delta_ring.dispatch_count < (int)ctx.delta_ring.all_tensors.size())) {
 
             struct pim_delta_cache * cache = (struct pim_delta_cache *)delta_src0->ray_march_delta_cache;
-            auto & pf = ctx.delta_prefetch;
+            auto & ring = ctx.delta_ring;
             const char * delta_ptr = nullptr;
             const char * source = "pcie";
             const int64_t ne00 = delta_src0->ne[0];
             const int64_t ne01 = delta_src0->ne[1];
 
-            // O(1) map lookup: is this tensor in a prefetched swing buffer?
-            auto map_it = pf.active_map.find(delta_src0);
-            if (map_it != pf.active_map.end()) {
-                if (pf.pending) {
-                    CUDA_CHECK(cudaStreamWaitEvent(stream, pf.done, 0));
-                    pf.pending = false;
+            // O(1) ring buffer lookup
+            auto map_it = ring.tensor_map.find(delta_src0);
+            if (map_it != ring.tensor_map.end() && ring.filled) {
+                // Wait for initial fill if still pending
+                if (ring.fill_pending) {
+                    CUDA_CHECK(cudaStreamWaitEvent(stream, ring.fill_done, 0));
+                    ring.fill_pending = false;
                 }
-                delta_ptr = (const char *)pf.buf[map_it->second.first] + map_it->second.second;
-                source = "prefetched";
+                delta_ptr = (const char *)ring.vram + map_it->second;
+                source = "ring";
+                ring.n_hits++;
             }
             // Fallback: PCIe zero-copy from mmap
             if (!delta_ptr) {
                 delta_ptr = pim_delta_cache_get(cache, 0);
                 source = "pcie";
-                pf.n_misses++;
-            } else if (source[0] == 'p') { // "prefetched"
-                pf.n_hits++;
+                ring.n_misses++;
             }
 
             if (delta_ptr && ggml_cuda_mmvq_type_supported(delta_src0->ray_march_delta_type)) {
@@ -2468,7 +2469,7 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
                     /* ncols_x   */ (int)ne00,
                     /* nrows_x   */ (int)ne01,
                     /* nrows_y   */ (int)ne10_padded,
-                    /* ncols_y   */ 1,
+                    /* ncols_y   */ (int)src1->ne[1],
                     /* nrows_dst */ (int)dst->ne[0],
                     /* ne2       */ 1,
                     /* nb02      */ (uint64_t)(ne01 * delta_nb01),
@@ -2483,61 +2484,18 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
 
                 ggml_cuda_mmvq_dispatch(delta_type, delta_args, stream);
 
-                // Build queue during first token (record execution order)
-                if (!pf.queue_built) {
+                // Build tensor list during first gen token
+                if (!ring.built) {
                     const char * hp = pim_delta_cache_get(cache, 0);
-                    size_t bytes = (size_t)ne01 * delta_nb01;
-                    pf.queue.push_back({delta_src0, hp, bytes});
+                    ring.all_tensors.push_back({delta_src0, hp, (size_t)ne01 * delta_nb01});
                 }
-
-                // Advance queue position
-                if (pf.queue_built) {
-                    pf.queue_pos++;
-
-                    // Batch prefetch: every 5 tensors (layer boundary), DMA next 5
-                    // into alternate swing buffer. 5 tensors ≈ 75MB, 3ms DMA, hidden
-                    // behind 10ms layer compute.
-                    if (pf.buf[0] && (pf.queue_pos % 5) == 0) {
-                        int batch_start = pf.queue_pos;
-                        int batch_end = std::min(batch_start + 5, (int)pf.queue.size());
-                        if (batch_start < (int)pf.queue.size()) {
-                            // Check total batch size fits in buffer
-                            size_t total = 0;
-                            for (int bi = batch_start; bi < batch_end; bi++) total += pf.queue[bi].bytes;
-                            if (total <= pf.buf_size) {
-                                pf.cur_buf = 1 - pf.cur_buf;
-                                size_t offset = 0;
-                                auto upload_stream = ctx.jit_upload_stream();
-                                // Clear old entries for this buffer
-                                for (auto it = pf.active_map.begin(); it != pf.active_map.end(); ) {
-                                    if (it->second.first == pf.cur_buf) it = pf.active_map.erase(it);
-                                    else ++it;
-                                }
-                                for (int bi = batch_start; bi < batch_end; bi++) {
-                                    auto & nxt = pf.queue[bi];
-                                    if (nxt.host_ptr) {
-                                        CUDA_CHECK(cudaMemcpyAsync((char *)pf.buf[pf.cur_buf] + offset,
-                                                                   nxt.host_ptr, nxt.bytes,
-                                                                   cudaMemcpyHostToDevice, upload_stream));
-                                        pf.active_map[nxt.src0] = {pf.cur_buf, offset};
-                                        offset += nxt.bytes;
-                                    }
-                                }
-                                CUDA_CHECK(cudaEventRecord(pf.done, upload_stream));
-                                pf.pending = true;
-                            }
-                        }
-                    }
-                }
+                ring.dispatch_count++;
 
                 static int diag = 0;
                 if (diag < 10) { diag++;
-                    fprintf(stderr, "[gpu-delta-mmvq] %s ne=[%lld,%lld] delta=%s src=%s qpos=%d/%d\n",
-                            delta_src0->name, (long long)ne00, (long long)ne01,
-                            ggml_type_name(delta_type), source,
-                            pf.queue_pos, (int)pf.queue.size());
-                }
-            }
+                    fprintf(stderr, "[gpu-delta-ring] %s ne=[%lld,%lld] src=%s\n",
+                            delta_src0->name, (long long)ne00, (long long)ne01, source);
+                }            }
         }
     }
 
@@ -2660,7 +2618,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     }
 
     // CPU delta correction for non-quantized paths (f16/f32 weights)
-    if (src0->ray_march_delta_cache != NULL && src1->ne[1] <= 4) {
+    if (src0->ray_march_delta_cache != NULL && src1->ne[1] <= 4 && ctx.delta_ready) {
         // Only for small batches (TG). For large batches (PP), skip delta.
         const int64_t ne00 = src0->ne[0]; // input dim (n_embd or n_ff)
         const int64_t ne01 = src0->ne[1]; // output dim (n_ff or n_embd)
@@ -4605,14 +4563,53 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
     auto graph = ggml_cuda_get_graph(*cuda_ctx, ggml_cuda_graph_get_key(cgraph));
 #endif
 
-    // Delta prefetch queue management
-    auto & pf = cuda_ctx->delta_prefetch;
-
-    // Queue management moved to ggml_backend_cuda_graph_compute (once per token)
+    // Delta ring buffer: build tensor list (first token), fill VRAM (second token)
+    auto & ring = cuda_ctx->delta_ring;
+    if (cuda_ctx->delta_ready && ring.vram) {
+        // After first gen token fills the tensor list, do one-time VRAM upload
+        if (ring.built && !ring.filled && !ring.all_tensors.empty()) {
+            size_t offset = 0;
+            auto upload_stream = cuda_ctx->jit_upload_stream();
+            int n_loaded = 0;
+            for (auto & e : ring.all_tensors) {
+                if (offset + e.bytes > ring.vram_size) break; // buffer full
+                if (e.host_ptr) {
+                    CUDA_CHECK(cudaMemcpyAsync((char *)ring.vram + offset, e.host_ptr,
+                                               e.bytes, cudaMemcpyHostToDevice, upload_stream));
+                    ring.tensor_map[e.src0] = offset;
+                    offset += e.bytes;
+                    n_loaded++;
+                }
+            }
+            CUDA_CHECK(cudaEventRecord(ring.fill_done, upload_stream));
+            ring.fill_pending = true;
+            ring.filled = true;
+            fprintf(stderr, "[delta-ring] filled %d/%zu tensors (%.1f MB) into VRAM\n",
+                    n_loaded, ring.all_tensors.size(), offset / (1024.0 * 1024.0));
+        }
+        // Mark built after first gen token provides enough tensors
+        if (!ring.built && ring.all_tensors.size() >= 20) {
+            ring.built = true;
+            ring.dispatch_count = (int)ring.all_tensors.size(); // force no double-dispatch on build token
+            fprintf(stderr, "[delta-ring] tensor list built: %zu tensors\n", ring.all_tensors.size());
+        }
+        // Token boundary: reset dispatch count
+        if (ring.filled && ring.dispatch_count >= (int)ring.all_tensors.size()) {
+            // Print stats
+            static int stat_diag = 0;
+            if (stat_diag < 5 && (ring.n_hits + ring.n_misses) > 0) {
+                stat_diag++;
+                fprintf(stderr, "[delta-ring] token: hits=%d misses=%d (%.0f%%)\n",
+                        ring.n_hits, ring.n_misses,
+                        100.0 * ring.n_hits / std::max(1, ring.n_hits + ring.n_misses));
+            }
+            ring.dispatch_count = 0;
+            ring.n_hits = 0;
+            ring.n_misses = 0;
+        }
+    }
 
     while (!graph_evaluated_or_captured) {
-        // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
-        // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4625,10 +4622,6 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                     GGML_CUDA_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
-
-                // (prefetch now handled via queue in ggml_cuda_mul_mat_q, not here)
-                if (false) {
-                }
             }
         }
 #ifdef USE_CUDA_GRAPH
@@ -4670,57 +4663,7 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
 
     ggml_cuda_set_device(cuda_ctx->device);
 
-    // Delta prefetch: detect new token via queue_pos wraparound
-    {
-        auto & pf = cuda_ctx->delta_prefetch;
-        // Mark queue built after a generation token fills it (expect 50+ entries)
-        if (cuda_ctx->delta_ready && !pf.queue_built && pf.queue.size() >= 20) {
-            pf.queue_built = true;
-            pf.queue_pos = (int)pf.queue.size(); // force wraparound on next call → prefetch first batch
-            fprintf(stderr, "[delta-prefetch] queue built: %zu tensors\n", pf.queue.size());
-        }
-        // If queue was polluted by prompt (< 20 entries), clear it for generation to rebuild
-        if (cuda_ctx->delta_ready && !pf.queue_built && !pf.queue.empty() && pf.queue.size() < 20) {
-            // Check if this looks like a new generation pass (queue_pos beyond current size)
-            if (pf.queue_pos >= (int)pf.queue.size()) {
-                pf.queue.clear();
-                pf.queue_pos = 0;
-            }
-        }
-        // Detect new token: queue_pos past end → print stats and reset
-        if (pf.queue_built && pf.buf[0] && pf.queue_pos >= (int)pf.queue.size()) {
-            // Print hit rate for previous token
-            static int token_diag = 0;
-            if (token_diag < 5 && (pf.n_hits + pf.n_misses) > 0) {
-                token_diag++;
-                fprintf(stderr, "[delta-prefetch] token stats: hits=%d misses=%d (%.0f%% hit rate)\n",
-                        pf.n_hits, pf.n_misses,
-                        100.0 * pf.n_hits / (pf.n_hits + pf.n_misses + 1));
-            }
-            pf.n_hits = 0;
-            pf.n_misses = 0;
-            pf.queue_pos = 0;
-            pf.pending = false;
-            pf.cur_buf = 0;
-            pf.active_map.clear();
-            // Prefetch first 5 tensors (one layer's worth)
-            int batch_end = std::min(5, (int)pf.queue.size());
-            size_t offset = 0;
-            auto upload_stream = cuda_ctx->jit_upload_stream();
-            for (int bi = 0; bi < batch_end; bi++) {
-                auto & e = pf.queue[bi];
-                if (e.host_ptr && offset + e.bytes <= pf.buf_size) {
-                    CUDA_CHECK(cudaMemcpyAsync((char *)pf.buf[0] + offset,
-                                               e.host_ptr, e.bytes,
-                                               cudaMemcpyHostToDevice, upload_stream));
-                    pf.active_map[e.src0] = {0, offset};
-                    offset += e.bytes;
-                }
-            }
-            CUDA_CHECK(cudaEventRecord(pf.done, upload_stream));
-            pf.pending = true;
-        }
-    }
+    // (ring buffer management in evaluate_and_capture_cuda_graph)
 
 #ifdef USE_CUDA_GRAPH
     cuda_ctx->cur_graph = nullptr;
@@ -5680,6 +5623,11 @@ void ggml_backend_cuda_disable_graphs(ggml_backend_t backend) {
 #endif
 }
 
+void ggml_backend_cuda_set_delta_ready(ggml_backend_t backend, bool ready) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)backend->context;
+    ctx->delta_ready = ready;
+}
+
 // Delta worker thread function
 static void delta_worker_func(ggml_backend_cuda_context * ctx) {
     auto & pipe = ctx->delta_pipe;
@@ -5741,6 +5689,11 @@ static void delta_worker_func(ggml_backend_cuda_context * ctx) {
         pipe.has_work.store(false);
         pipe.has_result.store(true);
     }
+}
+
+void ggml_backend_cuda_set_delta_vram_budget(ggml_backend_t backend, int mb) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)backend->context;
+    ctx->delta_vram_budget = mb;
 }
 
 void ggml_backend_cuda_enable_delta_post_graph(ggml_backend_t backend, bool enable) {
@@ -5809,23 +5762,49 @@ void ggml_backend_cuda_enable_delta_post_graph(ggml_backend_t backend, bool enab
                 result_n * sizeof(float) / 1024);
     }
 
-    // Swing buffer prefetch: two VRAM buffers for async DMA from host
-    auto & pf = ctx->delta_prefetch;
-    if (enable && !pf.buf[0]) {
+    // Ring buffer: single VRAM allocation for delta cache.
+    auto & ring = ctx->delta_ring;
+    if (enable && !ring.vram) {
         ggml_cuda_set_device(ctx->device);
-        const size_t swing_size = 150 * 1024 * 1024; // 150MB — covers full layer delta (~140MB for 5 tensors)
-        cudaError_t e0 = cudaMalloc(&pf.buf[0], swing_size);
-        cudaError_t e1 = cudaMalloc(&pf.buf[1], swing_size);
-        if (e0 == cudaSuccess && e1 == cudaSuccess) {
-            pf.buf_size = swing_size;
-            CUDA_CHECK(cudaEventCreateWithFlags(&pf.done, cudaEventDisableTiming));
-            fprintf(stderr, "[cuda-delta] swing buffers allocated: 2x%.0fMB VRAM\n",
-                    swing_size / (1024.0 * 1024.0));
+
+        // Use configured budget, or try descending sizes
+        if (ctx->delta_vram_budget > 0) {
+            size_t sz = (size_t)ctx->delta_vram_budget * 1024 * 1024;
+            cudaError_t err = cudaMalloc(&ring.vram, sz);
+            if (err == cudaSuccess) {
+                ring.vram_size = sz;
+            } else {
+                cudaGetLastError();
+                fprintf(stderr, "[cuda-delta] WARNING: ring buffer alloc of %d MB failed\n",
+                        ctx->delta_vram_budget);
+            }
         } else {
-            if (pf.buf[0]) { cudaFree(pf.buf[0]); pf.buf[0] = nullptr; }
-            if (pf.buf[1]) { cudaFree(pf.buf[1]); pf.buf[1] = nullptr; }
-            cudaGetLastError();
-            fprintf(stderr, "[cuda-delta] WARNING: swing buffer alloc failed\n");
+            // Auto: try descending sizes
+            const size_t sizes[] = {
+                (size_t)6ULL * 1024 * 1024 * 1024,
+                (size_t)4ULL * 1024 * 1024 * 1024,
+                (size_t)2ULL * 1024 * 1024 * 1024,
+                (size_t)1ULL * 1024 * 1024 * 1024,
+                512ULL * 1024 * 1024
+            };
+            for (size_t sz : sizes) {
+                cudaError_t err = cudaMalloc(&ring.vram, sz);
+                if (err == cudaSuccess) {
+                    ring.vram_size = sz;
+                    break;
+                }
+                cudaGetLastError();
+                ring.vram = nullptr;
+            }
+        }
+
+        if (ring.vram) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ring.fill_done, cudaEventDisableTiming));
+            fprintf(stderr, "[cuda-delta] ring buffer allocated: %.0f MB VRAM\n",
+                    ring.vram_size / (1024.0 * 1024.0));
+        } else {
+            fprintf(stderr, "[cuda-delta] WARNING: ring buffer alloc failed, GPU delta disabled\n");
+            ctx->delta_ready = false;
         }
     }
 }

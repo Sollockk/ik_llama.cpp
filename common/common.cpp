@@ -2335,6 +2335,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.bs_spec_draft = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--spec-delta-k") {
+        CHECK_ARG
+        params.spec_delta_k = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "--bs-prompt-repair") {
         CHECK_ARG
         params.bs_prompt_repair = std::stoi(argv[i]);
@@ -2409,6 +2414,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "--delta") {
         CHECK_ARG
         params.delta_paths.push_back(argv[i]);
+        return true;
+    }
+    if (arg == "--delta-vram") {
+        CHECK_ARG
+        params.delta_vram_mb = std::atoi(argv[i]);
         return true;
     }
     if (arg == "--gpu-delta-priority") {
