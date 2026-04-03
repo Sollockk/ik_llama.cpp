@@ -5,6 +5,9 @@
 
 #include "common.h"
 #include "llama.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 #include "llama-streaming.h"
 
 #include <unordered_set>
@@ -575,10 +578,20 @@ bool server_context::load_model(const gpt_params& params_) {
             // for post-graph CPU ray march correction.
             int32_t n_wired = llama_blurry_sharp_wire_delta_tensors(bsctx);
             LOG_INFO("Delta-only PIM: expert tensors wired", {{"n_wired", n_wired}});
-            // Graph-level delta tensors DISABLED — causes 338 graph splits and NaN.
-            // Using inline cooperative CPU+GPU delta in ggml_cuda_mul_mat_q instead.
-            // int32_t n_graph = llama_blurry_sharp_create_graph_delta_tensors(bsctx);
-            // LOG_INFO("Delta graph tensors created", {{"n_graph", n_graph}});
+
+            // Disable CUDA graphs at init when delta is active.
+            // Cooperative delta uses cudaMemcpy which is incompatible with graph capture.
+            // Must disable at init (not mid-computation) to avoid partial graph state NaN.
+#ifdef GGML_USE_CUDA
+            if (n_wired > 0) {
+                extern std::vector<ggml_backend_t> & llama_get_backends(llama_context * ctx);
+                for (auto * be : llama_get_backends(ctx)) {
+                    if (!ggml_backend_is_cpu(be)) {
+                        ggml_backend_cuda_disable_graphs(be);
+                    }
+                }
+            }
+#endif
 
             // Note: GPU delta upgrade via requantization is disabled — requanting
             // dequant(blurry)+dequant(delta) back to blurry type destroys the correction.

@@ -16988,10 +16988,10 @@ static int ggml_compute_forward_mul_mat(
             }
         }
 
-        // ---- Dense delta correction: DISABLED ----
-        // CPU delta handled by post-graph pass for GPU tensors.
-        // CPU-only tensors (layers 0-19) skip delta — applying during prompt causes NaN.
-        if (false && has_delta_dense) {
+        // ---- Dense delta correction: additive pass after IQK blurry matmul ----
+        // For CPU-resident tensors. Generation only (small batch) — prompt batches
+        // produce NaN due to multi-threaded accumulation issues with large ne11.
+        if (has_delta_dense && ne11 <= 4) {
             const enum ggml_type ray_march_delta_type = src0->ray_march_delta_type;
             ggml_type_traits_t delta_traits = ggml_internal_get_type_traits(ray_march_delta_type);
 

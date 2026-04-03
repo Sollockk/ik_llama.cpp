@@ -67,6 +67,11 @@ GGML_API bool ggml_backend_cuda_pin_host_memory(void * ptr, size_t size);
 GGML_API void ggml_backend_cuda_enable_delta_post_graph(ggml_backend_t backend, bool enable);
 GGML_API void ggml_backend_cuda_unpin_host_memory(void * ptr);
 
+// Disable CUDA graph capture/replay at init time (clean disable).
+// Call when delta correction is active — cooperative delta requires host sync
+// which is incompatible with graph capture. Must be called BEFORE first graph eval.
+GGML_API void ggml_backend_cuda_disable_graphs(ggml_backend_t backend);
+
 #ifdef  __cplusplus
 }
 #endif

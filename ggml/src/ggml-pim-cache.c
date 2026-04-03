@@ -28,14 +28,11 @@ struct pim_delta_cache * pim_delta_cache_create(
     cache->n_experts    = n_experts;
     memset(cache->populated, 0, sizeof(cache->populated));
 
-    // Allocate heap buffer for all experts (virtual only, no physical pages yet)
-    size_t total = expert_bytes * (size_t)n_experts;
-    cache->heap_buf = (char *)malloc(total);
-    if (!cache->heap_buf) {
-        // Fallback: will use mmap_ptr directly
-        fprintf(stderr, "[pim-cache] warning: failed to allocate %zu MiB heap buffer, using mmap fallback\n",
-                total / (1024*1024));
-    }
+    // Use mmap fallback instead of heap allocation.
+    // Allocating heap buffers for all delta tensors (~16GB) causes memory pressure
+    // that corrupts GPU operations on systems with limited RAM headroom.
+    // The mmap path reads directly from the delta GGUF via kernel page cache.
+    cache->heap_buf = NULL;
 
     return cache;
 }

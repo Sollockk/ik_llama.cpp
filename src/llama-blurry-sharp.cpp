@@ -6767,10 +6767,10 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
                        __func__, n_wired);
     }
 
-    // GPU pinning disabled — post-graph CPU delta correction doesn't need pinned memory.
-    // Pinning 553 caches consumed too much CUDA address space and caused NaN.
+    // GPU pinning disabled — causes NaN on RTX 3090 (too many cudaHostRegister calls).
+    // The CPU ray march delta path uses cudaMemcpy instead of zero-copy.
 #ifdef GGML_USE_CUDA
-    LLAMA_LOG_INFO("%s: GPU pinning skipped — using post-graph CPU delta correction\n", __func__);
+    LLAMA_LOG_INFO("%s: GPU pinning skipped (CPU delta path uses cudaMemcpy)\n", __func__);
 #endif
 
     return n_wired;
