@@ -2262,6 +2262,9 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
     }
 }
 
+// Forward declaration — defined below k_copy_src_to_contiguous
+static __global__ void k_delta_add_f32(float * __restrict__ dst, const float * __restrict__ delta, const int n);
+
 static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n, bool is_gemv) {
 
@@ -2362,112 +2365,147 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
         ++node_n;
     }
 
-    // ---- GPU Delta Correction: additive pass via zero-copy from pinned host memory ----
-    // After blurry matmul computed dst, add delta@input using MMVQ with accumulate=true.
-    // Delta weights are read from pinned CPU RAM via PCIe (zero VRAM cost).
-    // Only applies to the FIRST src0 (the original tensor, not fused successors).
+    // ---- GPU Delta Correction: CPU ray march → pinned staging → CUDA add kernel ----
+    // Never reads dst from GPU. CPU computes delta into pinned staging buffer,
+    // then tiny CUDA kernel adds it to dst. Avoids corruption from bias fusion / stride issues.
     {
-        // Use the original src0 (weight tensor), not dst->src[0] which may point
-        // to a fused successor's src0 (an intermediate tensor like Qcur).
         const ggml_tensor * delta_src0 = src0;
 
-        if (delta_src0 && delta_src0->ray_march_delta_cache != NULL) {
-            struct pim_delta_cache * cache = (struct pim_delta_cache *)delta_src0->ray_march_delta_cache;
-
-            // CPU ray march delta with block-energy skipping.
-            // CUDA graphs are disabled when delta is active (see graph compat check).
-            // Only run after init is complete (delta_post_graph_enabled flag).
-            // Skip prompt batches (is_gemv is false for large batches).
-            {
-                static int inline_diag = 0;
-                if (inline_diag < 5) {
-                    inline_diag++;
-                    fprintf(stderr, "[inline-delta-check] %s: is_gemv=%d heap=%d enabled=%d ne1=%lld\n",
-                            delta_src0->name, (int)is_gemv, (int)(cache->heap_buf != nullptr),
-                            (int)ctx.delta_post_graph_enabled, (long long)src1->ne[1]);
-                }
+        // Debug: log buffer type for ALL delta tensors that reach this point
+        if (delta_src0 && delta_src0->ray_march_delta_cache != NULL && is_gemv) {
+            static int buf_diag = 0;
+            if (buf_diag < 50) {
+                buf_diag++;
+                bool is_host = delta_src0->buffer ? ggml_backend_buffer_is_host(delta_src0->buffer) : true;
+                fprintf(stderr, "[gpu-delta-buf] %s: buffer=%s is_host=%d\n",
+                        delta_src0->name,
+                        delta_src0->buffer ? ggml_backend_buffer_name(delta_src0->buffer) : "null",
+                        (int)is_host);
             }
-            if (is_gemv && cache->heap_buf) {
-                const ggml_type delta_type = delta_src0->ray_march_delta_type;
-                const ggml_type_traits_t delta_traits = ggml_internal_get_type_traits(delta_type);
-                const char * delta_ptr = pim_delta_cache_get(cache, 0);
-                if (delta_ptr && delta_traits.vec_dot) {
-                    const int64_t ne00 = delta_src0->ne[0];
-                    const int64_t ne01 = delta_src0->ne[1];
-                    const int64_t ne11 = src1->ne[1];
-                    const size_t delta_row_stride = ggml_row_size(delta_type, ne00);
+        }
 
-                    // 1. Copy tiny input activations from GPU to CPU
-                    std::vector<float> input_f32(ne00 * ne11);
-                    CUDA_CHECK(cudaMemcpy(input_f32.data(), src1->data,
-                                          ne00 * ne11 * sizeof(float), cudaMemcpyDeviceToHost));
+        // GPU delta staging: only for GPU-resident weight tensors, generation only, after init.
+        // Skip ffn_gate and ffn_up: their delta is applied AFTER the blurry activation (gelu/silu),
+        // so gelu(blurry) + delta ≠ gelu(blurry + delta). Only ffn_down and attention are safe.
+        bool skip_due_to_activation = false;
+        if (delta_src0 && delta_src0->name[0] != '\0') {
+            const char * n = delta_src0->name;
+            skip_due_to_activation = (strstr(n, "ffn_gate") != nullptr || strstr(n, "ffn_up") != nullptr
+                || strstr(n, "attn_q.") != nullptr || strstr(n, "attn_k.") != nullptr
+                || strstr(n, "attn_v.") != nullptr);
+        }
+        if (delta_src0 && delta_src0->ray_march_delta_cache != NULL
+            && is_gemv && ctx.delta_ready && ctx.delta_staging
+            && delta_src0->buffer && !ggml_backend_buffer_is_host(delta_src0->buffer)
+            && !skip_due_to_activation) {
 
-                    // 2. Quantize input as standard Q8_0 (IK vec_dot accepts Q8_0)
-                    const ggml_type delta_input_type = GGML_TYPE_Q8_0;
-                    const ggml_type_traits_t dit = ggml_internal_get_type_traits(delta_input_type);
-                    const size_t dinput_row_size = ggml_row_size(delta_input_type, ne00);
-                    std::vector<uint8_t> dinput_buf(dinput_row_size * ne11);
-                    for (int64_t t = 0; t < ne11; t++) {
-                        dit.from_float(input_f32.data() + t * ne00,
-                                       dinput_buf.data() + t * dinput_row_size, ne00);
-                    }
+            struct pim_delta_cache * cache = (struct pim_delta_cache *)delta_src0->ray_march_delta_cache;
+            const ggml_type delta_type = delta_src0->ray_march_delta_type;
+            const ggml_type_traits_t delta_traits = ggml_internal_get_type_traits(delta_type);
+            const char * delta_ptr = pim_delta_cache_get(cache, 0);
 
-                    // 3. Block energy scan + ray march partition
+            if (delta_ptr && delta_traits.vec_dot) {
+                const int64_t ne00 = delta_src0->ne[0];
+                const int64_t ne01 = delta_src0->ne[1];
+                const size_t delta_row_stride = ggml_row_size(delta_type, ne00);
+
+                if ((size_t)ne01 <= ctx.delta_staging_n) {
+                    // 1. Copy input D2H (tiny: ne00 floats ≈ 21KB)
+                    std::vector<float> input_f32(ne00);
+                    CUDA_CHECK(cudaMemcpyAsync(input_f32.data(), src1->data,
+                                               ne00 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                    // 2. Quantize input for delta vec_dot (Q8_0)
+                    const ggml_type dinput_type = GGML_TYPE_Q8_0;
+                    const size_t dinput_size = ggml_row_size(dinput_type, ne00);
+                    std::vector<uint8_t> dinput(dinput_size);
+                    ggml_internal_get_type_traits(dinput_type).from_float(
+                        input_f32.data(), dinput.data(), ne00);
+
+                    // 3. Block energy scan + partition
                     const int rm_block_size = (int)ggml_blck_size(delta_type);
                     const int rm_n_blocks = (rm_block_size > 0 && ne00 % rm_block_size == 0)
                         ? (int)(ne00 / rm_block_size) : 0;
 
-                    // 4. Wait for GPU blurry matmul to finish, read dst
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
-                    std::vector<float> dst_data(ne01 * ne11);
-                    CUDA_CHECK(cudaMemcpy(dst_data.data(), dst->data,
-                                          ne01 * ne11 * sizeof(float), cudaMemcpyDeviceToHost));
+                    std::vector<int> rm_active(rm_n_blocks > 0 ? rm_n_blocks : 1);
+                    struct ggml_ray_march_tiers tiers = {};
+                    tiers.active_blocks = rm_active.data();
+                    tiers.n_total = rm_n_blocks;
 
-                    // 5. Per-token: energy scan + parallel delta vec_dot
-                    for (int64_t t = 0; t < ne11; t++) {
-                        int rm_active[512];
-                        struct ggml_ray_march_tiers tiers = {};
-                        tiers.active_blocks = rm_active;
-                        tiers.n_total = rm_n_blocks;
+                    if (rm_n_blocks > 0) {
+                        std::vector<float> energies(rm_n_blocks);
+                        ggml_ray_march_block_energies(input_f32.data(), energies.data(),
+                                                      (int)ne00, rm_block_size);
+                        float e_sum = 0.0f;
+                        for (int b = 0; b < rm_n_blocks; b++) e_sum += energies[b];
+                        ggml_ray_march_partition_blocks(energies.data(), rm_n_blocks,
+                                                       e_sum / rm_n_blocks * 0.01f, &tiers);
+                    } else {
+                        for (int b = 0; b < rm_n_blocks; b++) rm_active.data()[tiers.n_active++] = b;
+                    }
 
-                        if (rm_n_blocks > 0 && rm_n_blocks <= 512) {
-                            float energies[512];
-                            ggml_ray_march_block_energies(input_f32.data() + t * ne00,
-                                                          energies, (int)ne00, rm_block_size);
-                            float e_sum = 0.0f;
-                            for (int b = 0; b < rm_n_blocks; b++) e_sum += energies[b];
-                            ggml_ray_march_partition_blocks(energies, rm_n_blocks,
-                                                           e_sum / rm_n_blocks * 0.01f, &tiers);
-                        } else {
-                            for (int b = 0; b < rm_n_blocks; b++) rm_active[tiers.n_active++] = b;
+                    // 4. CPU ray march delta → host buffer
+                    std::vector<float> host_staging(ne01, 0.0f);
+
+                    // DEBUG: check input + delta for NaN/inf
+                    {
+                        int n_nan = 0, n_inf = 0;
+                        for (int64_t i = 0; i < ne00 && i < 100; i++) {
+                            if (std::isnan(input_f32[i])) n_nan++;
+                            if (std::isinf(input_f32[i])) n_inf++;
                         }
-
-                        const void * dinput_row = dinput_buf.data() + t * dinput_row_size;
-
-                        #pragma omp parallel for schedule(static) num_threads(8)
-                        for (int64_t j = 0; j < ne01; j++) {
-                            float dv = 0.0f;
-                            ggml_vec_dot_ray_march(
-                                (int)ne00, &dv,
-                                delta_ptr + j * delta_row_stride, (int)delta_type,
-                                nullptr, (ggml_ray_march_type)0,
-                                dinput_row, nullptr,
-                                &tiers, rm_block_size);
-                            dst_data[t * ne01 + j] += dv;
+                        // Also check first delta row raw bytes are non-zero
+                        int n_zero_bytes = 0;
+                        for (int i = 0; i < 32 && i < (int)delta_row_stride; i++) {
+                            if (delta_ptr[i] == 0) n_zero_bytes++;
                         }
-
-                        static int diag = 0;
-                        if (diag < 3) {
-                            diag++;
-                            fprintf(stderr, "[cpu-delta] %s: ne=[%lld,%lld] skip=%.0f%%\n",
-                                    delta_src0->name, (long long)ne00, (long long)ne01,
-                                    rm_n_blocks > 0 ? 100.0f * tiers.n_skip / rm_n_blocks : 0.0f);
+                        static int vd_diag = 0;
+                        if (vd_diag < 3) {
+                            vd_diag++;
+                            // Test single vec_dot
+                            float test_dv = 0.0f;
+                            ggml_internal_get_type_traits(delta_type).vec_dot(
+                                (int)ne00, &test_dv, 0,
+                                delta_ptr, 0, dinput.data(), 0, 1);
+                            fprintf(stderr, "[delta-debug] %s: input nan=%d inf=%d first=%.4f "
+                                    "delta_zero_bytes=%d/32 test_dot=%.4f src1_type=%s\n",
+                                    delta_src0->name, n_nan, n_inf, input_f32[0],
+                                    n_zero_bytes, test_dv,
+                                    ggml_type_name(src1->type));
                         }
                     }
 
-                    // 6. Write corrected result back to GPU
-                    CUDA_CHECK(cudaMemcpy(dst->data, dst_data.data(),
-                                          ne01 * ne11 * sizeof(float), cudaMemcpyHostToDevice));
+                    #pragma omp parallel for schedule(static) num_threads(8)
+                    for (int64_t j = 0; j < ne01; j++) {
+                        float dv = 0.0f;
+                        ggml_vec_dot_ray_march(
+                            (int)ne00, &dv,
+                            delta_ptr + j * delta_row_stride, (int)delta_type,
+                            nullptr, (ggml_ray_march_type)0,
+                            dinput.data(), nullptr,
+                            &tiers, rm_block_size);
+                        host_staging[j] = dv;
+                    }
+
+                    float * dev_staging = ctx.delta_staging;
+                    CUDA_CHECK(cudaMemcpyAsync(dev_staging, host_staging.data(),
+                                               ne01 * sizeof(float), cudaMemcpyHostToDevice, stream));
+                    const int block_sz = 256;
+                    const int n_blocks_k = ((int)ne01 + block_sz - 1) / block_sz;
+                    k_delta_add_f32<<<n_blocks_k, block_sz, 0, stream>>>(
+                        (float *)dst->data, dev_staging, (int)ne01);
+
+                    static int diag = 0;
+                    if (diag < 6) {
+                        diag++;
+                        bool is_h = delta_src0->buffer ? ggml_backend_buffer_is_host(delta_src0->buffer) : true;
+                        fprintf(stderr, "[gpu-delta-staging] %s: ne=[%lld,%lld] skip=%.0f%% buf=%s host=%d\n",
+                                delta_src0->name, (long long)ne00, (long long)ne01,
+                                rm_n_blocks > 0 ? 100.0f * tiers.n_skip / rm_n_blocks : 0.0f,
+                                delta_src0->buffer ? ggml_backend_buffer_name(delta_src0->buffer) : "null",
+                                (int)is_h);
+                    }
                 }
             }
         }
@@ -2711,6 +2749,14 @@ struct mmid_row_mapping {
     int32_t i1;
     int32_t i2;
 };
+
+// Tiny kernel: add pinned host delta result to GPU dst. Reads staging via PCIe zero-copy.
+static __global__ void k_delta_add_f32(float * __restrict__ dst, const float * __restrict__ delta, const int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] += delta[i];
+    }
+}
 
 template <typename data_t = float>
 static __global__ void k_copy_src_to_contiguous(const char * __restrict__ src_original, char * __restrict__ src_contiguous,
@@ -5533,8 +5579,24 @@ void ggml_backend_cuda_disable_graphs(ggml_backend_t backend) {
 void ggml_backend_cuda_enable_delta_post_graph(ggml_backend_t backend, bool enable) {
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)backend->context;
     ctx->delta_post_graph_enabled = enable;
-    if (enable) {
-        fprintf(stderr, "[cuda-delta] post-graph delta correction ENABLED\n");
+    ctx->delta_ready = enable;
+
+    // Allocate DEVICE staging buffer (VRAM, not pinned host).
+    // cudaMallocHost causes NaN due to memory pressure — use cudaMalloc instead.
+    // CPU delta result is copied to device via cudaMemcpy, then add kernel runs from VRAM.
+    if (enable && !ctx->delta_staging) {
+        const size_t staging_n = 32768; // 32K floats = 128KB VRAM
+        ggml_cuda_set_device(ctx->device);
+        cudaError_t err = cudaMalloc(&ctx->delta_staging, staging_n * sizeof(float));
+        if (err == cudaSuccess) {
+            ctx->delta_staging_n = staging_n;
+            fprintf(stderr, "[cuda-delta] device staging buffer allocated (%zu KB VRAM), delta_ready=true\n",
+                    staging_n * sizeof(float) / 1024);
+        } else {
+            cudaGetLastError();
+            ctx->delta_ready = false;
+            fprintf(stderr, "[cuda-delta] WARNING: cudaMalloc staging failed, GPU delta disabled\n");
+        }
     }
 }
 

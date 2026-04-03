@@ -852,7 +852,10 @@ struct ggml_backend_cuda_context {
 
     int   fusion = GGML_CUDA_FUSION;
     int   offload_batch_size = GGML_CUDA_MIN_BATCH_OFFLOAD;
-    bool delta_post_graph_enabled = false; // must be set true externally after init completes
+    bool delta_post_graph_enabled = false; // legacy — kept for compat
+    bool    delta_ready = false;       // set true after warmup completes — gates GPU delta
+    float * delta_staging = nullptr;   // pinned host buffer for CPU delta results (cudaMallocHost)
+    size_t  delta_staging_n = 0;       // allocated element count
     int   mmq_id_thresh = 32;
     float fa_offset = 0.6931f; // ln(2)
 #ifdef USE_CUDA_GRAPH
