@@ -308,7 +308,7 @@ void launch_fattn_tile_f16_64_128(ggml_backend_cuda_context & ctx, ggml_tensor *
             launch_fattn<D, D, parallel_blocks>(ctx, dst, fattn_kernel, nwarps, cols_per_block, true, true);
         } break;
         default: {
-            GGML_ABORT("FlashAttention without tensor cores only supports head sizes 64 and 128.");
+            GGML_ABORT("FlashAttention tile f16 only supports head sizes 64 and 128.");
         } break;
     }
 }

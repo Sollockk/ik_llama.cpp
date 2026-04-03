@@ -6785,6 +6785,28 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
     }
 #endif
 
+    // Pre-build GPU delta tensor list for ring buffer (avoids first-token miss).
+    // The actual DMA fill happens in enable_delta_post_graph (after ring buffer alloc).
+    {
+        bsctx->gpu_delta_fill_tensors.clear();
+        for (auto & [name, dinfo] : level.delta_index) {
+            if (!dinfo.base_tensor || !dinfo.base_tensor->ray_march_delta_cache) continue;
+            if (!dinfo.base_tensor->buffer || ggml_backend_buffer_is_host(dinfo.base_tensor->buffer)) continue;
+            if (dinfo.base_tensor->ne[1] <= 1) continue;
+            if (dinfo.base_tensor->name[0] && (strstr(dinfo.base_tensor->name, "ffn_gate") || strstr(dinfo.base_tensor->name, "ffn_up"))) continue;
+
+            struct pim_delta_cache * cache = (struct pim_delta_cache *)dinfo.base_tensor->ray_march_delta_cache;
+            const char * hp = pim_delta_cache_get(cache, 0);
+            if (!hp) continue;
+            size_t bytes = (size_t)dinfo.base_tensor->ne[1] * ggml_row_size(dinfo.type, dinfo.base_tensor->ne[0]);
+            bsctx->gpu_delta_fill_tensors.push_back({dinfo.base_tensor, hp, bytes});
+        }
+        if (!bsctx->gpu_delta_fill_tensors.empty()) {
+            LLAMA_LOG_INFO("%s: prepared %zu GPU tensors for ring buffer fill\n",
+                           __func__, bsctx->gpu_delta_fill_tensors.size());
+        }
+    }
+
     // Per-tensor VRAM upload REMOVED — ring buffer handles GPU delta.
 
     // CPU JIT Pre-Merge: build queue of CPU tensors for background merge.

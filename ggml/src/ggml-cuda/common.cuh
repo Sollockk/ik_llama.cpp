@@ -916,7 +916,7 @@ struct ggml_backend_cuda_context {
             size_t bytes;
         };
         std::vector<layer_entry> all_tensors; // all GPU delta tensors in execution order
-        bool   built = false;            // set after first gen token
+        bool   built = false;            // set after first gen token complete
         bool   filled = false;           // set after VRAM fill complete
         int    dispatch_count = 0;       // per-token dispatch counter
         int    n_hits = 0;

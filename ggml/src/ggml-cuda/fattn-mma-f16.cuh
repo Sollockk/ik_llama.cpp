@@ -1369,6 +1369,13 @@ void launch_fattn_mma(
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
+
+    // Opt-in to extended shared memory for large head dims (D=512 needs >48KB).
+    // Must be set before cudaOccupancyMaxActiveBlocksPerMultiprocessor and kernel launch.
+    if (nbytes_shared > 48*1024) {
+        CUDA_CHECK(cudaFuncSetAttribute(fattn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared));
+    }
+
     dim3 blocks_num;
     if (stream_k) {
         // For short contexts it can be faster to have the SMs work on whole tiles because this lets us skip the fixup.

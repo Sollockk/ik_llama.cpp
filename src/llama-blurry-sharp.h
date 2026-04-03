@@ -702,6 +702,14 @@ struct llama_blurry_sharp_context {
         // Lookup: tensor ptr → slot index
         std::unordered_map<const ggml_tensor *, int> ready_map;
     } jit_merge;
+
+    // Pre-built list of GPU delta tensors for ring buffer fill
+    struct gpu_delta_entry {
+        const ggml_tensor * tensor;
+        const char * host_ptr;
+        size_t bytes;
+    };
+    std::vector<gpu_delta_entry> gpu_delta_fill_tensors;
 };
 
 // ---------------------------------------------------------------------------

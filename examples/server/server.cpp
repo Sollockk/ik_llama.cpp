@@ -624,6 +624,8 @@ int main(int argc, char ** argv) {
                     ggml_backend_cuda_set_delta_vram_budget(be, params.delta_vram_mb);
                 }
                 ggml_backend_cuda_enable_delta_post_graph(be, true);
+
+                // Pre-fill disabled — runtime build captures correct dispatch-order tensors
             }
         }
     }
