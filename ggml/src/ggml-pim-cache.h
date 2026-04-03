@@ -26,6 +26,7 @@ struct pim_delta_cache {
     uint64_t     populated[4];    // bitmask: bit set = expert slice has been pread into heap
                                   // supports up to 256 experts
     bool         gpu_pinned;      // true if heap_buf is pinned for GPU zero-copy access
+    void *       dev_ptr;         // VRAM copy of delta data (cudaMalloc'd). NULL = use mmap.
 };
 
 // Sparse delta data uploaded to GPU VRAM for fast speculative correction.

@@ -6,6 +6,7 @@
 //
 
 #include "mmvq-templates.cuh"
+#include "mmvq-sparse.cuh"
 
 static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggml_type type,
         const int64_t ne00, const int64_t ne0, const int64_t ne2,

@@ -33,6 +33,17 @@
 #include <unistd.h>
 #endif
 
+#ifdef BS_HAVE_LAPACK
+extern "C" {
+    // LAPACK truncated SVD: compute min(M,N) singular values/vectors
+    void sgesvd_(const char * jobu, const char * jobvt,
+                 const int * m, const int * n, float * a, const int * lda,
+                 float * s, float * u, const int * ldu,
+                 float * vt, const int * ldvt,
+                 float * work, const int * lwork, int * info);
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Tensor metadata
 // ---------------------------------------------------------------------------
@@ -167,6 +178,7 @@ int main(int argc, char ** argv) {
     int          layer_min    = 0;
     int          layer_max    = INT32_MAX;
     float        sparse_threshold = 0.0f; // 0 = disabled, >0 = sparse mode (e.g. 0.01)
+    int          lowrank = 0;          // 0 = disabled, >0 = SVD rank for LoRA-style delta
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--blurry")     && i+1 < argc) blurry_path = argv[++i];
@@ -176,6 +188,7 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--levels")     && i+1 < argc) n_levels    = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threads")    && i+1 < argc) n_threads   = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--sparse")     && i+1 < argc) sparse_threshold = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--lowrank")    && i+1 < argc) lowrank = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--layers")     && i+1 < argc) {
             sscanf(argv[++i], "%d-%d", &layer_min, &layer_max);
         }
@@ -700,6 +713,186 @@ int main(int argc, char ** argv) {
                 100.0 * sst.st_size / fst.st_size, fst.st_size / 1e9);
     }
 skip_sparse:
+
+    // ==================================================================
+    // Phase 2.7: Generate low-rank (LoRA-style) delta GGUF
+    // ==================================================================
+#ifdef BS_HAVE_LAPACK
+    if (lowrank > 0 && level_files[0].fp) {
+        // Close level-1 file first (we'll re-read it)
+        fclose(level_files[0].fp);
+        level_files[0].fp = nullptr;
+
+        fprintf(stderr, "\n\nPhase 2.7: Generating low-rank delta GGUF (rank=%d)...\n", lowrank);
+
+        char lr_path[512];
+        snprintf(lr_path, sizeof(lr_path), "%s_lowrank_%d.gguf", out_prefix, lowrank);
+
+        // Build GGUF header
+        gguf_context * lhdr = gguf_init_empty();
+        gguf_set_val_str(lhdr, "general.architecture", model_arch.c_str());
+        gguf_set_val_str(lhdr, "general.type", "delta_correction_lowrank");
+        gguf_set_val_i32(lhdr, "bs.delta.rank", lowrank);
+
+        // Create tensor metadata context
+        const size_t lctx_size = shared_tensors.size() * 4 * ggml_tensor_overhead() + 16*1024*1024;
+        ggml_init_params lip = { .mem_size = lctx_size, .mem_buffer = nullptr, .no_alloc = true };
+        ggml_context * lctx = ggml_init(lip);
+
+        // Pre-scan: create tensor entries for all 2D weight tensors
+        struct LREntry {
+            std::string name;
+            int64_t ne00, ne01; // original weight dims
+            int split_idx;
+            size_t sharp_offset, blurry_offset;
+            size_t sharp_bpe, blurry_bpe;
+            ggml_type sharp_type, blurry_type;
+        };
+        std::vector<LREntry> lr_entries;
+
+        for (int ti = 0; ti < n_tensors; ti++) {
+            const auto & tname = shared_tensors[ti];
+            const auto & binfo = blurry_index[tname];
+            const auto & sinfo = sharp_index[tname];
+
+            if (sinfo.ne[1] <= 1) continue; // skip 1D tensors
+
+            int64_t ne00 = sinfo.ne[0];
+            int64_t ne01 = sinfo.ne[1];
+            int R = std::min(lowrank, (int)std::min(ne00, ne01));
+
+            // U: [ne01, R] in FP16
+            ggml_tensor * tu = ggml_new_tensor_2d(lctx, GGML_TYPE_F16, R, ne01);
+            std::string u_name = tname + ".U";
+            ggml_set_name(tu, u_name.c_str());
+            gguf_add_tensor(lhdr, tu);
+
+            // V: [ne00, R] in FP16
+            ggml_tensor * tv = ggml_new_tensor_2d(lctx, GGML_TYPE_F16, R, ne00);
+            std::string v_name = tname + ".V";
+            ggml_set_name(tv, v_name.c_str());
+            gguf_add_tensor(lhdr, tv);
+
+            int64_t n_experts = (sinfo.ne[2] > 0) ? sinfo.ne[2] : 1;
+            lr_entries.push_back({tname, ne00, ne01, sinfo.split_idx,
+                                  sinfo.file_offset, binfo.file_offset,
+                                  sinfo.nbytes / (size_t)n_experts,
+                                  binfo.nbytes / (size_t)n_experts,
+                                  sinfo.type, binfo.type});
+        }
+
+        gguf_write_to_file(lhdr, lr_path, true);
+        size_t lr_data_offset = gguf_get_meta_size(lhdr);
+        gguf_free(lhdr);
+        ggml_free(lctx);
+
+        FILE * lfp = fopen(lr_path, "r+b");
+        if (!lfp) { fprintf(stderr, "ERROR: cannot open %s\n", lr_path); goto skip_lowrank; }
+        fseek(lfp, (long)lr_data_offset, SEEK_SET);
+
+        int64_t lr_t_start = ggml_time_us();
+        for (size_t ei = 0; ei < lr_entries.size(); ei++) {
+            auto & e = lr_entries[ei];
+            int M = (int)e.ne01; // rows (output dim)
+            int N = (int)e.ne00; // cols (input dim)
+            int R = std::min(lowrank, std::min(M, N));
+            int64_t elems = (int64_t)M * N;
+
+            // Dequantize sharp and blurry to f32
+            std::vector<float> sf(elems), bf(elems), delta(elems);
+            dequant_to_f32(sharp_mmaps[e.split_idx].at(e.sharp_offset), e.sharp_type, elems, sf.data());
+            dequant_to_f32(blurry_mmap.at(e.blurry_offset), e.blurry_type, elems, bf.data());
+
+            for (int64_t i = 0; i < elems; i++) delta[i] = sf[i] - bf[i];
+
+            // LAPACK SVD: delta (M×N row-major) = U * diag(S) * V^T
+            // LAPACK expects column-major, so we transpose: pass N×M and swap U/V
+            // Actually: row-major M×N = column-major N×M (transpose)
+            // sgesvd on column-major N×M: A = U_col(N×K) * S(K) * Vt_col(K×M)
+            // where K = min(M,N)
+            int K = std::min(M, N);
+            std::vector<float> S(K);
+            std::vector<float> U_col(N * K);  // N×K (left singular vectors of transposed)
+            std::vector<float> Vt_col(K * M); // K×M (right singular vectors of transposed)
+
+            // Query optimal workspace
+            int lwork = -1;
+            float work_query;
+            int info;
+            sgesvd_("S", "S", &N, &M, delta.data(), &N, S.data(),
+                    U_col.data(), &N, Vt_col.data(), &K, &work_query, &lwork, &info);
+            lwork = (int)work_query;
+            std::vector<float> work(lwork);
+
+            // Compute SVD
+            sgesvd_("S", "S", &N, &M, delta.data(), &N, S.data(),
+                    U_col.data(), &N, Vt_col.data(), &K, work.data(), &lwork, &info);
+
+            if (info != 0) {
+                fprintf(stderr, "  WARNING: sgesvd failed for %s (info=%d), writing zeros\n",
+                        e.name.c_str(), info);
+            }
+
+            // Reconstruct: for row-major M×N:
+            // Original = U_orig(M×K) * diag(S) * V_orig(K×N)
+            // Since we passed transposed: U_col is V_orig^T, Vt_col is U_orig^T
+            // So: U_orig(M×K) = Vt_col^T and V_orig(N×K) = U_col
+            // Truncate to rank R and fold S into U:
+            // U_final(M×R) = Vt_col^T[:, :R] * diag(S[:R])
+            // V_final(N×R) = U_col[:, :R]
+
+            // Compute reconstruction error
+            double full_norm = 0, trunc_err = 0;
+            for (int i = 0; i < K; i++) full_norm += (double)S[i] * S[i];
+            for (int i = R; i < K; i++) trunc_err += (double)S[i] * S[i];
+            double retention = full_norm > 0 ? 1.0 - trunc_err / full_norm : 1.0;
+
+            // Write U tensor: [R, ne01] in FP16 (ne01 rows of R elements)
+            // U_final[row][r] = Vt_col[r * M + row] * S[r]
+            std::vector<ggml_fp16_t> u_fp16(M * R);
+            for (int row = 0; row < M; row++) {
+                for (int r = 0; r < R; r++) {
+                    u_fp16[row * R + r] = ggml_fp32_to_fp16(Vt_col[r * M + row] * S[r]);
+                }
+            }
+            fwrite(u_fp16.data(), sizeof(ggml_fp16_t), M * R, lfp);
+            size_t u_bytes = M * R * sizeof(ggml_fp16_t);
+            size_t pad = (32 - (u_bytes % 32)) % 32;
+            if (pad > 0) { uint8_t z[32] = {0}; fwrite(z, 1, pad, lfp); }
+
+            // Write V tensor: [R, ne00] in FP16 (ne00 rows of R elements)
+            // V_final[col][r] = U_col[col * K + r]  (but K may > R, take first R)
+            // Wait, U_col is N×K column-major → U_col[col][k] = U_col[k * ??? ]
+            // Actually U_col is stored column-major N×K: element [i,j] = U_col[j*N + i]
+            // V_final[col][r] = U_col[r * N + col]  for r < R, col < N
+            std::vector<ggml_fp16_t> v_fp16(N * R);
+            for (int col = 0; col < N; col++) {
+                for (int r = 0; r < R; r++) {
+                    v_fp16[col * R + r] = ggml_fp32_to_fp16(U_col[r * N + col]);
+                }
+            }
+            fwrite(v_fp16.data(), sizeof(ggml_fp16_t), N * R, lfp);
+            size_t v_bytes = N * R * sizeof(ggml_fp16_t);
+            pad = (32 - (v_bytes % 32)) % 32;
+            if (pad > 0) { uint8_t z[32] = {0}; fwrite(z, 1, pad, lfp); }
+
+            double elapsed = (ggml_time_us() - lr_t_start) / 1e6;
+            double eta = (ei > 0) ? (elapsed / ei) * (lr_entries.size() - ei) : 0;
+            fprintf(stderr, "  [%zu/%zu] %s: [%d,%d] rank=%d retention=%.1f%% S[0]=%.3f S[%d]=%.3f (%.0fs ETA %.0fs)\n",
+                    ei + 1, lr_entries.size(), e.name.c_str(), M, N, R,
+                    retention * 100.0, S[0], R - 1, S[std::min(R - 1, K - 1)],
+                    elapsed, eta);
+        }
+
+        fclose(lfp);
+
+        struct stat lrst;
+        stat(lr_path, &lrst);
+        fprintf(stderr, "  Low-rank delta: %s (%.1f MB, rank=%d)\n",
+                lr_path, lrst.st_size / 1e6, lowrank);
+    }
+skip_lowrank:
+#endif // BS_HAVE_LAPACK
 
     // ==================================================================
     // Phase 3: Close files and report

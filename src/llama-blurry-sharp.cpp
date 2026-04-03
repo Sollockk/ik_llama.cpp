@@ -6767,13 +6767,167 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
                        __func__, n_wired);
     }
 
-    // GPU pinning disabled — causes NaN on RTX 3090 (too many cudaHostRegister calls).
-    // The CPU ray march delta path uses cudaMemcpy instead of zero-copy.
+    // Pin delta mmap for async DMA (swing buffer prefetch).
+    // One large cudaHostRegister on the entire mmap — required for true async cudaMemcpyAsync.
 #ifdef GGML_USE_CUDA
-    LLAMA_LOG_INFO("%s: GPU pinning skipped (CPU delta path uses cudaMemcpy)\n", __func__);
+    if (n_wired > 0 && !level.mmaps.empty() && level.mmaps[0]) {
+        const uint8_t * mmap_base = (const uint8_t *)level.mmaps[0]->addr();
+        size_t mmap_size = level.mmaps[0]->size();
+        if (mmap_base && mmap_size > 0) {
+            madvise((void *)mmap_base, mmap_size, MADV_WILLNEED);
+            if (ggml_backend_cuda_pin_host_memory((void *)mmap_base, mmap_size)) {
+                LLAMA_LOG_INFO("%s: pinned %.1f MiB delta mmap for async DMA prefetch\n",
+                               __func__, mmap_size / (1024.0 * 1024.0));
+            } else {
+                LLAMA_LOG_WARN("%s: failed to pin delta mmap — swing buffer will use sync DMA\n", __func__);
+            }
+        }
+    }
 #endif
 
+    // Per-tensor VRAM upload REMOVED — swing buffer prefetch handles GPU delta.
+    // Only 144MB VRAM used (2x72MB swing buffers) instead of ~3.6GB per-tensor copies.
+
     return n_wired;
+}
+
+// ---------------------------------------------------------------------------
+// Load sparse delta GGUF to VRAM for fast speculative delta correction
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_load_sparse_delta_gpu(
+        llama_blurry_sharp_context * bsctx,
+        const char * sparse_path) {
+#ifndef GGML_USE_CUDA
+    GGML_UNUSED(bsctx); GGML_UNUSED(sparse_path);
+    LLAMA_LOG_WARN("%s: CUDA not available, sparse GPU delta disabled\n", __func__);
+    return 0;
+#else
+    if (!bsctx || !bsctx->model || !sparse_path) return 0;
+
+    // Open and parse the sparse delta GGUF
+    gguf_init_params gparams = { .no_alloc = true, .ctx = nullptr };
+    gguf_context * guf = gguf_init_from_file(sparse_path, gparams);
+    if (!guf) {
+        LLAMA_LOG_ERROR("%s: failed to open sparse delta: %s\n", __func__, sparse_path);
+        return 0;
+    }
+
+    // Verify it's a sparse delta
+    int k_sparse = gguf_find_key(guf, "bs.delta.sparse");
+    if (k_sparse < 0 || !gguf_get_val_bool(guf, k_sparse)) {
+        LLAMA_LOG_ERROR("%s: %s is not a sparse delta GGUF\n", __func__, sparse_path);
+        gguf_free(guf);
+        return 0;
+    }
+
+    // Read sparse delta file via llama_file (avoids raw mmap headers)
+    auto sparse_file = std::make_unique<llama_file>(sparse_path, "rb");
+    if (!sparse_file || sparse_file->size() == 0) { gguf_free(guf); return 0; }
+    size_t sfile_size = sparse_file->size();
+
+    size_t data_offset = gguf_get_data_offset(guf);
+    int n_tensors = gguf_get_n_tensors(guf);
+
+    // Get quant type from metadata
+    int k_qtype = gguf_find_key(guf, "bs.delta.quant_type");
+    std::string qtype_str = k_qtype >= 0 ? gguf_get_val_str(guf, k_qtype) : "Q4_0";
+
+    int32_t n_loaded = 0;
+    size_t total_vram = 0;
+
+    // Process tensor pairs: {name} (packed data) + {name}.idx (block index)
+    for (int ti = 0; ti < n_tensors; ti++) {
+        const char * tname = gguf_get_tensor_name(guf, ti);
+        std::string name(tname);
+
+        // Skip index tensors (processed with their data tensor)
+        if (name.size() > 4 && name.substr(name.size() - 4) == ".idx") continue;
+
+        // Find matching index tensor
+        std::string idx_name = name + ".idx";
+        int idx_ti = -1;
+        for (int j = 0; j < n_tensors; j++) {
+            if (idx_name == gguf_get_tensor_name(guf, j)) { idx_ti = j; break; }
+        }
+        if (idx_ti < 0) continue;
+
+        // Find the base model tensor
+        ggml_tensor * base = llama_get_model_tensor(bsctx->model, name.c_str());
+        if (!base) continue;
+        if (!base->buffer || ggml_backend_buffer_is_host(base->buffer)) continue; // CPU tensor
+
+        // Get metadata
+        char key_total[256], key_stored[256];
+        snprintf(key_total, sizeof(key_total), "bs.delta.%s.n_blocks_total", name.c_str());
+        snprintf(key_stored, sizeof(key_stored), "bs.delta.%s.n_blocks_stored", name.c_str());
+        int k_total = gguf_find_key(guf, key_total);
+        int k_stored = gguf_find_key(guf, key_stored);
+        if (k_total < 0 || k_stored < 0) continue;
+
+        int n_blocks_total = gguf_get_val_i32(guf, k_total);
+        int n_blocks_stored = gguf_get_val_i32(guf, k_stored);
+        if (n_blocks_stored <= 0) continue;
+
+        // Compute sizes
+        ggml_type delta_type = base->ray_march_delta_type;
+        size_t block_bytes = ggml_type_size(delta_type);
+        int block_elems = ggml_blck_size(delta_type);
+        int n_experts = (int)(base->ne[2] > 0 ? base->ne[2] : 1);
+        size_t packed_expert_bytes = (size_t)n_blocks_stored * block_bytes;
+        size_t packed_total = packed_expert_bytes * n_experts;
+        size_t idx_bytes = (size_t)n_blocks_stored * sizeof(uint16_t);
+
+        // Get tensor data offsets and read from file
+        size_t packed_offset = data_offset + gguf_get_tensor_offset(guf, ti);
+        size_t idx_offset = data_offset + gguf_get_tensor_offset(guf, idx_ti);
+
+        std::vector<uint8_t> packed_buf(packed_total);
+        sparse_file->seek(packed_offset, SEEK_SET);
+        sparse_file->read_raw(packed_buf.data(), packed_total);
+
+        std::vector<uint8_t> idx_buf(idx_bytes);
+        sparse_file->seek(idx_offset, SEEK_SET);
+        sparse_file->read_raw(idx_buf.data(), idx_bytes);
+
+        const void * packed_src = packed_buf.data();
+        const void * idx_src = idx_buf.data();
+
+        // Upload packed data + index to VRAM
+        void * dev_packed = ggml_backend_cuda_device_malloc_and_copy(packed_src, packed_total);
+        void * dev_index = ggml_backend_cuda_device_malloc_and_copy(idx_src, idx_bytes);
+
+        if (!dev_packed || !dev_index) {
+            if (dev_packed) ggml_backend_cuda_device_free(dev_packed);
+            if (dev_index) ggml_backend_cuda_device_free(dev_index);
+            continue;
+        }
+
+        // Create and attach sparse delta struct
+        struct pim_sparse_delta_gpu * sdg = (struct pim_sparse_delta_gpu *)calloc(1, sizeof(*sdg));
+        sdg->dev_packed = dev_packed;
+        sdg->dev_index = dev_index;
+        sdg->n_blocks_stored = n_blocks_stored;
+        sdg->n_blocks_total = n_blocks_total;
+        sdg->n_experts = n_experts;
+        sdg->packed_expert_bytes = packed_expert_bytes;
+        sdg->block_bytes = (int)block_bytes;
+        sdg->block_elems = block_elems;
+
+        base->sparse_delta_gpu = (void *)sdg;
+        n_loaded++;
+        total_vram += packed_total + idx_bytes;
+    }
+
+    sparse_file.reset();
+    gguf_free(guf);
+
+    if (n_loaded > 0) {
+        LLAMA_LOG_INFO("%s: loaded %d sparse delta tensors to VRAM (%.1f MiB)\n",
+                       __func__, n_loaded, total_vram / (1024.0 * 1024.0));
+    }
+    return n_loaded;
+#endif // GGML_USE_CUDA
 }
 
 // ---------------------------------------------------------------------------

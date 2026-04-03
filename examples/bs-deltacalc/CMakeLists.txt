@@ -9,6 +9,13 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(${TARGET} PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
+# LAPACK for SVD in --lowrank mode
+find_package(LAPACK)
+if(LAPACK_FOUND)
+    target_link_libraries(${TARGET} PRIVATE ${LAPACK_LIBRARIES})
+    target_compile_definitions(${TARGET} PRIVATE BS_HAVE_LAPACK)
+endif()
+
 # Standalone test for the three-tier ray march kernel
 add_executable(test-ray-march test-ray-march.cpp)
 target_link_libraries(test-ray-march PRIVATE common llama ggml ${CMAKE_THREAD_LIBS_INIT})

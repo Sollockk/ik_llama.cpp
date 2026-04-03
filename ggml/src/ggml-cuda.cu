@@ -28,6 +28,13 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-pim-cache.h"
+
+#include "ggml-cuda/mmvq-sparse-args.h"
+void ggml_cuda_mmvq_sparse_dispatch(ggml_type type, const mmvq_sparse_args & args, cudaStream_t stream);
+
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 #include "ggml-ray-march.h"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/pad.cuh"
@@ -2365,147 +2372,170 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
         ++node_n;
     }
 
-    // ---- GPU Delta Correction: CPU ray march → pinned staging → CUDA add kernel ----
-    // Never reads dst from GPU. CPU computes delta into pinned staging buffer,
-    // then tiny CUDA kernel adds it to dst. Avoids corruption from bias fusion / stride issues.
+    // ---- GPU Delta: Sparse VRAM (fast) or Full PCIe (fallback) ----
+    // Priority 1: sparse_delta_gpu → sparse MMVQ kernel from VRAM (~0.1ms)
+    // Priority 2: ray_march_delta_cache → full MMVQ from host mmap via PCIe (~2ms)
+    // Skip ffn_gate/up (nonlinear activation makes post-hoc addition wrong).
     {
         const ggml_tensor * delta_src0 = src0;
 
-        // Debug: log buffer type for ALL delta tensors that reach this point
-        if (delta_src0 && delta_src0->ray_march_delta_cache != NULL && is_gemv) {
-            static int buf_diag = 0;
-            if (buf_diag < 50) {
-                buf_diag++;
-                bool is_host = delta_src0->buffer ? ggml_backend_buffer_is_host(delta_src0->buffer) : true;
-                fprintf(stderr, "[gpu-delta-buf] %s: buffer=%s is_host=%d\n",
-                        delta_src0->name,
-                        delta_src0->buffer ? ggml_backend_buffer_name(delta_src0->buffer) : "null",
-                        (int)is_host);
-            }
-        }
-
-        // GPU delta staging: only for GPU-resident weight tensors, generation only, after init.
-        // Skip ffn_gate and ffn_up: their delta is applied AFTER the blurry activation (gelu/silu),
-        // so gelu(blurry) + delta ≠ gelu(blurry + delta). Only ffn_down and attention are safe.
-        bool skip_due_to_activation = false;
+        bool skip = false;
         if (delta_src0 && delta_src0->name[0] != '\0') {
             const char * n = delta_src0->name;
-            skip_due_to_activation = (strstr(n, "ffn_gate") != nullptr || strstr(n, "ffn_up") != nullptr
-                || strstr(n, "attn_q.") != nullptr || strstr(n, "attn_k.") != nullptr
-                || strstr(n, "attn_v.") != nullptr);
+            skip = (strstr(n, "ffn_gate") || strstr(n, "ffn_up"));
         }
-        if (delta_src0 && delta_src0->ray_march_delta_cache != NULL
-            && is_gemv && ctx.delta_ready && ctx.delta_staging
+
+        // Priority 1: Sparse delta in VRAM
+        if (delta_src0 && delta_src0->sparse_delta_gpu != NULL
+            && is_gemv && ctx.delta_ready
             && delta_src0->buffer && !ggml_backend_buffer_is_host(delta_src0->buffer)
-            && !skip_due_to_activation) {
+            && !skip) {
+
+            struct pim_sparse_delta_gpu * sdg = (struct pim_sparse_delta_gpu *)delta_src0->sparse_delta_gpu;
+            const ggml_type delta_type = delta_src0->ray_march_delta_type;
+            const int64_t ne00 = delta_src0->ne[0];
+            const int64_t ne01 = delta_src0->ne[1];
+
+            if (ggml_cuda_mmvq_type_supported(delta_type)) {
+                mmvq_sparse_args sparse_args{
+                    /* packed_weights   */ sdg->dev_packed,
+                    /* block_index      */ (const uint16_t *)sdg->dev_index,
+                    /* vy               */ src1_quantized.get(),
+                    /* dst              */ (float *)dst->data,
+                    /* ncols_x          */ (int)ne00,
+                    /* nrows_x          */ (int)ne01,
+                    /* nrows_y          */ (int)ne10_padded,
+                    /* nrows_dst        */ (int)dst->ne[0],
+                    /* n_blocks_stored  */ sdg->n_blocks_stored,
+                    /* packed_row_blocks*/ sdg->n_blocks_stored
+                };
+
+                ggml_cuda_mmvq_sparse_dispatch(delta_type, sparse_args, stream);
+
+                static int diag = 0;
+                if (diag < 6) { diag++;
+                    fprintf(stderr, "[gpu-delta-sparse] %s ne=[%lld,%lld] blocks=%d/%d VRAM\n",
+                            delta_src0->name, (long long)ne00, (long long)ne01,
+                            sdg->n_blocks_stored, sdg->n_blocks_total);
+                }
+            }
+        }
+        // Priority 2: Prefetched swing buffer (VRAM, fast) or PCIe fallback (slow)
+        else if (delta_src0 && delta_src0->ray_march_delta_cache != NULL
+            && is_gemv && ctx.delta_ready
+            && delta_src0->buffer && !ggml_backend_buffer_is_host(delta_src0->buffer)
+            && !skip
+            && (!ctx.delta_prefetch.queue_built || ctx.delta_prefetch.queue_pos < (int)ctx.delta_prefetch.queue.size())) {
 
             struct pim_delta_cache * cache = (struct pim_delta_cache *)delta_src0->ray_march_delta_cache;
-            const ggml_type delta_type = delta_src0->ray_march_delta_type;
-            const ggml_type_traits_t delta_traits = ggml_internal_get_type_traits(delta_type);
-            const char * delta_ptr = pim_delta_cache_get(cache, 0);
+            auto & pf = ctx.delta_prefetch;
+            const char * delta_ptr = nullptr;
+            const char * source = "pcie";
+            const int64_t ne00 = delta_src0->ne[0];
+            const int64_t ne01 = delta_src0->ne[1];
 
-            if (delta_ptr && delta_traits.vec_dot) {
-                const int64_t ne00 = delta_src0->ne[0];
-                const int64_t ne01 = delta_src0->ne[1];
-                const size_t delta_row_stride = ggml_row_size(delta_type, ne00);
+            // O(1) map lookup: is this tensor in a prefetched swing buffer?
+            auto map_it = pf.active_map.find(delta_src0);
+            if (map_it != pf.active_map.end()) {
+                if (pf.pending) {
+                    CUDA_CHECK(cudaStreamWaitEvent(stream, pf.done, 0));
+                    pf.pending = false;
+                }
+                delta_ptr = (const char *)pf.buf[map_it->second.first] + map_it->second.second;
+                source = "prefetched";
+            }
+            // Fallback: PCIe zero-copy from mmap
+            if (!delta_ptr) {
+                delta_ptr = pim_delta_cache_get(cache, 0);
+                source = "pcie";
+                pf.n_misses++;
+            } else if (source[0] == 'p') { // "prefetched"
+                pf.n_hits++;
+            }
 
-                if ((size_t)ne01 <= ctx.delta_staging_n) {
-                    // 1. Copy input D2H (tiny: ne00 floats ≈ 21KB)
-                    std::vector<float> input_f32(ne00);
-                    CUDA_CHECK(cudaMemcpyAsync(input_f32.data(), src1->data,
-                                               ne00 * sizeof(float), cudaMemcpyDeviceToHost, stream));
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (delta_ptr && ggml_cuda_mmvq_type_supported(delta_src0->ray_march_delta_type)) {
+                const ggml_type delta_type = delta_src0->ray_march_delta_type;
+                const size_t delta_nb01 = ggml_row_size(delta_type, ne00);
 
-                    // 2. Quantize input for delta vec_dot (Q8_0)
-                    const ggml_type dinput_type = GGML_TYPE_Q8_0;
-                    const size_t dinput_size = ggml_row_size(dinput_type, ne00);
-                    std::vector<uint8_t> dinput(dinput_size);
-                    ggml_internal_get_type_traits(dinput_type).from_float(
-                        input_f32.data(), dinput.data(), ne00);
+                mmvq_args delta_args{
+                    /* vx_u      */ delta_ptr,
+                    /* vx_g      */ nullptr,
+                    /* bias_u    */ nullptr,
+                    /* bias_g    */ nullptr,
+                    /* vy        */ src1_quantized.get(),
+                    /* dst       */ (float *)dst->data,
+                    /* ids_data  */ nullptr,
+                    /* ncols_x   */ (int)ne00,
+                    /* nrows_x   */ (int)ne01,
+                    /* nrows_y   */ (int)ne10_padded,
+                    /* ncols_y   */ 1,
+                    /* nrows_dst */ (int)dst->ne[0],
+                    /* ne2       */ 1,
+                    /* nb02      */ (uint64_t)(ne01 * delta_nb01),
+                    /* nb12      */ (uint64_t)(ne10_padded * sizeof(block_q8_1) / QK8_1),
+                    /* nb2       */ (uint64_t)dst->nb[2],
+                    /* ids_nb0   */ 0,
+                    /* bias_nb1  */ 0,
+                    /* unary_op  */ GGML_UNARY_OP_COUNT,
+                    /* limit     */ INFINITY,
+                    /* accumulate*/ true
+                };
 
-                    // 3. Block energy scan + partition
-                    const int rm_block_size = (int)ggml_blck_size(delta_type);
-                    const int rm_n_blocks = (rm_block_size > 0 && ne00 % rm_block_size == 0)
-                        ? (int)(ne00 / rm_block_size) : 0;
+                ggml_cuda_mmvq_dispatch(delta_type, delta_args, stream);
 
-                    std::vector<int> rm_active(rm_n_blocks > 0 ? rm_n_blocks : 1);
-                    struct ggml_ray_march_tiers tiers = {};
-                    tiers.active_blocks = rm_active.data();
-                    tiers.n_total = rm_n_blocks;
+                // Build queue during first token (record execution order)
+                if (!pf.queue_built) {
+                    const char * hp = pim_delta_cache_get(cache, 0);
+                    size_t bytes = (size_t)ne01 * delta_nb01;
+                    pf.queue.push_back({delta_src0, hp, bytes});
+                }
 
-                    if (rm_n_blocks > 0) {
-                        std::vector<float> energies(rm_n_blocks);
-                        ggml_ray_march_block_energies(input_f32.data(), energies.data(),
-                                                      (int)ne00, rm_block_size);
-                        float e_sum = 0.0f;
-                        for (int b = 0; b < rm_n_blocks; b++) e_sum += energies[b];
-                        ggml_ray_march_partition_blocks(energies.data(), rm_n_blocks,
-                                                       e_sum / rm_n_blocks * 0.01f, &tiers);
-                    } else {
-                        for (int b = 0; b < rm_n_blocks; b++) rm_active.data()[tiers.n_active++] = b;
-                    }
+                // Advance queue position
+                if (pf.queue_built) {
+                    pf.queue_pos++;
 
-                    // 4. CPU ray march delta → host buffer
-                    std::vector<float> host_staging(ne01, 0.0f);
-
-                    // DEBUG: check input + delta for NaN/inf
-                    {
-                        int n_nan = 0, n_inf = 0;
-                        for (int64_t i = 0; i < ne00 && i < 100; i++) {
-                            if (std::isnan(input_f32[i])) n_nan++;
-                            if (std::isinf(input_f32[i])) n_inf++;
+                    // Batch prefetch: every 5 tensors (layer boundary), DMA next 5
+                    // into alternate swing buffer. 5 tensors ≈ 75MB, 3ms DMA, hidden
+                    // behind 10ms layer compute.
+                    if (pf.buf[0] && (pf.queue_pos % 5) == 0) {
+                        int batch_start = pf.queue_pos;
+                        int batch_end = std::min(batch_start + 5, (int)pf.queue.size());
+                        if (batch_start < (int)pf.queue.size()) {
+                            // Check total batch size fits in buffer
+                            size_t total = 0;
+                            for (int bi = batch_start; bi < batch_end; bi++) total += pf.queue[bi].bytes;
+                            if (total <= pf.buf_size) {
+                                pf.cur_buf = 1 - pf.cur_buf;
+                                size_t offset = 0;
+                                auto upload_stream = ctx.jit_upload_stream();
+                                // Clear old entries for this buffer
+                                for (auto it = pf.active_map.begin(); it != pf.active_map.end(); ) {
+                                    if (it->second.first == pf.cur_buf) it = pf.active_map.erase(it);
+                                    else ++it;
+                                }
+                                for (int bi = batch_start; bi < batch_end; bi++) {
+                                    auto & nxt = pf.queue[bi];
+                                    if (nxt.host_ptr) {
+                                        CUDA_CHECK(cudaMemcpyAsync((char *)pf.buf[pf.cur_buf] + offset,
+                                                                   nxt.host_ptr, nxt.bytes,
+                                                                   cudaMemcpyHostToDevice, upload_stream));
+                                        pf.active_map[nxt.src0] = {pf.cur_buf, offset};
+                                        offset += nxt.bytes;
+                                    }
+                                }
+                                CUDA_CHECK(cudaEventRecord(pf.done, upload_stream));
+                                pf.pending = true;
+                            }
                         }
-                        // Also check first delta row raw bytes are non-zero
-                        int n_zero_bytes = 0;
-                        for (int i = 0; i < 32 && i < (int)delta_row_stride; i++) {
-                            if (delta_ptr[i] == 0) n_zero_bytes++;
-                        }
-                        static int vd_diag = 0;
-                        if (vd_diag < 3) {
-                            vd_diag++;
-                            // Test single vec_dot
-                            float test_dv = 0.0f;
-                            ggml_internal_get_type_traits(delta_type).vec_dot(
-                                (int)ne00, &test_dv, 0,
-                                delta_ptr, 0, dinput.data(), 0, 1);
-                            fprintf(stderr, "[delta-debug] %s: input nan=%d inf=%d first=%.4f "
-                                    "delta_zero_bytes=%d/32 test_dot=%.4f src1_type=%s\n",
-                                    delta_src0->name, n_nan, n_inf, input_f32[0],
-                                    n_zero_bytes, test_dv,
-                                    ggml_type_name(src1->type));
-                        }
                     }
+                }
 
-                    #pragma omp parallel for schedule(static) num_threads(8)
-                    for (int64_t j = 0; j < ne01; j++) {
-                        float dv = 0.0f;
-                        ggml_vec_dot_ray_march(
-                            (int)ne00, &dv,
-                            delta_ptr + j * delta_row_stride, (int)delta_type,
-                            nullptr, (ggml_ray_march_type)0,
-                            dinput.data(), nullptr,
-                            &tiers, rm_block_size);
-                        host_staging[j] = dv;
-                    }
-
-                    float * dev_staging = ctx.delta_staging;
-                    CUDA_CHECK(cudaMemcpyAsync(dev_staging, host_staging.data(),
-                                               ne01 * sizeof(float), cudaMemcpyHostToDevice, stream));
-                    const int block_sz = 256;
-                    const int n_blocks_k = ((int)ne01 + block_sz - 1) / block_sz;
-                    k_delta_add_f32<<<n_blocks_k, block_sz, 0, stream>>>(
-                        (float *)dst->data, dev_staging, (int)ne01);
-
-                    static int diag = 0;
-                    if (diag < 6) {
-                        diag++;
-                        bool is_h = delta_src0->buffer ? ggml_backend_buffer_is_host(delta_src0->buffer) : true;
-                        fprintf(stderr, "[gpu-delta-staging] %s: ne=[%lld,%lld] skip=%.0f%% buf=%s host=%d\n",
-                                delta_src0->name, (long long)ne00, (long long)ne01,
-                                rm_n_blocks > 0 ? 100.0f * tiers.n_skip / rm_n_blocks : 0.0f,
-                                delta_src0->buffer ? ggml_backend_buffer_name(delta_src0->buffer) : "null",
-                                (int)is_h);
-                    }
+                static int diag = 0;
+                if (diag < 10) { diag++;
+                    fprintf(stderr, "[gpu-delta-mmvq] %s ne=[%lld,%lld] delta=%s src=%s qpos=%d/%d\n",
+                            delta_src0->name, (long long)ne00, (long long)ne01,
+                            ggml_type_name(delta_type), source,
+                            pf.queue_pos, (int)pf.queue.size());
                 }
             }
         }
@@ -4575,7 +4605,11 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
     auto graph = ggml_cuda_get_graph(*cuda_ctx, ggml_cuda_graph_get_key(cgraph));
 #endif
 
-    //printf("======================== %s: graph with %d nodes on device %d. time = %ld\n", __func__, cgraph->n_nodes, cuda_ctx->device, ggml_time_us());
+    // Delta prefetch queue management
+    auto & pf = cuda_ctx->delta_prefetch;
+
+    // Queue management moved to ggml_backend_cuda_graph_compute (once per token)
+
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
@@ -4591,6 +4625,10 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
                     GGML_CUDA_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                // (prefetch now handled via queue in ggml_cuda_mul_mat_q, not here)
+                if (false) {
+                }
             }
         }
 #ifdef USE_CUDA_GRAPH
@@ -4631,6 +4669,58 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // Delta prefetch: detect new token via queue_pos wraparound
+    {
+        auto & pf = cuda_ctx->delta_prefetch;
+        // Mark queue built after a generation token fills it (expect 50+ entries)
+        if (cuda_ctx->delta_ready && !pf.queue_built && pf.queue.size() >= 20) {
+            pf.queue_built = true;
+            pf.queue_pos = (int)pf.queue.size(); // force wraparound on next call → prefetch first batch
+            fprintf(stderr, "[delta-prefetch] queue built: %zu tensors\n", pf.queue.size());
+        }
+        // If queue was polluted by prompt (< 20 entries), clear it for generation to rebuild
+        if (cuda_ctx->delta_ready && !pf.queue_built && !pf.queue.empty() && pf.queue.size() < 20) {
+            // Check if this looks like a new generation pass (queue_pos beyond current size)
+            if (pf.queue_pos >= (int)pf.queue.size()) {
+                pf.queue.clear();
+                pf.queue_pos = 0;
+            }
+        }
+        // Detect new token: queue_pos past end → print stats and reset
+        if (pf.queue_built && pf.buf[0] && pf.queue_pos >= (int)pf.queue.size()) {
+            // Print hit rate for previous token
+            static int token_diag = 0;
+            if (token_diag < 5 && (pf.n_hits + pf.n_misses) > 0) {
+                token_diag++;
+                fprintf(stderr, "[delta-prefetch] token stats: hits=%d misses=%d (%.0f%% hit rate)\n",
+                        pf.n_hits, pf.n_misses,
+                        100.0 * pf.n_hits / (pf.n_hits + pf.n_misses + 1));
+            }
+            pf.n_hits = 0;
+            pf.n_misses = 0;
+            pf.queue_pos = 0;
+            pf.pending = false;
+            pf.cur_buf = 0;
+            pf.active_map.clear();
+            // Prefetch first 5 tensors (one layer's worth)
+            int batch_end = std::min(5, (int)pf.queue.size());
+            size_t offset = 0;
+            auto upload_stream = cuda_ctx->jit_upload_stream();
+            for (int bi = 0; bi < batch_end; bi++) {
+                auto & e = pf.queue[bi];
+                if (e.host_ptr && offset + e.bytes <= pf.buf_size) {
+                    CUDA_CHECK(cudaMemcpyAsync((char *)pf.buf[0] + offset,
+                                               e.host_ptr, e.bytes,
+                                               cudaMemcpyHostToDevice, upload_stream));
+                    pf.active_map[e.src0] = {0, offset};
+                    offset += e.bytes;
+                }
+            }
+            CUDA_CHECK(cudaEventRecord(pf.done, upload_stream));
+            pf.pending = true;
+        }
+    }
 
 #ifdef USE_CUDA_GRAPH
     cuda_ctx->cur_graph = nullptr;
@@ -5558,6 +5648,20 @@ bool ggml_backend_cuda_pin_host_memory(void * ptr, size_t size) {
 #endif
 }
 
+void * ggml_backend_cuda_device_malloc_and_copy(const void * host_data, size_t size) {
+    if (!host_data || size == 0) return nullptr;
+    void * dev = nullptr;
+    cudaError_t err = cudaMalloc(&dev, size);
+    if (err != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    err = cudaMemcpy(dev, host_data, size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { cudaGetLastError(); cudaFree(dev); return nullptr; }
+    return dev;
+}
+
+void ggml_backend_cuda_device_free(void * dev_ptr) {
+    if (dev_ptr) cudaFree(dev_ptr);
+}
+
 void ggml_backend_cuda_unpin_host_memory(void * ptr) {
     if (!ptr) return;
     cudaError_t err = cudaHostUnregister(ptr);
@@ -5576,26 +5680,152 @@ void ggml_backend_cuda_disable_graphs(ggml_backend_t backend) {
 #endif
 }
 
+// Delta worker thread function
+static void delta_worker_func(ggml_backend_cuda_context * ctx) {
+    auto & pipe = ctx->delta_pipe;
+    while (!pipe.stop.load()) {
+        // Wait for work
+        {
+            std::unique_lock<std::mutex> lock(pipe.mtx);
+            pipe.cv.wait(lock, [&]{ return pipe.has_work.load() || pipe.stop.load(); });
+        }
+        if (pipe.stop.load()) break;
+
+        // Wait for D2H input copy to complete
+        CUDA_CHECK(cudaEventSynchronize(pipe.input_ready));
+
+        // Quantize input to Q8_0
+        const ggml_type dinput_type = GGML_TYPE_Q8_0;
+        const size_t dinput_size = ggml_row_size(dinput_type, pipe.w_ne00);
+        ggml_internal_get_type_traits(dinput_type).from_float(
+            pipe.host_input, pipe.host_dinput, pipe.w_ne00);
+
+        // Block energy scan + partition
+        const int rm_n_blocks = (pipe.w_rm_block_size > 0 && pipe.w_ne00 % pipe.w_rm_block_size == 0)
+            ? (int)(pipe.w_ne00 / pipe.w_rm_block_size) : 0;
+
+        std::vector<int> rm_active(rm_n_blocks > 0 ? rm_n_blocks : 1);
+        struct ggml_ray_march_tiers tiers = {};
+        tiers.active_blocks = rm_active.data();
+        tiers.n_total = rm_n_blocks;
+
+        if (rm_n_blocks > 0) {
+            std::vector<float> energies(rm_n_blocks);
+            ggml_ray_march_block_energies(pipe.host_input, energies.data(),
+                                          (int)pipe.w_ne00, pipe.w_rm_block_size);
+            float e_sum = 0.0f;
+            for (int b = 0; b < rm_n_blocks; b++) e_sum += energies[b];
+            ggml_ray_march_partition_blocks(energies.data(), rm_n_blocks,
+                                           e_sum / rm_n_blocks * 0.01f, &tiers);
+        } else {
+            for (int b = 0; b < rm_n_blocks; b++) rm_active[b] = b;
+            tiers.n_active = rm_n_blocks;
+        }
+
+        // Ray march delta → zero-copy result buffer
+        memset(pipe.host_result, 0, pipe.w_ne01 * sizeof(float));
+
+        #pragma omp parallel for schedule(static) num_threads(8)
+        for (int64_t j = 0; j < pipe.w_ne01; j++) {
+            float dv = 0.0f;
+            ggml_vec_dot_ray_march(
+                (int)pipe.w_ne00, &dv,
+                pipe.w_delta_ptr + j * pipe.w_delta_row_stride, (int)pipe.w_delta_type,
+                nullptr, (ggml_ray_march_type)0,
+                pipe.host_dinput, nullptr,
+                &tiers, pipe.w_rm_block_size);
+            pipe.host_result[j] = dv;
+        }
+
+        // Signal completion
+        pipe.has_work.store(false);
+        pipe.has_result.store(true);
+    }
+}
+
 void ggml_backend_cuda_enable_delta_post_graph(ggml_backend_t backend, bool enable) {
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)backend->context;
     ctx->delta_post_graph_enabled = enable;
     ctx->delta_ready = enable;
 
-    // Allocate DEVICE staging buffer (VRAM, not pinned host).
-    // cudaMallocHost causes NaN due to memory pressure — use cudaMalloc instead.
-    // CPU delta result is copied to device via cudaMemcpy, then add kernel runs from VRAM.
-    if (enable && !ctx->delta_staging) {
-        const size_t staging_n = 32768; // 32K floats = 128KB VRAM
+    auto & pipe = ctx->delta_pipe;
+    if (enable && !pipe.initialized) {
         ggml_cuda_set_device(ctx->device);
-        cudaError_t err = cudaMalloc(&ctx->delta_staging, staging_n * sizeof(float));
-        if (err == cudaSuccess) {
-            ctx->delta_staging_n = staging_n;
-            fprintf(stderr, "[cuda-delta] device staging buffer allocated (%zu KB VRAM), delta_ready=true\n",
-                    staging_n * sizeof(float) / 1024);
-        } else {
+
+        // Allocate device staging buffer (for cudaMemcpyAsync H2D of result)
+        const size_t result_n = 32768; // 32K floats = 128KB
+        cudaError_t err = cudaMalloc(&ctx->delta_staging, result_n * sizeof(float));
+        if (err != cudaSuccess) {
             cudaGetLastError();
             ctx->delta_ready = false;
-            fprintf(stderr, "[cuda-delta] WARNING: cudaMalloc staging failed, GPU delta disabled\n");
+            fprintf(stderr, "[cuda-delta] WARNING: cudaMalloc staging failed\n");
+            return;
+        }
+        ctx->delta_staging_n = result_n;
+
+        // Allocate zero-copy result buffer: mmap anonymous + cudaHostRegister
+        // GPU's k_delta_add_f32 reads this directly via PCIe (~32KB, ~1μs)
+#ifndef _WIN32
+        pipe.host_result = (float *)mmap(NULL, result_n * sizeof(float),
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (pipe.host_result == MAP_FAILED) {
+            pipe.host_result = nullptr;
+            fprintf(stderr, "[cuda-delta] WARNING: mmap failed for result buffer\n");
+            ctx->delta_ready = false;
+            return;
+        }
+        // Register with CUDA for zero-copy GPU access
+        cudaError_t reg_err = cudaHostRegister(pipe.host_result, result_n * sizeof(float),
+                                                cudaHostRegisterMapped);
+        if (reg_err == cudaSuccess) {
+            cudaHostGetDevicePointer(&pipe.dev_result, pipe.host_result, 0);
+        } else {
+            cudaGetLastError();
+            // Fallback: dev_result stays null, use cudaMemcpyAsync instead
+            pipe.dev_result = nullptr;
+            fprintf(stderr, "[cuda-delta] WARNING: cudaHostRegister failed, using memcpy fallback\n");
+        }
+#else
+        pipe.host_result = (float *)malloc(result_n * sizeof(float));
+        if (!pipe.host_result) { ctx->delta_ready = false; return; }
+#endif
+        pipe.result_n = result_n;
+
+        // Host input/dinput buffers (regular malloc, tiny)
+        const size_t input_n = 32768; // 32K floats = 128KB
+        pipe.host_input = (float *)malloc(input_n * sizeof(float));
+        pipe.host_dinput = (uint8_t *)malloc(ggml_row_size(GGML_TYPE_Q8_0, input_n));
+        pipe.input_n = input_n;
+
+        // CUDA event for D2H completion signaling
+        CUDA_CHECK(cudaEventCreateWithFlags(&pipe.input_ready, cudaEventDisableTiming));
+
+        // Worker thread NOT started — using synchronous delta path.
+        // Worker is only needed for the async deferred approach (currently disabled).
+        pipe.initialized = true;
+
+        fprintf(stderr, "[cuda-delta] async pipeline initialized: staging=%zuKB\n",
+                result_n * sizeof(float) / 1024);
+    }
+
+    // Swing buffer prefetch: two VRAM buffers for async DMA from host
+    auto & pf = ctx->delta_prefetch;
+    if (enable && !pf.buf[0]) {
+        ggml_cuda_set_device(ctx->device);
+        const size_t swing_size = 150 * 1024 * 1024; // 150MB — covers full layer delta (~140MB for 5 tensors)
+        cudaError_t e0 = cudaMalloc(&pf.buf[0], swing_size);
+        cudaError_t e1 = cudaMalloc(&pf.buf[1], swing_size);
+        if (e0 == cudaSuccess && e1 == cudaSuccess) {
+            pf.buf_size = swing_size;
+            CUDA_CHECK(cudaEventCreateWithFlags(&pf.done, cudaEventDisableTiming));
+            fprintf(stderr, "[cuda-delta] swing buffers allocated: 2x%.0fMB VRAM\n",
+                    swing_size / (1024.0 * 1024.0));
+        } else {
+            if (pf.buf[0]) { cudaFree(pf.buf[0]); pf.buf[0] = nullptr; }
+            if (pf.buf[1]) { cudaFree(pf.buf[1]); pf.buf[1] = nullptr; }
+            cudaGetLastError();
+            fprintf(stderr, "[cuda-delta] WARNING: swing buffer alloc failed\n");
         }
     }
 }

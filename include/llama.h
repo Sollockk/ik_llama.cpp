@@ -1880,6 +1880,12 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API int32_t llama_blurry_sharp_wire_delta_tensors(
             struct llama_blurry_sharp_context * bsctx);
 
+    // Load sparse delta GGUF to VRAM for fast GPU delta correction.
+    // Packed blocks + uint16 index per tensor. Returns number of tensors loaded.
+    LLAMA_API int32_t llama_blurry_sharp_load_sparse_delta_gpu(
+            struct llama_blurry_sharp_context * bsctx,
+            const char * sparse_path);
+
     // Create ggml_tensor objects backed by mmap'd delta data in a CPU buffer.
     // These tensors can be included in the computation graph for CPU-side delta
     // matmul, enabling async CPU delta correction while GPU computes blurry.

@@ -26,6 +26,10 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
 
 #if defined(GGML_USE_HIPBLAS)
 #include "vendors/hip.h"
@@ -854,8 +858,72 @@ struct ggml_backend_cuda_context {
     int   offload_batch_size = GGML_CUDA_MIN_BATCH_OFFLOAD;
     bool delta_post_graph_enabled = false; // legacy — kept for compat
     bool    delta_ready = false;       // set true after warmup completes — gates GPU delta
-    float * delta_staging = nullptr;   // pinned host buffer for CPU delta results (cudaMallocHost)
+    float * delta_staging = nullptr;   // device staging buffer (cudaMalloc)
     size_t  delta_staging_n = 0;       // allocated element count
+
+    // Async delta pipeline: CPU worker computes delta while GPU continues
+    struct {
+        bool initialized = false;
+
+        // Worker thread
+        std::thread      worker;
+        std::mutex       mtx;
+        std::condition_variable cv;
+        std::atomic<bool> has_work{false};
+        std::atomic<bool> has_result{false};
+        std::atomic<bool> stop{false};
+
+        // Zero-copy result buffer (mmap + cudaHostRegister)
+        float *   host_result = nullptr;   // host ptr (mmap'd anonymous)
+        float *   dev_result = nullptr;    // device-mapped ptr (zero-copy)
+        size_t    result_n = 0;            // allocated element count
+
+        // Host buffers for input (regular malloc, tiny)
+        float *   host_input = nullptr;    // D2H copy target (~21KB)
+        uint8_t * host_dinput = nullptr;   // quantized input (~6KB)
+        size_t    input_n = 0;             // ne00 capacity
+
+        // CUDA event for D2H completion
+        cudaEvent_t input_ready = nullptr;
+
+        // Work item (set by main thread, read by worker)
+        const char * w_delta_ptr = nullptr;
+        ggml_type    w_delta_type = GGML_TYPE_F32;
+        int64_t      w_ne00 = 0;
+        int64_t      w_ne01 = 0;
+        size_t       w_delta_row_stride = 0;
+        int          w_rm_block_size = 0;
+
+        // Pending add (from previous worker result)
+        float *     pending_dst = nullptr;   // GPU dst to add result to
+        int64_t     pending_ne01 = 0;
+    } delta_pipe;
+
+    // Delta prefetch: async DMA of next tensor into VRAM swing buffer
+    struct {
+        void * buf[2] = {nullptr, nullptr};  // 2x VRAM swing buffers
+        size_t buf_size = 0;                  // bytes per buffer (80MB)
+        int    cur_buf = 0;                   // which buffer holds prefetched data
+        bool   pending = false;               // DMA in flight on JIT stream
+        cudaEvent_t done = nullptr;           // signaled when DMA completes
+        const ggml_tensor * prefetched_src0 = nullptr;
+
+        // Ordered queue of delta tensors (built during first token)
+        struct delta_entry {
+            const ggml_tensor * src0;
+            const char * host_ptr;            // pinned mmap pointer
+            size_t bytes;
+        };
+        std::vector<delta_entry> queue;       // execution order
+        int queue_pos = 0;                    // current position (resets each token)
+        bool queue_built = false;             // set after first token
+        int  n_hits = 0;                      // prefetch hits this token
+        int  n_misses = 0;                    // prefetch misses this token
+
+        // Active prefetch map: tensor pointer → (buffer_idx, offset) for O(1) lookup
+        std::unordered_map<const ggml_tensor *, std::pair<int, size_t>> active_map;
+    } delta_prefetch;
+
     int   mmq_id_thresh = 32;
     float fa_offset = 0.6931f; // ln(2)
 #ifdef USE_CUDA_GRAPH

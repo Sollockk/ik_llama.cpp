@@ -7,20 +7,7 @@
 #pragma once
 
 #include "mmvq-templates.cuh"
-
-// Sparse delta accumulation args (separate from mmvq_args for clarity).
-struct mmvq_sparse_args {
-    const void *    packed_weights;   // VRAM: packed non-zero blocks [n_stored * block_bytes * nrows]
-    const uint16_t * block_index;    // VRAM: uint16 indices [n_blocks_stored]
-    const void *    vy;              // Q8_1 quantized input (same as blurry pass)
-    float *         dst;             // output (accumulate: dst += sparse_delta @ input)
-    int             ncols_x;         // full row width in elements (ne00)
-    int             nrows_x;         // number of output rows
-    int             nrows_y;         // padded input rows (for Q8_1 block alignment)
-    int             nrows_dst;       // destination rows
-    int             n_blocks_stored; // number of non-zero blocks per row
-    int             packed_row_blocks;// n_blocks_stored (blocks per packed row)
-};
+#include "mmvq-sparse-args.h"
 
 // Device function: sparse matmul-vec with block index scatter.
 // Iterates only over stored (non-zero) blocks, reading input at scattered positions.
@@ -139,29 +126,27 @@ static __global__ void mul_mat_vec_q_sparse_kernel(
 // Dispatch helper: launch sparse MMVQ for a given type
 template <ggml_type type, int nwarps>
 static void mul_mat_vec_q_sparse_cuda_T(const mmvq_sparse_args & args, cudaStream_t stream) {
-#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
-    constexpr int rows_per_cuda_block = 1;
-#else
-    constexpr int rows_per_cuda_block = args.ncols_x < 4 ? 1 : 2; // can't use args in constexpr
-#endif
-    // Use rows_per_cuda_block = 1 for simplicity in sparse case
-    const int nblocks_y = 1; // single batch dimension for now
-    const dim3 block_nums((args.nrows_x + 0) / 1, nblocks_y, 1); // 1 row per block
+    // 1 row per CUDA block for sparse (simpler, avoids row count issues)
+    const dim3 block_nums(args.nrows_x, 1, 1);
     const dim3 block_dims(WARP_SIZE, nwarps, 1);
 
-    // For ncols_y == 1 (generation, single token):
+    // nb02_packed = bytes of packed data per expert = nrows_x * n_blocks_stored * block_type_size
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    const size_t block_type_size = ggml_type_size(type);
+    const uint64_t nb02_packed = (uint64_t)args.nrows_x * args.packed_row_blocks * block_type_size;
+    const uint64_t nb12 = (uint64_t)args.nrows_y * sizeof(block_q8_1) / QK8_1;
+    const uint64_t nb2 = (uint64_t)args.nrows_dst * sizeof(float);
+
     mul_mat_vec_q_sparse_kernel<type, 1, nwarps><<<block_nums, block_dims, 0, stream>>>(
         args.packed_weights, (const uint16_t *)args.block_index,
         args.vy, args.dst,
         args.ncols_x, args.nrows_x, args.nrows_y, args.nrows_dst,
         args.n_blocks_stored, args.packed_row_blocks,
-        uint64_t(args.nrows_x) * args.packed_row_blocks * ggml_cuda_type_traits<type>::type_size_bytes,
-        uint64_t(args.nrows_y) * sizeof(block_q8_1) / QK8_1,
-        uint64_t(args.nrows_dst) * sizeof(float));
+        nb02_packed, nb12, nb2);
 }
 
 // Public dispatch by quant type
-inline void ggml_cuda_mmvq_sparse_dispatch(ggml_type type, const mmvq_sparse_args & args, cudaStream_t stream) {
+void ggml_cuda_mmvq_sparse_dispatch(ggml_type type, const mmvq_sparse_args & args, cudaStream_t stream) {
     constexpr int nwarps = 4; // same as standard MMVQ
     switch (type) {
         case GGML_TYPE_Q4_0: mul_mat_vec_q_sparse_cuda_T<GGML_TYPE_Q4_0, nwarps>(args, stream); break;

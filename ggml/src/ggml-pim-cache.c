@@ -25,6 +25,7 @@ struct pim_delta_cache * pim_delta_cache_create(
     cache->file_offset  = file_offset;
     cache->expert_bytes = expert_bytes;
     cache->gpu_pinned   = false;
+    cache->dev_ptr      = NULL;
     cache->n_experts    = n_experts;
     memset(cache->populated, 0, sizeof(cache->populated));
 

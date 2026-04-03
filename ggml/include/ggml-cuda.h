@@ -72,6 +72,10 @@ GGML_API void ggml_backend_cuda_unpin_host_memory(void * ptr);
 // which is incompatible with graph capture. Must be called BEFORE first graph eval.
 GGML_API void ggml_backend_cuda_disable_graphs(ggml_backend_t backend);
 
+// Allocate device memory and copy host data to it. Returns device pointer, or NULL on failure.
+GGML_API void * ggml_backend_cuda_device_malloc_and_copy(const void * host_data, size_t size);
+GGML_API void   ggml_backend_cuda_device_free(void * dev_ptr);
+
 #ifdef  __cplusplus
 }
 #endif
