@@ -47,6 +47,19 @@ static __device__ void mul_mat_vec_q_sparse(
         const int orig_bx = block_idx[sbx];
         const int kby = orig_bx * (qk / QK8_1); // y block index at original position
 
+        // Exact-zero skip: if ALL Q8_1 input blocks for this weight block have d==0,
+        // the contribution is zero. Lossless skip for GELU-gated inputs.
+        {
+            constexpr int n_q8_per_x = qk / QK8_1;
+            bool all_zero = true;
+            for (int j = 0; j < ncols_y && all_zero; j++) {
+                for (int q = 0; q < n_q8_per_x && all_zero; q++) {
+                    if (__half2float(y[j*blocks_per_col_y + kby + q].data.d) != 0.0f) all_zero = false;
+                }
+            }
+            if (all_zero) continue;
+        }
+
         const int kqs = vdr * (tid % (qi/vdr));
 
 #pragma unroll

@@ -101,6 +101,21 @@ static __device__ void mul_mat_vec_q(
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
+        // Exact-zero skip for delta accumulate mode: if ALL Q8_1 input blocks
+        // mapping to this weight block have scale d==0, the contribution is
+        // mathematically zero. Lossless — saves weight reads over PCIe/VRAM.
+        // Effective for GELU-gated MoE ffn_down inputs (~10-20% skip rate).
+        if (accumulate) {
+            constexpr int n_q8_per_x = qk / QK8_1; // 1 for Q4_0, 8 for K-quants
+            bool all_zero = true;
+            for (int j = 0; j < ncols_y && all_zero; j++) {
+                for (int q = 0; q < n_q8_per_x && all_zero; q++) {
+                    if (__half2float(y[j*blocks_per_col_y + kby + q].data.d) != 0.0f) all_zero = false;
+                }
+            }
+            if (all_zero) continue;
+        }
+
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 

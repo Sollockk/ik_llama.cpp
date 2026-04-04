@@ -900,28 +900,52 @@ struct ggml_backend_cuda_context {
         int64_t     pending_ne01 = 0;
     } delta_pipe;
 
-    // Delta ring buffer: VRAM cache for delta tensors, filled once then reused.
-    // For generation (same layers every token), data persists — zero DMA after fill.
+    // Delta ring buffer: VRAM LRU cache for delta slices (expert-aware).
+    // For dense models: one slice = full tensor. For MoE: one slice = one expert.
+    // Exploits temporal locality: MoE expert routing repeats ~80% between tokens.
     struct {
         void * vram = nullptr;           // single cudaMalloc
         size_t vram_size = 0;            // total allocated bytes
+        size_t vram_used = 0;            // current high-water mark
 
-        // Tensor lookup: src0_ptr → offset in vram buffer
-        std::unordered_map<const ggml_tensor *, size_t> tensor_map;
-
-        // Layer info (built during first generation token)
-        struct layer_entry {
-            const ggml_tensor * src0;
-            const char * host_ptr;       // pinned mmap pointer
-            size_t bytes;
+        // Slice lookup: hash(tensor_ptr, expert_id) → VRAM offset
+        struct slice_info {
+            size_t offset;               // byte offset in vram
+            size_t bytes;                // size of this slice
+            int64_t last_used;           // token counter for LRU
         };
-        std::vector<layer_entry> all_tensors; // all GPU delta tensors in execution order
-        bool   built = false;            // set after first gen token complete
-        bool   filled = false;           // set after VRAM fill complete
-        int    dispatch_count = 0;       // per-token dispatch counter
+        std::unordered_map<uint64_t, slice_info> slice_map;
+
+        // Free list for evicted slices (simple: just track offset+size)
+        struct free_block { size_t offset; size_t bytes; };
+        std::vector<free_block> free_list;
+
+        int64_t token_counter = 0;       // monotonic, incremented per token
         int    n_hits = 0;
         int    n_misses = 0;
-        cudaEvent_t fill_done = nullptr; // signaled when initial fill completes
+        int    n_evictions = 0;
+        cudaEvent_t upload_done = nullptr;
+        bool   upload_pending = false;
+
+        // Helper: compute hash key for (tensor, expert_id) pair
+        static uint64_t key(const void * tensor, int expert_id) {
+            uint64_t h = (uint64_t)(uintptr_t)tensor;
+            h ^= (uint64_t)expert_id * 0x9E3779B97F4A7C15ULL; // fibonacci hash
+            return h;
+        }
+
+        // Dense model compat: full tensor = expert_id 0
+        // Layer info (built during first generation token for dense models)
+        struct layer_entry {
+            const ggml_tensor * src0;
+            const char * host_ptr;
+            size_t bytes;
+        };
+        std::vector<layer_entry> all_tensors;
+        bool   built = false;
+        bool   filled = false;
+        int    dispatch_count = 0;
+        cudaEvent_t fill_done = nullptr;
         bool   fill_pending = false;
     } delta_ring;
 

@@ -699,6 +699,7 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  hparams.n_embd_per_layer, false);
                 ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA,    hparams.n_embd_head_k_swa, false);
                 ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,  hparams.n_embd_head_v_swa, false);
+                ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
 
                 uint32_t n_rot_swa = 0;
                 ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT_SWA, n_rot_swa, false);

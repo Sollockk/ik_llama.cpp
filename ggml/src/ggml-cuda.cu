@@ -2396,12 +2396,13 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
             const char * n = delta_src0->name;
             skip = (strstr(n, "ffn_gate") || strstr(n, "ffn_up"));
         }
-        // MMVQ kernels only support batch <= MMVQ_MAX_BATCH_SIZE (8)
-        if (src1->ne[1] > MMVQ_MAX_BATCH_SIZE) skip = true;
 
-        // Priority 1: Sparse delta in VRAM
+        const bool use_mmvq = (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE);
+        const int64_t ne11 = src1->ne[1];
+
+        // Priority 1: Sparse delta in VRAM (MMVQ only)
         if (delta_src0 && delta_src0->sparse_delta_gpu != NULL
-            && ctx.delta_ready
+            && ctx.delta_ready && use_mmvq
             && delta_src0->buffer && !ggml_backend_buffer_is_host(delta_src0->buffer)
             && !skip) {
 
@@ -2434,7 +2435,7 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
                 }
             }
         }
-        // Priority 2: Ring buffer (VRAM) or PCIe fallback
+        // Priority 2: Ring buffer / PCIe — MMVQ (batch<=8) or cuBLAS (batch>8)
         else if (delta_src0 && delta_src0->ray_march_delta_cache != NULL
             && ctx.delta_ready
             && delta_src0->buffer && !ggml_backend_buffer_is_host(delta_src0->buffer)
@@ -2449,19 +2450,20 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
             const int64_t ne00 = delta_src0->ne[0];
             const int64_t ne01 = delta_src0->ne[1];
 
-            // O(1) ring buffer lookup
-            auto map_it = ring.tensor_map.find(delta_src0);
-            if (map_it != ring.tensor_map.end() && ring.filled) {
-                // Wait for initial fill if still pending
-                if (ring.fill_pending) {
-                    CUDA_CHECK(cudaStreamWaitEvent(stream, ring.fill_done, 0));
-                    ring.fill_pending = false;
+            // O(1) ring buffer lookup (dense: expert_id=0)
+            uint64_t rk = ring.key(delta_src0, 0);
+            auto map_it = ring.slice_map.find(rk);
+            if (map_it != ring.slice_map.end()) {
+                if (ring.upload_pending) {
+                    CUDA_CHECK(cudaStreamWaitEvent(stream, ring.upload_done, 0));
+                    ring.upload_pending = false;
                 }
-                delta_ptr = (const char *)ring.vram + map_it->second;
+                delta_ptr = (const char *)ring.vram + map_it->second.offset;
+                map_it->second.last_used = ring.token_counter;
                 source = "ring";
                 ring.n_hits++;
             }
-            // Fallback: PCIe zero-copy from mmap (skip during CUDA graph capture/replay)
+            // Fallback: PCIe zero-copy from mmap
             if (!delta_ptr) {
 #ifdef USE_CUDA_GRAPH
                 if (!ctx.cur_graph) {
@@ -2476,8 +2478,10 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
                 ring.n_misses++;
             }
 
-            if (delta_ptr && ggml_cuda_mmvq_type_supported(delta_src0->ray_march_delta_type)) {
-                const ggml_type delta_type = delta_src0->ray_march_delta_type;
+            const ggml_type delta_type = delta_src0->ray_march_delta_type;
+
+            if (delta_ptr && use_mmvq && ggml_cuda_mmvq_type_supported(delta_type)) {
+                // Small batch: use MMVQ with accumulate
                 const size_t delta_nb01 = ggml_row_size(delta_type, ne00);
 
                 mmvq_args delta_args{
@@ -2491,7 +2495,7 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
                     /* ncols_x   */ (int)ne00,
                     /* nrows_x   */ (int)ne01,
                     /* nrows_y   */ (int)ne10_padded,
-                    /* ncols_y   */ (int)src1->ne[1],
+                    /* ncols_y   */ (int)ne11,
                     /* nrows_dst */ (int)dst->ne[0],
                     /* ne2       */ 1,
                     /* nb02      */ (uint64_t)(ne01 * delta_nb01),
@@ -2505,32 +2509,82 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
                 };
 
                 ggml_cuda_mmvq_dispatch(delta_type, delta_args, stream);
+            }
+            else if (delta_ptr) {
+                // Large batch: dequantize delta to f16, cuBLAS GEMM, accumulate into dst
+                const int id = ggml_cuda_get_device();
+                const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(delta_type);
 
-                // Build tensor list during first gen token
-                if (!ring.built) {
-                    // Detect wrap-around: if we see a tensor already in the list,
-                    // the first token is complete.
-                    bool duplicate = false;
-                    for (const auto & e : ring.all_tensors) {
-                        if (e.src0 == delta_src0) { duplicate = true; break; }
-                    }
-                    if (duplicate) {
-                        ring.built = true;
-                        ring.dispatch_count = 0;
-                        fprintf(stderr, "[delta-ring] tensor list built: %zu tensors\n",
-                                ring.all_tensors.size());
-                    } else {
-                        const char * hp = pim_delta_cache_get(cache, 0);
-                        ring.all_tensors.push_back({delta_src0, hp, (size_t)ne01 * delta_nb01});
+                if (to_fp16) {
+                    // Dequantize delta weights [ne01 × ne00] to f16
+                    ggml_cuda_pool_alloc<half> delta_f16(ctx.pool(id), ne01 * ne00);
+                    to_fp16(delta_ptr, delta_f16.get(), ne01, ne00, stream);
+
+                    // Input src1 is f32 [ne00 × ne11] — convert to f16
+                    ggml_cuda_pool_alloc<half> src1_f16(ctx.pool(id), ne00 * ne11);
+                    const to_fp16_cuda_t src1_to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+                    src1_to_fp16((const char *)src1->data, src1_f16.get(), ne11, ne00, stream);
+
+                    // GEMM: dst += delta @ input
+                    // delta is [ne00, ne01] row-major (transposed for cuBLAS)
+                    // src1 is [ne00, ne11]
+                    // result is [ne01, ne11]
+                    ggml_cuda_pool_alloc<half> tmp_f16(ctx.pool(id), ne01 * ne11);
+                    const half alpha_f16 = 1.0f;
+                    const half beta_f16  = 0.0f;
+
+                    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+                    CUBLAS_CHECK(
+                        cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                                ne01, ne11, ne00,
+                                &alpha_f16, delta_f16.get(), CUDA_R_16F, ne00,
+                                            src1_f16.get(),  CUDA_R_16F, ne00,
+                                &beta_f16,  tmp_f16.get(),   CUDA_R_16F, ne01,
+                                CUBLAS_COMPUTE_16F,
+                                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+                    // Convert f16 result to f32 and add to dst
+                    ggml_cuda_pool_alloc<float> tmp_f32(ctx.pool(id), ne01 * ne11);
+                    const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+                    to_fp32(tmp_f16.get(), tmp_f32.get(), ne01, ne11, stream);
+
+                    const int n = (int)(ne01 * ne11);
+                    k_delta_add_f32<<<(n + 255)/256, 256, 0, stream>>>(
+                        (float *)dst->data, tmp_f32.get(), n);
+
+                    static int diag_cublas = 0;
+                    if (diag_cublas < 6) { diag_cublas++;
+                        fprintf(stderr, "[gpu-delta-cublas] %s ne=[%lld,%lld] batch=%lld src=%s\n",
+                                delta_src0->name, (long long)ne00, (long long)ne01,
+                                (long long)ne11, source);
                     }
                 }
-                ring.dispatch_count++;
+            }
 
-                static int diag = 0;
-                if (diag < 10) { diag++;
-                    fprintf(stderr, "[gpu-delta-ring] %s ne=[%lld,%lld] src=%s\n",
-                            delta_src0->name, (long long)ne00, (long long)ne01, source);
-                }            }
+            // Build tensor list during first token (small batch only to avoid prompt)
+            if (use_mmvq && !ring.built) {
+                bool duplicate = false;
+                for (const auto & e : ring.all_tensors) {
+                    if (e.src0 == delta_src0) { duplicate = true; break; }
+                }
+                if (duplicate) {
+                    ring.built = true;
+                    ring.dispatch_count = 0;
+                    fprintf(stderr, "[delta-ring] tensor list built: %zu tensors\n",
+                            ring.all_tensors.size());
+                } else {
+                    const size_t delta_nb01 = ggml_row_size(delta_type, ne00);
+                    const char * hp = pim_delta_cache_get(cache, 0);
+                    ring.all_tensors.push_back({delta_src0, hp, (size_t)ne01 * delta_nb01});
+                }
+            }
+            ring.dispatch_count++;
+
+            static int diag = 0;
+            if (diag < 10 && use_mmvq) { diag++;
+                fprintf(stderr, "[gpu-delta-ring] %s ne=[%lld,%lld] src=%s\n",
+                        delta_src0->name, (long long)ne00, (long long)ne01, source);
+            }
         }
     }
 
@@ -2676,15 +2730,17 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
             }
             if (skip) goto delta_nonq_done;
 
-            // Ring buffer lookup (O(1))
+            // Ring buffer lookup (O(1), dense: expert_id=0)
             if (ring.vram) {
-                auto map_it = ring.tensor_map.find(src0);
-                if (map_it != ring.tensor_map.end() && ring.filled) {
-                    if (ring.fill_pending) {
-                        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ring.fill_done, 0));
-                        ring.fill_pending = false;
+                uint64_t rk = ring.key(src0, 0);
+                auto map_it = ring.slice_map.find(rk);
+                if (map_it != ring.slice_map.end()) {
+                    if (ring.upload_pending) {
+                        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ring.upload_done, 0));
+                        ring.upload_pending = false;
                     }
-                    delta_ptr = (const char *)ring.vram + map_it->second;
+                    delta_ptr = (const char *)ring.vram + map_it->second.offset;
+                    map_it->second.last_used = ring.token_counter;
                     source = "ring";
                 }
             }
@@ -2921,6 +2977,221 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 (const char *)src0->data, nullptr, src1_quantized.get(), (float *)dst->data,
                 0, src0->ne[1], 1, src1_padded_col_size, stream);
             CUDA_CHECK(cudaGetLastError());
+
+            // MoE delta correction: per-expert delta with accumulate=true.
+            // Priority 1: sparse delta in VRAM (fastest, ~0.1ms/expert)
+            // Priority 2: full delta via ring buffer or PCIe
+            // Skip ffn_gate/up — nonlinear activation makes post-hoc addition wrong.
+            if ((src0->ray_march_delta_cache || src0->sparse_delta_gpu) && ctx.delta_ready) {
+                bool skip_delta = false;
+                if (src0->name[0] != '\0') {
+                    const char * n = src0->name;
+                    skip_delta = (strstr(n, "ffn_gate") || strstr(n, "ffn_up"));
+                }
+
+                // Priority 1: Sparse delta in VRAM (per-expert packed blocks)
+                if (!skip_delta && src0->sparse_delta_gpu) {
+                    struct pim_sparse_delta_gpu * sdg = (struct pim_sparse_delta_gpu *)src0->sparse_delta_gpu;
+                    const ggml_type delta_type = src0->ray_march_delta_type;
+
+                    if (ggml_cuda_mmvq_type_supported(delta_type)) {
+                        // Read expert IDs
+                        const int64_t n_expert_ids = ids->ne[0];
+                        const int64_t n_tokens_ids = ids->ne[1];
+                        std::vector<int32_t> ids_host(n_expert_ids * n_tokens_ids);
+                        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data,
+                                                   ids_host.size() * sizeof(int32_t),
+                                                   cudaMemcpyDeviceToHost, stream));
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                        // For each token-expert pair, dispatch sparse MMVQ
+                        for (int64_t tid = 0; tid < n_tokens_ids; tid++) {
+                            for (int64_t k = 0; k < n_expert_ids; k++) {
+                                int32_t eid = ids_host[tid * n_expert_ids + k];
+                                if (eid < 0 || eid >= sdg->n_experts) continue;
+
+                                float * dst_row = (float *)dst->data +
+                                                  (tid * n_expert_ids + k) * dst->ne[0];
+
+                                // Sparse packed weights for this expert
+                                const char * packed = (const char *)sdg->dev_packed +
+                                                      (size_t)eid * sdg->packed_expert_bytes;
+                                const uint16_t * idx = (const uint16_t *)sdg->dev_index;
+
+                                mmvq_sparse_args sparse_args{
+                                    /* packed_weights   */ packed,
+                                    /* block_index      */ idx,
+                                    /* vy               */ src1_quantized.get() + tid * src_1_ddq_size,
+                                    /* dst              */ dst_row,
+                                    /* ncols_x          */ (int)src0->ne[0],
+                                    /* nrows_x          */ (int)src0->ne[1],
+                                    /* nrows_y          */ (int)src1_padded_col_size,
+                                    /* nrows_dst        */ (int)dst->ne[0],
+                                    /* n_blocks_stored  */ sdg->n_blocks_stored,
+                                    /* packed_row_blocks*/ sdg->n_blocks_stored
+                                };
+
+                                ggml_cuda_mmvq_sparse_dispatch(delta_type, sparse_args, stream);
+                            }
+                        }
+
+                        static int moe_sparse_diag = 0;
+                        if (moe_sparse_diag < 6) {
+                            moe_sparse_diag++;
+                            fprintf(stderr, "[moe-delta-sparse] %s: blocks=%d/%d VRAM\n",
+                                    src0->name, sdg->n_blocks_stored, sdg->n_blocks_total);
+                        }
+                        skip_delta = true; // don't fall through to full delta
+                    }
+                }
+
+                // Priority 2: Full delta via ring buffer or PCIe
+                if (!skip_delta && src0->ray_march_delta_cache) {
+                    struct pim_delta_cache * cache = (struct pim_delta_cache *)src0->ray_march_delta_cache;
+                    const ggml_type delta_type = src0->ray_march_delta_type;
+
+                    if (ggml_cuda_mmvq_type_supported(delta_type)) {
+                        // Read expert IDs from GPU
+                        const int64_t n_expert_ids = ids->ne[0]; // top-K (e.g., 8)
+                        const int64_t n_tokens_ids = ids->ne[1]; // n_tokens
+                        std::vector<int32_t> ids_host(n_expert_ids * n_tokens_ids);
+                        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data,
+                                                   ids_host.size() * sizeof(int32_t),
+                                                   cudaMemcpyDeviceToHost, stream));
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                        // Collect unique expert IDs
+                        std::vector<bool> expert_seen(src0->ne[2], false);
+                        std::vector<int32_t> active_experts;
+                        for (auto eid : ids_host) {
+                            if (eid >= 0 && eid < src0->ne[2] && !expert_seen[eid]) {
+                                expert_seen[eid] = true;
+                                active_experts.push_back(eid);
+                            }
+                        }
+
+                        const size_t delta_nb01 = ggml_row_size(delta_type, src0->ne[0]);
+                        const int64_t ne01_expert = src0->ne[1]; // rows per expert
+                        const size_t expert_slice_bytes = (size_t)ne01_expert * delta_nb01;
+                        auto & ring = ctx.delta_ring;
+
+                        // For each active expert, dispatch delta MMVQ on its slice
+                        for (int32_t eid : active_experts) {
+                            const char * delta_ptr = nullptr;
+
+                            // Check ring buffer first (O(1) lookup)
+                            if (ring.vram) {
+                                uint64_t rk = ring.key(src0, eid);
+                                auto it = ring.slice_map.find(rk);
+                                if (it != ring.slice_map.end()) {
+                                    if (ring.upload_pending) {
+                                        CUDA_CHECK(cudaStreamWaitEvent(stream, ring.upload_done, 0));
+                                        ring.upload_pending = false;
+                                    }
+                                    delta_ptr = (const char *)ring.vram + it->second.offset;
+                                    it->second.last_used = ring.token_counter;
+                                    ring.n_hits++;
+                                } else {
+                                    // Cache miss: load this expert slice into ring buffer
+                                    const char * host_ptr = pim_delta_cache_get(cache, eid);
+                                    if (host_ptr && ring.vram_used + expert_slice_bytes <= ring.vram_size) {
+                                        // Space available: append
+                                        size_t off = ring.vram_used;
+                                        CUDA_CHECK(cudaMemcpyAsync((char *)ring.vram + off, host_ptr,
+                                                                   expert_slice_bytes, cudaMemcpyHostToDevice, stream));
+                                        ring.slice_map[rk] = {off, expert_slice_bytes, ring.token_counter};
+                                        ring.vram_used += expert_slice_bytes;
+                                        delta_ptr = (const char *)ring.vram + off;
+                                    } else if (host_ptr) {
+                                        // Buffer full: LRU evict oldest slice
+                                        // Find oldest entry
+                                        uint64_t oldest_key = 0;
+                                        int64_t oldest_time = INT64_MAX;
+                                        for (auto & [k, v] : ring.slice_map) {
+                                            if (v.last_used < oldest_time && v.bytes >= expert_slice_bytes) {
+                                                oldest_time = v.last_used;
+                                                oldest_key = k;
+                                            }
+                                        }
+                                        if (oldest_key && oldest_time < ring.token_counter) {
+                                            auto evict_it = ring.slice_map.find(oldest_key);
+                                            size_t off = evict_it->second.offset;
+                                            ring.slice_map.erase(evict_it);
+                                            CUDA_CHECK(cudaMemcpyAsync((char *)ring.vram + off, host_ptr,
+                                                                       expert_slice_bytes, cudaMemcpyHostToDevice, stream));
+                                            ring.slice_map[rk] = {off, expert_slice_bytes, ring.token_counter};
+                                            delta_ptr = (const char *)ring.vram + off;
+                                            ring.n_evictions++;
+                                        } else {
+                                            // Can't evict: fall back to PCIe zero-copy
+                                            delta_ptr = host_ptr;
+                                        }
+                                    }
+                                    ring.n_misses++;
+                                }
+                            } else {
+                                // No ring buffer: PCIe zero-copy
+                                delta_ptr = pim_delta_cache_get(cache, eid);
+                                ring.n_misses++;
+                            }
+                            if (!delta_ptr) continue;
+
+                            // Delta MMVQ: accumulates correction for this expert's rows in dst.
+                            // The base matmul already wrote dst[row] = sum(blurry @ input) per expert.
+                            // We add delta[expert] @ input to the same dst rows.
+                            // Note: dst layout from mul_mat_vec_q_id is [ne0, n_ids, ne11, 1]
+                            // where each expert's output is scattered across the n_ids dimension.
+                            // For single-token (ne11=1), dst is [ne0, n_ids, 1, 1].
+
+                            // Find which dst rows correspond to this expert
+                            for (int64_t tid = 0; tid < n_tokens_ids; tid++) {
+                                for (int64_t k = 0; k < n_expert_ids; k++) {
+                                    if (ids_host[tid * n_expert_ids + k] == eid) {
+                                        // This token-expert pair needs delta correction.
+                                        // dst offset: (tid * n_expert_ids + k) * ne0 * sizeof(float)
+                                        float * dst_row = (float *)dst->data +
+                                                          (tid * n_expert_ids + k) * dst->ne[0];
+
+                                        mmvq_args delta_args{
+                                            /* vx_u      */ delta_ptr,
+                                            /* vx_g      */ nullptr,
+                                            /* bias_u    */ nullptr,
+                                            /* bias_g    */ nullptr,
+                                            /* vy        */ src1_quantized.get() + tid * src_1_ddq_size,
+                                            /* dst       */ dst_row,
+                                            /* ids_data  */ nullptr,
+                                            /* ncols_x   */ (int)src0->ne[0],
+                                            /* nrows_x   */ (int)ne01_expert,
+                                            /* nrows_y   */ (int)src1_padded_col_size,
+                                            /* ncols_y   */ 1,
+                                            /* nrows_dst */ (int)dst->ne[0],
+                                            /* ne2       */ 1,
+                                            /* nb02      */ (uint64_t)(ne01_expert * delta_nb01),
+                                            /* nb12      */ (uint64_t)(src1_padded_col_size * sizeof(block_q8_1) / QK8_1),
+                                            /* nb2       */ (uint64_t)(dst->ne[0] * sizeof(float)),
+                                            /* ids_nb0   */ 0,
+                                            /* bias_nb1  */ 0,
+                                            /* unary_op  */ GGML_UNARY_OP_COUNT,
+                                            /* limit     */ INFINITY,
+                                            /* accumulate*/ true
+                                        };
+
+                                        ggml_cuda_mmvq_dispatch(delta_type, delta_args, stream);
+                                    }
+                                }
+                            }
+                        }
+
+                        static int moe_delta_diag = 0;
+                        if (moe_delta_diag < 6) {
+                            moe_delta_diag++;
+                            fprintf(stderr, "[moe-delta] %s: %zu active experts, ne=[%lld,%lld,%lld]\n",
+                                    src0->name, active_experts.size(),
+                                    (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2]);
+                        }
+                    }
+                } // if ggml_cuda_mmvq_type_supported
+                } // if !skip_delta && ray_march_delta_cache
 
             if (next && next->op == GGML_OP_MUL_MAT_ID && next->src[0]->type == src0->type && src1 == next->src[1] &&
                 ggml_are_same_shape(src0, next->src[0]) &&
@@ -4588,53 +4859,48 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
     auto graph = ggml_cuda_get_graph(*cuda_ctx, ggml_cuda_graph_get_key(cgraph));
 #endif
 
-    // Delta ring buffer: build tensor list (first token), fill VRAM (second token)
+    // Delta ring buffer: LRU cache for delta slices (expert-aware).
+    // Dense models: first token builds tensor list, second fills VRAM (one-time).
+    // MoE models: slices loaded on-demand per expert, LRU eviction when full.
     auto & ring = cuda_ctx->delta_ring;
     if (cuda_ctx->delta_ready && ring.vram) {
-        // After first gen token fills the tensor list, do one-time VRAM upload
+        // Dense model path: one-time VRAM fill from tensor list
         if (ring.built && !ring.filled && !ring.all_tensors.empty()) {
-            // Sort by ascending size to maximize hit count (pack small tensors first)
-            std::sort(ring.all_tensors.begin(), ring.all_tensors.end(),
-                      [](const auto & a, const auto & b) { return a.bytes < b.bytes; });
-
             size_t offset = 0;
             auto upload_stream = cuda_ctx->jit_upload_stream();
             int n_loaded = 0;
             for (auto & e : ring.all_tensors) {
-                if (offset + e.bytes > ring.vram_size) continue; // skip, try smaller ones
+                if (offset + e.bytes > ring.vram_size) break;
                 if (e.host_ptr) {
                     CUDA_CHECK(cudaMemcpyAsync((char *)ring.vram + offset, e.host_ptr,
                                                e.bytes, cudaMemcpyHostToDevice, upload_stream));
-                    ring.tensor_map[e.src0] = offset;
+                    uint64_t rk = ring.key(e.src0, 0);
+                    ring.slice_map[rk] = {offset, e.bytes, ring.token_counter};
                     offset += e.bytes;
                     n_loaded++;
                 }
             }
+            ring.vram_used = offset;
             CUDA_CHECK(cudaEventRecord(ring.fill_done, upload_stream));
             ring.fill_pending = true;
             ring.filled = true;
             fprintf(stderr, "[delta-ring] filled %d/%zu tensors (%.1f MB) into VRAM\n",
                     n_loaded, ring.all_tensors.size(), offset / (1024.0 * 1024.0));
         }
-        // Building→built transition is detected in the dispatch path
-        // (when a duplicate tensor is seen, meaning we've wrapped to token 2).
-        // Here we just handle the fill after built is set.
-        if (ring.built && !ring.filled && !ring.all_tensors.empty() && ring.dispatch_count == 0) {
-            // redundant guard — fill is handled above. This catches edge cases.
-        }
-        // Token boundary: reset dispatch count
-        if (ring.filled && ring.dispatch_count >= (int)ring.all_tensors.size()) {
-            // Print stats
+
+        // Token boundary: increment counter, print stats
+        ring.token_counter++;
+        if ((ring.n_hits + ring.n_misses) > 0) {
             static int stat_diag = 0;
-            if (stat_diag < 20 && (ring.n_hits + ring.n_misses) > 0) {
+            if (stat_diag < 20) {
                 stat_diag++;
-                fprintf(stderr, "[delta-ring] token: hits=%d misses=%d (%.0f%%)\n",
-                        ring.n_hits, ring.n_misses,
+                fprintf(stderr, "[delta-ring] token %lld: hits=%d misses=%d evictions=%d (%.0f%% hit)\n",
+                        (long long)ring.token_counter, ring.n_hits, ring.n_misses, ring.n_evictions,
                         100.0 * ring.n_hits / std::max(1, ring.n_hits + ring.n_misses));
             }
-            ring.dispatch_count = 0;
             ring.n_hits = 0;
             ring.n_misses = 0;
+            ring.n_evictions = 0;
         }
     }
 
@@ -5847,7 +6113,8 @@ void ggml_backend_cuda_enable_delta_post_graph(ggml_backend_t backend, bool enab
 
         if (ring.vram) {
             CUDA_CHECK(cudaEventCreateWithFlags(&ring.fill_done, cudaEventDisableTiming));
-            fprintf(stderr, "[cuda-delta] ring buffer allocated: %.0f MB VRAM\n",
+            CUDA_CHECK(cudaEventCreateWithFlags(&ring.upload_done, cudaEventDisableTiming));
+            fprintf(stderr, "[cuda-delta] ring buffer allocated: %.0f MB VRAM (LRU expert-aware)\n",
                     ring.vram_size / (1024.0 * 1024.0));
         } else {
             fprintf(stderr, "[cuda-delta] WARNING: ring buffer alloc failed, GPU delta disabled\n");

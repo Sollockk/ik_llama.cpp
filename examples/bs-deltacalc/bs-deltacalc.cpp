@@ -397,12 +397,11 @@ int main(int argc, char ** argv) {
     int64_t t_start = ggml_time_us();
     std::mutex write_mtx;  // protects file writes
 
-    // Sparse mode: accumulate per-tensor block indices for Phase 2.5
+    // Sparse mode: accumulate per-tensor, per-expert block indices for Phase 2.5
     struct SparseInfo {
         std::string name;
-        std::vector<uint16_t> block_indices; // significant block positions
+        std::vector<std::vector<uint16_t>> per_expert_indices; // [n_experts][n_blocks_stored_for_expert]
         int64_t n_blocks_total;              // total blocks per expert
-        int64_t n_blocks_stored;             // significant blocks
         int64_t n_per_row;                   // ne00
         int64_t rows_per_expert;
         int64_t n_experts;
@@ -528,55 +527,49 @@ int main(int argc, char ** argv) {
         }
 
         // Build sparse index for this tensor (level 1)
-        // Per-expert adaptive threshold: a block is kept if ANY expert considers
-        // it significant relative to that expert's own max importance.
+        // Per-expert independent thresholds: each expert keeps only its own
+        // significant blocks. No union — MoE experts have independent patterns.
         if (sparse_threshold > 0 && n_blocks_per_expert > 0) {
-            // Per-expert threshold
-            std::vector<float> expert_max(n_experts, 0.0f);
-            for (int64_t ei = 0; ei < n_experts; ei++) {
-                for (int64_t b = 0; b < n_blocks_per_expert; b++) {
-                    if (expert_block_importance[ei][b] > expert_max[ei])
-                        expert_max[ei] = expert_block_importance[ei][b];
-                }
-            }
-
-            // Union: block survives if ANY expert says it's important
-            std::vector<bool> block_significant(n_blocks_per_expert, false);
-            for (int64_t b = 0; b < n_blocks_per_expert; b++) {
-                for (int64_t ei = 0; ei < n_experts; ei++) {
-                    float thresh = expert_max[ei] * sparse_threshold;
-                    if (expert_block_importance[ei][b] >= thresh) {
-                        block_significant[b] = true;
-                        break;
-                    }
-                }
-            }
-
             SparseInfo si;
             si.name = tname;
             si.n_blocks_total = n_blocks_per_expert;
             si.n_per_row = n_per_row;
             si.rows_per_expert = rows_per_expert;
             si.n_experts = n_experts;
-            for (int64_t b = 0; b < n_blocks_per_expert; b++) {
-                if (block_significant[b]) {
-                    si.block_indices.push_back((uint16_t)b);
+            si.per_expert_indices.resize(n_experts);
+
+            int64_t total_kept = 0, total_possible = 0;
+            for (int64_t ei = 0; ei < n_experts; ei++) {
+                // Find this expert's max importance
+                float emax = 0.0f;
+                for (int64_t b = 0; b < n_blocks_per_expert; b++) {
+                    if (expert_block_importance[ei][b] > emax)
+                        emax = expert_block_importance[ei][b];
                 }
+                float thresh = emax * sparse_threshold;
+
+                // Keep blocks above threshold for this expert
+                for (int64_t b = 0; b < n_blocks_per_expert; b++) {
+                    if (expert_block_importance[ei][b] >= thresh) {
+                        si.per_expert_indices[ei].push_back((uint16_t)b);
+                    }
+                }
+                total_kept += (int64_t)si.per_expert_indices[ei].size();
+                total_possible += n_blocks_per_expert;
             }
-            si.n_blocks_stored = (int64_t)si.block_indices.size();
 
             sparse_infos.push_back(std::move(si));
+
+            double pruned_pct = 100.0 * (1.0 - (double)total_kept / (double)total_possible);
+            fprintf(stderr, "  [sparse] %s: avg %.0f%% pruned across %lld experts\n",
+                    tname.c_str(), pruned_pct, (long long)n_experts);
         }
 
         double elapsed = (ggml_time_us() - t_start) / 1e6;
         double eta = (elapsed / (ti + 1)) * (n_tensors - ti - 1);
         if (sparse_threshold > 0 && n_blocks_per_expert > 0 && !sparse_infos.empty()) {
-            auto & last = sparse_infos.back();
-            fprintf(stderr, "  [%d/%d] %s: %lld→%lld blocks kept (%.0f%% pruned) [%.0fs ETA %.0fs]\n",
-                    ti+1, n_tensors, tname.c_str(),
-                    (long long)last.n_blocks_total, (long long)last.n_blocks_stored,
-                    100.0 * (1.0 - (double)last.n_blocks_stored / last.n_blocks_total),
-                    elapsed, eta);
+            fprintf(stderr, "  [%d/%d] %.0fs ETA %.0fs\n",
+                    ti+1, n_tensors, elapsed, eta);
         } else {
             fprintf(stderr, "\r  [%d/%d] %.0fs ETA %.0fs  (%s: %.1fM elems, %lld experts)          ",
                     ti+1, n_tensors, elapsed, eta, tname.c_str(),
@@ -603,7 +596,7 @@ int main(int argc, char ** argv) {
         char sparse_path[512];
         snprintf(sparse_path, sizeof(sparse_path), "%s_sparse_1.gguf", out_prefix);
 
-        // Build GGUF header with sparse tensors
+        // Build GGUF header with per-expert sparse tensors
         gguf_context * shdr = gguf_init_empty();
         gguf_set_val_str(shdr, "general.architecture", model_arch.c_str());
         gguf_set_val_str(shdr, "general.type", "delta_correction_sparse");
@@ -611,34 +604,43 @@ int main(int argc, char ** argv) {
         gguf_set_val_str(shdr, "bs.delta.quant_type", quant_str);
         gguf_set_val_bool(shdr, "bs.delta.sparse", true);
         gguf_set_val_f32(shdr, "bs.delta.sparse_threshold", sparse_threshold);
+        gguf_set_val_bool(shdr, "bs.delta.per_expert_index", true);
 
+        // For per-expert sparse: use the MAX blocks stored across all experts
+        // for the packed tensor shape (experts with fewer blocks are zero-padded).
         const size_t sctx_size = sparse_infos.size() * 2 * ggml_tensor_overhead() + 16*1024*1024;
         ggml_init_params sip = { .mem_size = sctx_size, .mem_buffer = nullptr, .no_alloc = true };
         ggml_context * sctx = ggml_init(sip);
 
         for (auto & si : sparse_infos) {
-            // Packed delta tensor: n_stored_blocks * block_elems per expert row dimension
-            int64_t packed_elems_per_expert = si.n_blocks_stored * ggml_blck_size(delta_type);
+            // Find max blocks stored across experts (for uniform tensor shape)
+            int64_t max_stored = 0;
+            for (int64_t ei = 0; ei < si.n_experts; ei++) {
+                max_stored = std::max(max_stored, (int64_t)si.per_expert_indices[ei].size());
+            }
+            if (max_stored == 0) max_stored = 1;
+
+            // Packed delta tensor: [max_stored * block_elems, 1, n_experts]
+            int64_t packed_elems = max_stored * ggml_blck_size(delta_type);
             ggml_tensor * td = ggml_new_tensor_3d(sctx, delta_type,
-                packed_elems_per_expert > 0 ? packed_elems_per_expert : 1,
-                si.rows_per_expert > 0 ? 1 : 1,  // packed: 1 "row" of packed blocks
-                si.n_experts);
+                packed_elems, 1, si.n_experts);
             ggml_set_name(td, si.name.c_str());
             gguf_add_tensor(shdr, td);
 
-            // Index tensor: uint16 array of block positions
+            // Per-expert index tensor: [max_stored, n_experts] — uint16 block positions
+            // Unused slots filled with 0xFFFF (sentinel).
             std::string idx_name = si.name + ".idx";
-            ggml_tensor * ti_t = ggml_new_tensor_1d(sctx, GGML_TYPE_I16,
-                si.n_blocks_stored > 0 ? si.n_blocks_stored : 1);
+            ggml_tensor * ti_t = ggml_new_tensor_2d(sctx, GGML_TYPE_I16,
+                max_stored, si.n_experts);
             ggml_set_name(ti_t, idx_name.c_str());
             gguf_add_tensor(shdr, ti_t);
 
-            // Store metadata
+            // Metadata
             char key[256];
             snprintf(key, sizeof(key), "bs.delta.%s.n_blocks_total", si.name.c_str());
             gguf_set_val_i32(shdr, key, (int32_t)si.n_blocks_total);
-            snprintf(key, sizeof(key), "bs.delta.%s.n_blocks_stored", si.name.c_str());
-            gguf_set_val_i32(shdr, key, (int32_t)si.n_blocks_stored);
+            snprintf(key, sizeof(key), "bs.delta.%s.max_blocks_stored", si.name.c_str());
+            gguf_set_val_i32(shdr, key, (int32_t)max_stored);
         }
 
         gguf_write_to_file(shdr, sparse_path, true);
@@ -646,34 +648,41 @@ int main(int argc, char ** argv) {
         gguf_free(shdr);
         ggml_free(sctx);
 
-        // Write sparse data
+        // Write sparse data (per-expert packed blocks + per-expert indices)
         FILE * sfp = fopen(sparse_path, "r+b");
         if (!sfp) { fprintf(stderr, "  ERROR: cannot open %s for writing\n", sparse_path); fclose(full_fp); goto skip_sparse; }
         fseek(sfp, (long)sparse_data_offset, SEEK_SET);
 
-        // Read full delta and pack significant blocks
         size_t full_data_offset = level_files[0].data_offset;
         size_t full_cursor = full_data_offset;
+        size_t total_sparse_bytes = 0;
 
         for (size_t si_idx = 0; si_idx < sparse_infos.size(); si_idx++) {
             auto & si = sparse_infos[si_idx];
-            const size_t block_bytes = ggml_type_size(delta_type); // bytes per quantization block
+            const size_t block_bytes = ggml_type_size(delta_type);
             const size_t full_expert_bytes = ggml_row_size(delta_type, si.n_per_row) * si.rows_per_expert;
-            const size_t packed_expert_bytes = si.n_blocks_stored * block_bytes;
 
-            std::vector<uint8_t> full_expert(full_expert_bytes);
-            std::vector<uint8_t> packed(packed_expert_bytes);
-
+            // Find max stored for this tensor
+            int64_t max_stored = 0;
             for (int64_t ei = 0; ei < si.n_experts; ei++) {
-                // Read full expert from level-1 output
+                max_stored = std::max(max_stored, (int64_t)si.per_expert_indices[ei].size());
+            }
+            if (max_stored == 0) max_stored = 1;
+
+            const size_t packed_expert_bytes = max_stored * block_bytes;
+            std::vector<uint8_t> full_expert(full_expert_bytes);
+            std::vector<uint8_t> packed(packed_expert_bytes, 0);
+
+            // Write packed data for each expert (zero-padded to max_stored)
+            for (int64_t ei = 0; ei < si.n_experts; ei++) {
                 fseek(full_fp, (long)(full_cursor + ei * full_expert_bytes), SEEK_SET);
                 fread(full_expert.data(), 1, full_expert_bytes, full_fp);
 
-                // Pack significant blocks
-                for (int64_t bi = 0; bi < si.n_blocks_stored; bi++) {
-                    int64_t src_block = si.block_indices[bi];
+                memset(packed.data(), 0, packed_expert_bytes);
+                auto & idx = si.per_expert_indices[ei];
+                for (size_t bi = 0; bi < idx.size(); bi++) {
                     memcpy(packed.data() + bi * block_bytes,
-                           full_expert.data() + src_block * block_bytes,
+                           full_expert.data() + idx[bi] * block_bytes,
                            block_bytes);
                 }
                 fwrite(packed.data(), 1, packed_expert_bytes, sfp);
@@ -684,21 +693,34 @@ int main(int argc, char ** argv) {
             size_t pad = (32 - (total_packed % 32)) % 32;
             if (pad > 0) { uint8_t z[32] = {0}; fwrite(z, 1, pad, sfp); }
 
-            // Write index tensor
-            fwrite(si.block_indices.data(), sizeof(uint16_t), si.n_blocks_stored, sfp);
-            size_t idx_bytes = si.n_blocks_stored * sizeof(uint16_t);
-            pad = (32 - (idx_bytes % 32)) % 32;
+            // Write per-expert index arrays (padded to max_stored with 0xFFFF sentinel)
+            for (int64_t ei = 0; ei < si.n_experts; ei++) {
+                auto & idx = si.per_expert_indices[ei];
+                fwrite(idx.data(), sizeof(uint16_t), idx.size(), sfp);
+                // Pad remaining with sentinel
+                size_t remaining = max_stored - idx.size();
+                if (remaining > 0) {
+                    std::vector<uint16_t> sentinel(remaining, 0xFFFF);
+                    fwrite(sentinel.data(), sizeof(uint16_t), remaining, sfp);
+                }
+            }
+            size_t idx_total = max_stored * si.n_experts * sizeof(uint16_t);
+            pad = (32 - (idx_total % 32)) % 32;
             if (pad > 0) { uint8_t z[32] = {0}; fwrite(z, 1, pad, sfp); }
 
             // Advance past this tensor in the full file
             size_t full_tensor_bytes = full_expert_bytes * si.n_experts;
             size_t full_pad = (32 - (full_tensor_bytes % 32)) % 32;
             full_cursor += full_tensor_bytes + full_pad;
+            total_sparse_bytes += total_packed + idx_total;
 
-            fprintf(stderr, "  [%zu/%zu] %s: %lld→%lld blocks (%.0f%% reduction)\n",
+            // Stats
+            int64_t total_kept = 0;
+            for (int64_t ei = 0; ei < si.n_experts; ei++) total_kept += si.per_expert_indices[ei].size();
+            double avg_pruned = 100.0 * (1.0 - (double)total_kept / (si.n_blocks_total * si.n_experts));
+            fprintf(stderr, "  [%zu/%zu] %s: avg %.0f%% pruned (%lld experts, max %lld blocks/expert)\n",
                     si_idx + 1, sparse_infos.size(), si.name.c_str(),
-                    (long long)si.n_blocks_total, (long long)si.n_blocks_stored,
-                    100.0 * (1.0 - (double)si.n_blocks_stored / si.n_blocks_total));
+                    avg_pruned, (long long)si.n_experts, (long long)max_stored);
         }
 
         fclose(sfp);

@@ -7,6 +7,10 @@
 
 #include "common.h"
 #include "llama.h"
+#include "ggml-backend.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #include <cmath>
 #include <cstdio>
@@ -2039,6 +2043,42 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Delta correction support (--delta, --delta-vram)
+    struct llama_blurry_sharp_context * bsctx = nullptr;
+    if (!params.delta_paths.empty()) {
+        fprintf(stderr, "%s: loading delta correction...\n", __func__);
+        llama_blurry_sharp_params bs_params = llama_blurry_sharp_default_params();
+        bs_params.sharp_model_path = nullptr;
+        bs_params.permanent = false;
+        bs_params.use_mmap = true;
+
+        std::vector<const char *> delta_cstrs;
+        for (auto & p : params.delta_paths) delta_cstrs.push_back(p.c_str());
+        bs_params.delta_paths    = delta_cstrs.data();
+        bs_params.n_delta_levels = (int32_t)delta_cstrs.size();
+
+        bsctx = llama_blurry_sharp_init(model, bs_params);
+        if (bsctx) {
+            int32_t n_wired = llama_blurry_sharp_wire_delta_tensors(bsctx);
+            fprintf(stderr, "%s: delta wired %d tensors\n", __func__, n_wired);
+
+#ifdef GGML_USE_CUDA
+            if (n_wired > 0) {
+                extern std::vector<ggml_backend_t> & llama_get_backends(llama_context * ctx);
+                for (auto * be : llama_get_backends(ctx)) {
+                    if (!ggml_backend_is_cpu(be)) {
+                        ggml_backend_cuda_disable_graphs(be);
+                        if (params.delta_vram_mb > 0) {
+                            ggml_backend_cuda_set_delta_vram_budget(be, params.delta_vram_mb);
+                        }
+                        ggml_backend_cuda_enable_delta_post_graph(be, true);
+                    }
+                }
+            }
+#endif
+        }
+    }
+
     const int n_ctx_train = llama_n_ctx_train(model);
 
     if (params.n_ctx > n_ctx_train) {
@@ -2068,6 +2108,9 @@ int main(int argc, char ** argv) {
     llama_print_timings(ctx);
     write_logfile(ctx, params, model, results);
 
+    if (bsctx) {
+        llama_blurry_sharp_free(bsctx);
+    }
     llama_free(ctx);
     llama_free_model(model);
 
