@@ -2018,6 +2018,8 @@ bool create_tensors_helper::create_gemma4_tensors(const LLM_TN & tn) {
             // MoE expert FFN
             layer.ffn_up_gate_exps = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, n_ff_exp * 2, n_expert});
             layer.ffn_down_exps    = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert});
+            layer.ffn_down_exps_s  = create_tensor(ctx_layer, tn(LLM_TENSOR_FFN_DOWN_EXPS,    "scale", i), {n_expert},
+                    llama_model_loader::TENSOR_NOT_REQUIRED);
         }
 
         // per-layer embeddings

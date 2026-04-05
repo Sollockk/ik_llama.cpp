@@ -363,6 +363,19 @@ typedef struct {
 } block_q4_k_r4;
 static_assert(sizeof(block_q4_k_r4) == 8*sizeof(ggml_half) + QK_K/16 + QK_K/8 + QK_K*2, "wrong q4_k_r4 block size/padding");
 
+// Delta-optimized 4-bit quantization (QD4_K)
+// 8 sub-blocks of 32 elements each, signed quants (-8..+7 stored as 0..15)
+// No min offset (zero-centered deltas), 4-bit sub-block scales
+// Effectively 4.22 bits per weight
+typedef struct {
+    ggml_half d;             // super-block scale (max magnitude / 15)
+    uint8_t energy;          // log-scale block energy for sparsity decisions
+    uint8_t flags;           // reserved (sparsity flags, level info, etc.)
+    uint8_t scales[4];       // 8 sub-block scales, 4-bit each (packed pairs)
+    uint8_t qs[QK_K/2];     // 256 signed 4-bit quants, stored as (q+8)
+} block_qd4_k;
+static_assert(sizeof(block_qd4_k) == sizeof(ggml_half) + 2 + 4 + QK_K/2, "wrong qd4_k block size/padding");
+
 // 5-bit quantization
 // 8 blocks of 32 elements each
 // weight is represented as x = a * q + b

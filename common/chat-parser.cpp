@@ -1421,6 +1421,12 @@ static void common_chat_parse_content_only(common_chat_msg_parser & builder) {
     builder.add_content(builder.consume_rest());
 }
 
+static void common_chat_parse_gemma_4(common_chat_msg_parser & builder) {
+    // Gemma 4 uses <|channel>thought\n...<channel|> for reasoning
+    builder.try_parse_reasoning("<|channel>thought\n", "<channel|>");
+    builder.add_content(builder.consume_rest());
+}
+
 static void common_chat_parse(common_chat_msg_parser & builder) {
     LOG_DBG("Parsing input with format %s: %s\n", common_chat_format_name(builder.syntax().format), builder.input().c_str());
 
@@ -1502,6 +1508,9 @@ static void common_chat_parse(common_chat_msg_parser & builder) {
             break;
         case COMMON_CHAT_FORMAT_MIROTHINKER:
             common_chat_parse_mirothinker(builder);
+            break;
+        case COMMON_CHAT_FORMAT_GEMMA_4:
+            common_chat_parse_gemma_4(builder);
             break;
         default:
             throw std::runtime_error(std::string("Unsupported format: ") + common_chat_format_name(builder.syntax().format));

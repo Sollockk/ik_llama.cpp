@@ -6810,7 +6810,12 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
     // Per-tensor VRAM upload REMOVED — ring buffer handles GPU delta.
 
     // CPU JIT Pre-Merge: build queue of CPU tensors for background merge.
-    // The worker thread is started later (after first gen token populates the queue).
+    // Only useful when the JIT eval callback is active (MoE with sharp overlay).
+    // In delta-only mode for dense models, PIM handles delta correction during
+    // mat-mul, so pre-merge is unnecessary and causes scheduler type mismatches
+    // when tensors need cross-device copies.
+    const bool skip_pre_merge = bsctx->sharp_files.empty();
+    if (!skip_pre_merge)
     {
         auto & jm = bsctx->jit_merge;
         for (auto & [name, dinfo] : level.delta_index) {

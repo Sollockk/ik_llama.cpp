@@ -6046,6 +6046,9 @@ ggml_cgraph * llm_build_context::build_gemma3() {
 ggml_cgraph * llm_build_context::build_gemma4() {
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model, n_tokens), false);
 
+    // mutable variable, needed during the last layer of the computation to skip unused tokens
+    int32_t n_tokens = this->n_tokens;
+
     struct ggml_tensor * cur;
     struct ggml_tensor * inpL;
 
@@ -6068,8 +6071,9 @@ ggml_cgraph * llm_build_context::build_gemma4() {
         const bool is_swa = hparams.is_swa(il);
         const int64_t n_head_l      = hparams.n_head(il);
         const int64_t n_head_kv_l   = hparams.n_head_kv(il);
-        const int64_t n_embd_head_l = hparams.n_embd_head_k_l(il);
-        const int64_t n_rot_l       = hparams.n_rot_l(il);
+        const int64_t n_embd_head_l   = hparams.n_embd_head_k_l(il);
+        const int64_t n_embd_head_v_l = hparams.n_embd_head_v_l(il);
+        const int64_t n_rot_l         = hparams.n_rot_l(il);
 
         const float freq_base_l  = is_swa ? hparams.rope_freq_base_train_swa : freq_base;
         const float freq_scale_l = is_swa ? 1.0f                             : freq_scale;
@@ -6088,7 +6092,7 @@ ggml_cgraph * llm_build_context::build_gemma4() {
         // Q projection
         ggml_tensor * Qcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wq, cur);
         cb(Qcur, "Qcur", il);
-        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head_l, n_head_l, n_tokens);
+        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head_l, n_head_l, n_tokens, "Qcur");
         Qcur = llm_build_norm(ctx0, Qcur, hparams, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, cb, il);
         cb(Qcur, "Qcur_normed", il);
         Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
@@ -6107,8 +6111,8 @@ ggml_cgraph * llm_build_context::build_gemma4() {
                 : Kcur; // if v_proj is not present, use Kcur as Vcur
             cb(Vcur, "Vcur", il);
 
-            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head_l, n_head_kv_l, n_tokens);
-            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_l, n_head_kv_l, n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head_l,   n_head_kv_l, n_tokens, "Kcur");
+            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v_l, n_head_kv_l, n_tokens, "Vcur");
 
             Kcur = llm_build_norm(ctx0, Kcur, hparams, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, cb, il);
             Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
@@ -6131,6 +6135,7 @@ ggml_cgraph * llm_build_context::build_gemma4() {
             struct ggml_tensor * inp_out_ids = build_inp_out_ids();
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+            n_tokens = n_outputs;
         }
 
         cur = llm_build_norm(ctx0, cur, hparams, model.layers[il].attn_post_norm, NULL, LLM_NORM_RMS, cb, il);
@@ -6184,9 +6189,9 @@ ggml_cgraph * llm_build_context::build_gemma4() {
             ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);
             weights = ggml_div(ctx0, weights, weights_sum);
             cb(weights, "ffn_moe_weights_norm", il);
-            weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+            weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens, "moe_weights");
 
-            cur_moe = ggml_reshape_3d(ctx0, cur_moe, n_embd, 1, n_tokens);
+            cur_moe = ggml_reshape_3d(ctx0, cur_moe, n_embd, 1, n_tokens, "moe_cur_pre_upgate");
             cur_moe = ggml_mul_mat_id(ctx0, model.layers[il].ffn_up_gate_exps, cur_moe, selected_experts); // [n_ff_exp*2, n_expert_used, n_tokens]
             cb(cur_moe, "ffn_moe_up_gate", il);
 
@@ -6203,6 +6208,17 @@ ggml_cgraph * llm_build_context::build_gemma4() {
 
             cur_moe = ggml_mul_mat_id(ctx0, model.layers[il].ffn_down_exps, cur_moe, selected_experts); // [n_embd, n_expert_used, n_tokens]
             cb(cur_moe, "ffn_moe_down", il);
+
+            // per-expert output scale (gemma4 26B-A4B) — fold into routing weights
+            if (model.layers[il].ffn_down_exps_s) {
+                // expand scale [n_expert] → [n_expert, n_tokens] via repeat, then gather like weights
+                ggml_tensor * s_col = ggml_reshape_2d(ctx0, model.layers[il].ffn_down_exps_s, n_expert, 1);
+                ggml_tensor * s_exp = ggml_repeat(ctx0, s_col, probs); // [n_expert, n_tokens]
+                ggml_tensor * s_3d  = ggml_reshape_3d(ctx0, s_exp, 1, n_expert, n_tokens);
+                ggml_tensor * expert_scale = ggml_get_rows(ctx0, s_3d, selected_experts); // [1, n_eu, n_t]
+                weights = ggml_mul(ctx0, weights, expert_scale);
+                cb(weights, "ffn_moe_weights_scaled", il);
+            }
 
             cur_moe = ggml_mul(ctx0, cur_moe, weights);
             cb(cur_moe, "ffn_moe_weighted", il);

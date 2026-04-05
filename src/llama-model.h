@@ -261,6 +261,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_inp_s = nullptr; // gemma4 router scale
     struct ggml_tensor * ffn_gate_exps = nullptr;
     struct ggml_tensor * ffn_down_exps = nullptr;
+    struct ggml_tensor * ffn_down_exps_s = nullptr; // per-expert scale (gemma4)
     struct ggml_tensor * ffn_up_exps  = nullptr;
     struct ggml_tensor * ffn_up_gate_exps  = nullptr;
 

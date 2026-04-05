@@ -140,10 +140,11 @@ static ggml_type parse_quant_type(const char * s) {
     if (!strcmp(s, "Q5_K_S")) return GGML_TYPE_Q5_K;
     if (!strcmp(s, "Q5_K_M")) return GGML_TYPE_Q5_K;
     if (!strcmp(s, "Q6_K"))   return GGML_TYPE_Q6_K;
+    if (!strcmp(s, "QD4_K"))  return GGML_TYPE_QD4_K;
     if (!strcmp(s, "F16"))    return GGML_TYPE_F16;
     if (!strcmp(s, "F32"))    return GGML_TYPE_F32;
     fprintf(stderr, "ERROR: unknown quantization type: '%s'\n", s);
-    fprintf(stderr, "  Valid types: Q4_0 Q5_0 Q8_0 Q2_K Q3_K_S Q3_K_M Q4_K_S Q4_K_M Q5_K_S Q5_K_M Q6_K F16 F32\n");
+    fprintf(stderr, "  Valid types: Q4_0 Q5_0 Q8_0 Q2_K Q3_K_S Q3_K_M Q4_K_S Q4_K_M Q5_K_S Q5_K_M Q6_K QD4_K F16 F32\n");
     return GGML_TYPE_Q2_K;
 }
 

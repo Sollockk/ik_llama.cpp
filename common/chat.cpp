@@ -753,6 +753,7 @@ const char * common_chat_format_name(common_chat_format format) {
         case COMMON_CHAT_FORMAT_APRIEL_1_5: return "Apriel 1.5";
         case COMMON_CHAT_FORMAT_XIAOMI_MIMO: return "Xiaomi MiMo";
         case COMMON_CHAT_FORMAT_MIROTHINKER: return "MiroThinker";
+        case COMMON_CHAT_FORMAT_GEMMA_4: return "Gemma 4";
         case COMMON_CHAT_FORMAT_PEG_SIMPLE: return "peg-simple";
         case COMMON_CHAT_FORMAT_PEG_NATIVE: return "peg-native";
         case COMMON_CHAT_FORMAT_PEG_CONSTRUCTED: return "peg-constructed";
@@ -3077,6 +3078,73 @@ static void use_generic_schema(json & messages) {
 
 } // namespace workaround
 
+static common_chat_params common_chat_params_init_gemma_4(const common_chat_template & tmpl, const struct templates_params & inputs) {
+    common_chat_params data;
+
+    // Pass enable_thinking to Gemma 4 template
+    json additional_context = {
+        {"enable_thinking", inputs.enable_thinking},
+    };
+
+    data.prompt = apply(tmpl, inputs, /* messages_override =*/ std::nullopt, /* tools_override= */ std::nullopt, additional_context);
+    data.format = COMMON_CHAT_FORMAT_GEMMA_4;
+
+    // Check if thinking was enabled and forced the prompt open with <|think|>
+    if (string_ends_with(data.prompt, "<|think|>")) {
+        if (!inputs.enable_thinking) {
+            data.prompt += "<|/think|>";
+        } else {
+            data.thinking_forced_open = true;
+        }
+    }
+
+    // Handle tools if present (Gemma 4 uses <|tool_call> format)
+    if (!inputs.tools.is_null()) {
+        data.grammar_lazy = inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+            std::vector<std::string> tool_rules;
+            std::vector<std::string> tool_call_alts;
+            foreach_function(inputs.tools, [&](const json & tool) {
+                const auto & function = tool.at("function");
+                std::string name = function.at("name");
+                auto parameters = function.at("parameters");
+                builder.resolve_refs(parameters);
+                tool_rules.push_back(builder.add_schema(name + "-call", {
+                    {"type", "object"},
+                    {"properties", json {
+                        {"name", json {{"const", name}}},
+                        {"arguments", parameters},
+                    }},
+                    {"required", json::array({"name", "arguments"})},
+                }));
+                tool_call_alts.push_back(
+                    "\"<|tool_call>\" ( \"call:\" | \"{\" ) " +
+                    builder.add_schema(name + "-json", {
+                        {"type", "object"},
+                        {"properties", json {
+                            {"name", json {{"const", name}}},
+                            {"arguments", parameters},
+                        }},
+                        {"required", json::array({"name", "arguments"})},
+                    }) + " \"}\"");
+            });
+            auto any_tool_call = builder.add_rule("any_tool_call", "( " + string_join(tool_rules, " | ") + " )");
+            auto tool_call = builder.add_rule("tool_call",
+                std::string(data.thinking_forced_open ? "(\"<|/think|>\" space )? " : "") +
+                "\"<|tool_call>\" ( ( \"call:\" | \"{\" ) " + any_tool_call + " \"}\" | any_tool_call + \"}\" ) \"</tool_call|>\"");
+            builder.add_rule("root", tool_call);
+            data.preserved_tokens = {
+                "<|tool_call>",
+                "</tool_call|>",
+                "<|think|>",
+                "<|/think|>",
+            };
+        });
+    }
+
+    return data;
+}
+
 static common_chat_params common_chat_templates_apply_jinja(
     const struct common_chat_templates        * tmpls,
     const struct common_chat_templates_inputs & inputs)
@@ -3322,6 +3390,11 @@ static common_chat_params common_chat_templates_apply_jinja(
     if (src.find("[source_lang_code]") != std::string::npos &&
         src.find("[target_lang_code]") != std::string::npos) {
         return common_chat_params_init_translate_gemma(tmpl, params);
+    }
+
+    // Gemma 4: detect by strip_thinking macro (must be before plain handler)
+    if (src.find("macro strip_thinking(text)") != std::string::npos) {
+        return common_chat_params_init_gemma_4(tmpl, params);
     }
 
     // Plain handler (no tools)

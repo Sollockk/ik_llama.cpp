@@ -168,6 +168,7 @@ void ggml_cuda_mmvq_sparse_dispatch(ggml_type type, const mmvq_sparse_args & arg
         case GGML_TYPE_Q2_K: mul_mat_vec_q_sparse_cuda_T<GGML_TYPE_Q2_K, nwarps>(args, stream); break;
         case GGML_TYPE_Q3_K: mul_mat_vec_q_sparse_cuda_T<GGML_TYPE_Q3_K, nwarps>(args, stream); break;
         case GGML_TYPE_Q4_K: mul_mat_vec_q_sparse_cuda_T<GGML_TYPE_Q4_K, nwarps>(args, stream); break;
+        case GGML_TYPE_QD4_K: mul_mat_vec_q_sparse_cuda_T<GGML_TYPE_QD4_K, nwarps>(args, stream); break;
         case GGML_TYPE_Q5_K: mul_mat_vec_q_sparse_cuda_T<GGML_TYPE_Q5_K, nwarps>(args, stream); break;
         case GGML_TYPE_Q6_K: mul_mat_vec_q_sparse_cuda_T<GGML_TYPE_Q6_K, nwarps>(args, stream); break;
         default:

@@ -457,6 +457,8 @@ extern "C" {
         GGML_TYPE_IQ2_KL  = 157,
         GGML_TYPE_IQ1_KT  = 158,
 
+        GGML_TYPE_QD4_K   = 160,  // Delta-optimized 4-bit K-quant (signed, no min, 4.22 bpw)
+
         GGML_TYPE_Q4_0_R8   = 202,
         GGML_TYPE_Q5_0_R4   = 206,
         GGML_TYPE_Q8_0_R8   = 208,

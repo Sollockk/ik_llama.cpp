@@ -446,6 +446,68 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
+#define VDR_QD4_K_Q8_1_MMVQ 2
+#define VDR_QD4_K_Q8_1_MMQ  2
+
+// QD4_K vmmq: signed 4-bit delta quants (stored as q+8, no min offset)
+static __device__ __forceinline__ float vec_dot_qd4_k_q8_1_impl_vmmq(
+    const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
+    const half & d_qd4k, const float * __restrict__ d8) {
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int v0i = (v[0] >> (4*i)) & 0x0F0F0F0F;
+        const int v1i = (v[1] >> (4*i)) & 0x0F0F0F0F;
+
+        const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0));
+        const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0));
+
+        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_m += d8[i] * (dot2 * sc[i]);  // for the -8 bias correction
+    }
+
+    const float d_val = __half2float(d_qd4k);
+
+    return d_val * sumf_d - 8.0f * d_val * sumf_m;
+}
+
+static __device__ __forceinline__ float vec_dot_qd4_k_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_qd4_k * bqd4k = (const block_qd4_k *) vbq + kbx;
+
+    int    v[2];
+    int    u[2*2];
+    float d8[2];
+
+    const int bq8_offset = 2 * ((iqs/2) / (QI8_1/2));
+
+    const int * q4 = (const int *)(bqd4k->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+    v[0] = q4[0];
+    v[1] = q4[4];
+
+    // Extract 4-bit scales (much simpler than Q4_K's 6-bit scale packing)
+    // scales[4] packs 8 x 4-bit values: scales[j/2] nibble (j%2)
+    uint8_t sc[2];
+    const int j = bq8_offset/2;
+    sc[0] = (bqd4k->scales[j] >> 0) & 0xF;
+    sc[1] = (bqd4k->scales[j] >> 4) & 0xF;
+
+    for (int i = 0; i < 2; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        u[2*i+0] = q8[0];
+        u[2*i+1] = q8[4];
+    }
+
+    return vec_dot_qd4_k_q8_1_impl_vmmq(v, u, sc, bqd4k->d, d8);
+}
+
 #define VDR_Q5_K_Q8_1_MMVQ 2
 #define VDR_Q5_K_Q8_1_MMQ  8
 

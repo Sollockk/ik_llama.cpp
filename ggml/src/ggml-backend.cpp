@@ -369,6 +369,20 @@ void ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
                 dst->nb[i] = src->nb[i];
             }
+        } else if (ggml_nbytes(src) > ggml_nbytes(dst) &&
+                   src->buffer && ggml_backend_buffer_is_host(src->buffer) &&
+                   dst->buffer && !ggml_backend_buffer_is_host(dst->buffer)) {
+            // JIT pre-merge upgraded a CPU tensor (e.g. IQ2_M → Q8_0) after the
+            // scheduler created the device copy at the original (smaller) size.
+            // The device already has valid data from initial model loading — skip
+            // this copy rather than crashing.  The JIT eval callback will handle
+            // the actual overlay during computation.
+            static int n_skip_warn = 0;
+            if (n_skip_warn++ < 3) {
+                fprintf(stderr, "%s: skipping JIT-enlarged copy '%s' (%zu > %zu)\n",
+                        __func__, src->name, ggml_nbytes(src), ggml_nbytes(dst));
+            }
+            return;
         } else {
             fprintf(stderr, "\n%s: LAYOUT MISMATCH (different nbytes):\n"
                     "  src '%s' type=%d ne=[%lld,%lld,%lld,%lld] nbytes=%zu\n"

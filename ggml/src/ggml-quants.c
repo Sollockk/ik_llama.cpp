@@ -2916,6 +2916,203 @@ size_t quantize_q4_K(const float * restrict src, void * restrict dst, int64_t nr
     return nrow * row_size;
 }
 
+// ====================== QD4_K delta-optimized 4-bit (de)-quantization
+
+void quantize_row_qd4_k_ref(const float * restrict x, block_qd4_k * restrict y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+
+    uint8_t L[QK_K];
+    float sub_scales[QK_K/32];
+
+    for (int i = 0; i < nb; i++) {
+        // Find per-sub-block ideal scales (amax / 7 for signed -7..+7 range)
+        float max_scale = 0;
+        for (int j = 0; j < QK_K/32; ++j) {
+            float amax = 0;
+            for (int l = 0; l < 32; ++l) {
+                float ax = fabsf(x[32*j + l]);
+                if (ax > amax) amax = ax;
+            }
+            sub_scales[j] = amax / 7.0f;
+            if (sub_scales[j] > max_scale) max_scale = sub_scales[j];
+        }
+
+        // Compute super-block scale d and quantize sub-block scales to 4-bit
+        float inv_scale = max_scale > 0 ? 15.0f / max_scale : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(max_scale / 15.0f);
+        y[i].flags = 0;
+
+        memset(y[i].scales, 0, 4);
+        for (int j = 0; j < QK_K/32; ++j) {
+            uint8_t ls = (uint8_t)MIN(15, nearest_int(inv_scale * sub_scales[j]));
+            y[i].scales[j/2] |= (ls << (4*(j%2)));
+        }
+
+        // Quantize values using actual (quantized) scales
+        for (int j = 0; j < QK_K/32; ++j) {
+            uint8_t sc = (y[i].scales[j/2] >> (4*(j%2))) & 0xF;
+            float actual_scale = GGML_FP16_TO_FP32(y[i].d) * sc;
+            if (actual_scale < 1e-15f) {
+                for (int l = 0; l < 32; ++l) L[32*j + l] = 8; // zero stored as 8
+            } else {
+                float inv_actual = 1.0f / actual_scale;
+                for (int l = 0; l < 32; ++l) {
+                    int q = nearest_int(x[32*j + l] * inv_actual);
+                    q = MAX(-8, MIN(7, q));
+                    L[32*j + l] = (uint8_t)(q + 8);
+                }
+            }
+        }
+
+        // Pack nibbles (same interleaved layout as Q4_K)
+        uint8_t * q = y[i].qs;
+        for (int j = 0; j < QK_K; j += 64) {
+            for (int l = 0; l < 32; ++l) q[l] = L[j + l] | (L[j + l + 32] << 4);
+            q += 32;
+        }
+
+        // Compute energy byte (log-scale magnitude indicator for sparsity decisions)
+        float sum_abs = 0;
+        for (int l = 0; l < QK_K; ++l) sum_abs += fabsf(x[l]);
+        if (sum_abs < 1e-10f) {
+            y[i].energy = 0;
+        } else {
+            float avg_abs = sum_abs / QK_K;
+            y[i].energy = (uint8_t)MIN(255, MAX(1, nearest_int(128.0f + 16.0f * log2f(avg_abs))));
+        }
+
+        x += QK_K;
+    }
+}
+
+void dequantize_row_qd4_k(const block_qd4_k * restrict x, float * restrict y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const uint8_t * q = x[i].qs;
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        int is = 0;
+        for (int j = 0; j < QK_K; j += 64) {
+            const uint8_t sc0 = (x[i].scales[is/2] >> (4*(is%2))) & 0xF; is++;
+            const uint8_t sc1 = (x[i].scales[is/2] >> (4*(is%2))) & 0xF; is++;
+            const float d0 = d * sc0;
+            const float d1 = d * sc1;
+            for (int l = 0; l < 32; ++l) *y++ = d0 * ((int)(q[l] & 0xF) - 8);
+            for (int l = 0; l < 32; ++l) *y++ = d1 * ((int)(q[l]  >> 4) - 8);
+            q += 32;
+        }
+    }
+}
+
+void quantize_row_qd4_k(const float * restrict x, void * restrict vy, int64_t k) {
+    assert(k % QK_K == 0);
+    block_qd4_k * restrict y = vy;
+    quantize_row_qd4_k_ref(x, y, k);
+}
+
+static void quantize_row_qd4_k_impl(const float * restrict x, block_qd4_k * restrict y, int64_t n_per_row, const float * quant_weights) {
+    assert(n_per_row % QK_K == 0);
+    const int64_t nb = n_per_row / QK_K;
+
+    uint8_t L[QK_K];
+    float sub_scales[QK_K/32];
+    float weights[32];
+    float sw[QK_K/32];
+
+    for (int i = 0; i < nb; i++) {
+
+        float sum_x2 = 0;
+        for (int l = 0; l < QK_K; ++l) sum_x2 += x[l] * x[l];
+        float sigma2 = 2*sum_x2/QK_K;
+        float av_x = sqrtf(sigma2);
+
+        // Find per-sub-block scales with importance weighting
+        float max_scale = 0;
+        for (int j = 0; j < QK_K/32; ++j) {
+            float sumw = 0;
+            float amax = 0;
+            for (int l = 0; l < 32; ++l) {
+                if (quant_weights) {
+                    const float * qw = quant_weights + QK_K*i + 32*j;
+                    weights[l] = qw[l] * sqrtf(sigma2 + x[32*j + l]*x[32*j + l]);
+                } else {
+                    weights[l] = av_x + fabsf(x[32*j + l]);
+                }
+                sumw += weights[l];
+                float ax = fabsf(x[32*j + l]);
+                if (ax > amax) amax = ax;
+            }
+            sw[j] = sumw;
+            sub_scales[j] = amax / 7.0f;
+            if (sub_scales[j] > max_scale) max_scale = sub_scales[j];
+        }
+
+        // Quantize sub-block scales to 4-bit using weighted optimization
+        uint8_t Ls[QK_K/32];
+        float d_block = make_qp_quants(QK_K/32, 15, sub_scales, Ls, sw);
+        y[i].d = GGML_FP32_TO_FP16(d_block);
+        y[i].flags = 0;
+
+        memset(y[i].scales, 0, 4);
+        for (int j = 0; j < QK_K/32; ++j) {
+            y[i].scales[j/2] |= (Ls[j] << (4*(j%2)));
+        }
+
+        // Quantize values using actual scales
+        for (int j = 0; j < QK_K/32; ++j) {
+            uint8_t sc = (y[i].scales[j/2] >> (4*(j%2))) & 0xF;
+            float actual_scale = GGML_FP16_TO_FP32(y[i].d) * sc;
+            if (actual_scale < 1e-15f) {
+                for (int l = 0; l < 32; ++l) L[32*j + l] = 8;
+            } else {
+                float inv_actual = 1.0f / actual_scale;
+                for (int l = 0; l < 32; ++l) {
+                    int q = nearest_int(x[32*j + l] * inv_actual);
+                    q = MAX(-8, MIN(7, q));
+                    L[32*j + l] = (uint8_t)(q + 8);
+                }
+            }
+        }
+
+        // Pack nibbles
+        uint8_t * q = y[i].qs;
+        for (int j = 0; j < QK_K; j += 64) {
+            for (int l = 0; l < 32; ++l) q[l] = L[j + l] | (L[j + l + 32] << 4);
+            q += 32;
+        }
+
+        // Energy byte
+        float sum_abs = 0;
+        for (int l = 0; l < QK_K; ++l) sum_abs += fabsf(x[l]);
+        if (sum_abs < 1e-10f) {
+            y[i].energy = 0;
+        } else {
+            float avg_abs = sum_abs / QK_K;
+            y[i].energy = (uint8_t)MIN(255, MAX(1, nearest_int(128.0f + 16.0f * log2f(avg_abs))));
+        }
+
+        x += QK_K;
+    }
+}
+
+size_t quantize_qd4_k(const float * restrict src, void * restrict dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    size_t row_size = ggml_row_size(GGML_TYPE_QD4_K, n_per_row);
+    if (!quant_weights) {
+        quantize_row_qd4_k_ref(src, dst, (int64_t)nrow*n_per_row);
+    } else {
+        char * qrow = (char *)dst;
+        for (int64_t row = 0; row < nrow; ++row) {
+            quantize_row_qd4_k_impl(src, (block_qd4_k*)qrow, n_per_row, quant_weights);
+            src += n_per_row;
+            qrow += row_size;
+        }
+    }
+    return nrow * row_size;
+}
+
 // ====================== 5-bit (de)-quantization
 
 void quantize_row_q5_K_ref(const float * restrict x, block_q5_K * restrict y, int64_t k) {
@@ -7948,6 +8145,138 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * restrict s, size_t bs, const void * r
     for (int l = 0; l < 8; ++l) sumf += sums[l];
     *s = sumf;
 #endif
+}
+
+void ggml_vec_dot_qd4_k_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_qd4_k * restrict x = vx;
+    const block_q8_K  * restrict y = vy;
+
+    const int nb = n / QK_K;
+
+#ifdef __AVX2__
+
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+
+    __m256 acc = _mm256_setzero_ps();
+    float sumf_correction = 0;
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = y[i].d * GGML_FP16_TO_FP32(x[i].d);
+
+        const uint8_t * restrict q4 = x[i].qs;
+        const int8_t  * restrict q8 = y[i].qs;
+
+        // Scalar bsum correction: 8 * sum(sc_j * bsum32_j)
+        int32_t bsum_corr = 0;
+        for (int j = 0; j < 8; ++j) {
+            const int sc = (x[i].scales[j/2] >> (4*(j%2))) & 0xF;
+            bsum_corr += sc * ((int32_t)y[i].bsums[2*j] + (int32_t)y[i].bsums[2*j+1]);
+        }
+        sumf_correction += d * 8.0f * (float)bsum_corr;
+
+        __m256i sumi = _mm256_setzero_si256();
+
+        for (int j = 0; j < QK_K/64; ++j) {
+            // Extract 4-bit scales for the 2 sub-blocks in this chunk
+            const __m256i scale_l = _mm256_set1_epi16((x[i].scales[j] >> 0) & 0xF);
+            const __m256i scale_h = _mm256_set1_epi16((x[i].scales[j] >> 4) & 0xF);
+
+            const __m256i q4bits = _mm256_loadu_si256((const __m256i*)q4); q4 += 32;
+            const __m256i q4l = _mm256_and_si256(q4bits, m4);
+            const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+
+            // Low nibbles (sub-block 2j) * q8
+            const __m256i q8l = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            __m256i p16l = _mm256_maddubs_epi16(q4l, q8l);
+            p16l = _mm256_madd_epi16(scale_l, p16l);
+
+            // High nibbles (sub-block 2j+1) * q8
+            const __m256i q8h = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            __m256i p16h = _mm256_maddubs_epi16(q4h, q8h);
+            p16h = _mm256_madd_epi16(scale_h, p16h);
+
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
+        }
+
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+    }
+
+    *s = hsum_float_8(acc) - sumf_correction;
+
+#else
+    // Scalar fallback
+    float sumf = 0;
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d) * y[i].d;
+        const uint8_t * restrict q4 = x[i].qs;
+        const int8_t  * restrict q8 = y[i].qs;
+
+        int sumi = 0;
+        int is = 0;
+        for (int j = 0; j < QK_K; j += 64) {
+            const int sc0 = (x[i].scales[is/2] >> (4*(is%2))) & 0xF; is++;
+            const int sc1 = (x[i].scales[is/2] >> (4*(is%2))) & 0xF; is++;
+
+            int sub_dot0 = 0, sub_dot1 = 0;
+            for (int l = 0; l < 32; ++l) {
+                sub_dot0 += ((int)(q4[l] & 0xF) - 8) * q8[l];
+                sub_dot1 += ((int)(q4[l]  >> 4) - 8) * q8[32 + l];
+            }
+            sumi += sc0 * sub_dot0 + sc1 * sub_dot1;
+            q4 += 32; q8 += 64;
+        }
+        sumf += d * sumi;
+    }
+
+    *s = sumf;
+#endif
+}
+
+// Fused TQ3_0 base + QD4_K delta dequantization
+// Reads both base and delta blocks, writes sum to f32 output
+void dequantize_row_tq3_0_add_qd4_k(const block_tq3_0 * restrict base, const block_qd4_k * restrict delta, float * restrict y, int64_t k) {
+    // TQ3_0 has 32-element blocks, QD4_K has 256-element super-blocks
+    // 8 TQ3_0 blocks per 1 QD4_K super-block
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K; // number of QD4_K super-blocks
+
+    for (int i = 0; i < nb; i++) {
+        // Dequant 8 TQ3_0 blocks (256 elements) to output
+        for (int tb = 0; tb < 8; ++tb) {
+            const block_tq3_0 * b = &base[i*8 + tb];
+            dequantize_row_tq3_0(b, y + tb*QK_TQ3_0, QK_TQ3_0);
+        }
+
+        // Add QD4_K delta on top (skip zero-energy blocks)
+        if (delta[i].energy != 0) {
+            const uint8_t * q = delta[i].qs;
+            const float d = GGML_FP16_TO_FP32(delta[i].d);
+
+            int is = 0;
+            float * yp = y;
+            for (int j = 0; j < QK_K; j += 64) {
+                const uint8_t sc0 = (delta[i].scales[is/2] >> (4*(is%2))) & 0xF; is++;
+                const uint8_t sc1 = (delta[i].scales[is/2] >> (4*(is%2))) & 0xF; is++;
+                const float d0 = d * sc0;
+                const float d1 = d * sc1;
+                for (int l = 0; l < 32; ++l) yp[l] += d0 * ((int)(q[l] & 0xF) - 8);
+                yp += 32;
+                for (int l = 0; l < 32; ++l) yp[l] += d1 * ((int)(q[l]  >> 4) - 8);
+                yp += 32;
+                q += 32;
+            }
+        }
+
+        y += QK_K;
+    }
 }
 
 void ggml_vec_dot_q5_K_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy,  size_t by, int nrc) {
