@@ -15,6 +15,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -28,6 +29,7 @@
 #include <sys/stat.h>
 #include <unordered_map>
 #include <vector>
+#include <omp.h>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -43,6 +45,23 @@ extern "C" {
                  float * work, const int * lwork, int * info);
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// QD4_K block layout (must match ggml-common.h)
+// ---------------------------------------------------------------------------
+#ifndef QK_K
+#define QK_K 256
+#endif
+
+#pragma pack(push, 1)
+struct block_qd4_k {
+    uint16_t d;              // super-block scale (fp16)
+    uint8_t  energy;         // log-scale block energy
+    uint8_t  flags;          // reserved
+    uint8_t  scales[4];      // 8 sub-block scales, 4-bit each
+    uint8_t  qs[QK_K/2];    // 256 signed 4-bit quants as (q+8)
+};
+#pragma pack(pop)
 
 // ---------------------------------------------------------------------------
 // Tensor metadata
@@ -180,6 +199,7 @@ int main(int argc, char ** argv) {
     int          layer_max    = INT32_MAX;
     float        sparse_threshold = 0.0f; // 0 = disabled, >0 = sparse mode (e.g. 0.01)
     int          lowrank = 0;          // 0 = disabled, >0 = SVD rank for LoRA-style delta
+    bool         analyze_only = false; // --analyze: print distribution stats, no output
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--blurry")     && i+1 < argc) blurry_path = argv[++i];
@@ -190,12 +210,13 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--threads")    && i+1 < argc) n_threads   = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--sparse")     && i+1 < argc) sparse_threshold = atof(argv[++i]);
         else if (!strcmp(argv[i], "--lowrank")    && i+1 < argc) lowrank = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--analyze"))   analyze_only = true;
         else if (!strcmp(argv[i], "--layers")     && i+1 < argc) {
             sscanf(argv[++i], "%d-%d", &layer_min, &layer_max);
         }
         else { print_usage(argv[0]); return 1; }
     }
-    if (!blurry_path || !sharp_path || !out_prefix) { print_usage(argv[0]); return 1; }
+    if (!blurry_path || !sharp_path || (!out_prefix && !analyze_only)) { print_usage(argv[0]); return 1; }
     if (n_levels < 1 || n_levels > 8) { fprintf(stderr, "levels must be 1-8\n"); return 1; }
     if (n_threads < 1) n_threads = 1;
 
@@ -300,6 +321,210 @@ int main(int argc, char ** argv) {
     { int k = gguf_find_key(blurry_gguf, "general.architecture"); if (k >= 0) model_arch = gguf_get_val_str(blurry_gguf, k); }
 
     ggml_quantize_init(delta_type);
+
+    // ==================================================================
+    // Analyze-only mode: compute delta distribution statistics
+    // ==================================================================
+    if (analyze_only) {
+        fprintf(stderr, "\n=== DELTA DISTRIBUTION ANALYSIS ===\n\n");
+
+        // Global accumulators
+        int64_t total_blocks = 0;
+        int64_t total_zero_energy_blocks = 0;  // energy == 0
+        int64_t total_zero_subblocks = 0;      // sub-block scale == 0
+        int64_t total_subblocks = 0;
+        int64_t quant_histogram[16] = {0};     // histogram of 4-bit quant values (0-15, where 8=zero)
+        int64_t energy_histogram[256] = {0};
+        int64_t scale_histogram[16] = {0};     // histogram of 4-bit sub-block scales
+        int64_t total_bytes_dense = 0;
+        int64_t total_bytes_block_sparse = 0;  // skip zero-energy blocks
+        int64_t total_bytes_subblock_sparse = 0; // skip zero sub-blocks too
+        int64_t total_moe_tensors = 0;
+        int64_t total_non_moe_tensors = 0;
+
+        int64_t t_start = ggml_time_us();
+
+        for (int ti = 0; ti < n_tensors; ti++) {
+            const auto & tname = shared_tensors[ti];
+            const auto & binfo = blurry_index[tname];
+            const auto & sinfo = sharp_index[tname];
+
+            int64_t n_elements = 1;
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                if (sinfo.ne[d] > 0) n_elements *= sinfo.ne[d];
+            }
+
+            const int64_t n_per_row = sinfo.ne[0];
+            const int64_t n_rows_total = n_elements / (n_per_row > 0 ? n_per_row : 1);
+            const int64_t n_experts = (sinfo.ne[2] > 0) ? sinfo.ne[2] : 1;
+            const int64_t elems_per_expert = n_elements / n_experts;
+            const int64_t rows_per_expert = n_rows_total / n_experts;
+
+            const size_t sharp_bpe  = sinfo.nbytes / n_experts;
+            const size_t blurry_bpe = binfo.nbytes / n_experts;
+
+            const int64_t blk_sz = (int64_t)ggml_blck_size(delta_type);
+            const ggml_type eff_type = (blk_sz > 0 && n_per_row < blk_sz) ? GGML_TYPE_F32 : delta_type;
+
+            if (eff_type != GGML_TYPE_QD4_K || n_elements == 0 || n_per_row == 0) {
+                double elapsed = (ggml_time_us() - t_start) / 1e6;
+                fprintf(stderr, "\r  [%d/%d] %.0fs (skip: %s)          ", ti+1, n_tensors, elapsed, tname.c_str());
+                continue;
+            }
+
+            if (n_experts > 1) total_moe_tensors++; else total_non_moe_tensors++;
+
+            const uint8_t * sharp_base  = sharp_mmaps[sinfo.split_idx].at(sinfo.file_offset);
+            const uint8_t * blurry_base = blurry_mmap.at(binfo.file_offset);
+
+            const size_t delta_bpe = ggml_row_size(eff_type, n_per_row) * rows_per_expert;
+            const int64_t blocks_per_expert = elems_per_expert / QK_K;
+
+            // Per-thread histograms to avoid contention
+            std::vector<std::array<int64_t, 16>> thread_qhist(n_threads);
+            std::vector<std::array<int64_t, 256>> thread_ehist(n_threads);
+            std::vector<std::array<int64_t, 16>> thread_shist(n_threads);
+            std::vector<int64_t> thread_zero_blocks(n_threads, 0);
+            std::vector<int64_t> thread_zero_subblocks(n_threads, 0);
+            for (auto & h : thread_qhist) h.fill(0);
+            for (auto & h : thread_ehist) h.fill(0);
+            for (auto & h : thread_shist) h.fill(0);
+
+            #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
+            for (int64_t ei = 0; ei < n_experts; ei++) {
+                int tid = omp_get_thread_num();
+                std::vector<float> sf(elems_per_expert);
+                std::vector<float> ap(elems_per_expert);
+                std::vector<float> re(elems_per_expert);
+                std::vector<uint8_t> dq(delta_bpe);
+
+                dequant_to_f32(sharp_base + ei * sharp_bpe, sinfo.type, elems_per_expert, sf.data());
+                dequant_to_f32(blurry_base + ei * blurry_bpe, binfo.type, elems_per_expert, ap.data());
+
+                for (int64_t i = 0; i < elems_per_expert; i++) re[i] = sf[i] - ap[i];
+
+                ggml_quantize_chunk(eff_type, re.data(), dq.data(), 0, rows_per_expert, n_per_row, nullptr);
+
+                // Analyze the quantized QD4_K blocks
+                const block_qd4_k * blocks = (const block_qd4_k *)dq.data();
+                for (int64_t b = 0; b < blocks_per_expert; b++) {
+                    thread_ehist[tid][blocks[b].energy]++;
+                    if (blocks[b].energy == 0) { thread_zero_blocks[tid]++; continue; }
+
+                    // Analyze sub-block scales
+                    for (int j = 0; j < 8; j++) {
+                        uint8_t sc = (blocks[b].scales[j/2] >> (4*(j%2))) & 0xF;
+                        thread_shist[tid][sc]++;
+                        if (sc == 0) thread_zero_subblocks[tid]++;
+                    }
+
+                    // Analyze quant values
+                    for (int q = 0; q < QK_K/2; q++) {
+                        thread_qhist[tid][blocks[b].qs[q] & 0xF]++;
+                        thread_qhist[tid][blocks[b].qs[q] >> 4]++;
+                    }
+                }
+            }
+
+            // Merge thread histograms
+            int64_t tensor_blocks = blocks_per_expert * n_experts;
+            int64_t tensor_zero_blocks = 0;
+            int64_t tensor_zero_subblocks = 0;
+            for (int t = 0; t < n_threads; t++) {
+                for (int v = 0; v < 16; v++) { quant_histogram[v] += thread_qhist[t][v]; scale_histogram[v] += thread_shist[t][v]; }
+                for (int v = 0; v < 256; v++) energy_histogram[v] += thread_ehist[t][v];
+                tensor_zero_blocks += thread_zero_blocks[t];
+                tensor_zero_subblocks += thread_zero_subblocks[t];
+            }
+            int64_t active_blocks = tensor_blocks - tensor_zero_blocks;
+            int64_t tensor_subblocks = active_blocks * 8;
+
+            total_blocks += tensor_blocks;
+            total_zero_energy_blocks += tensor_zero_blocks;
+            total_subblocks += tensor_subblocks;
+            total_zero_subblocks += tensor_zero_subblocks;
+
+            total_bytes_dense += tensor_blocks * 136;
+            total_bytes_block_sparse += active_blocks * 136 + (tensor_blocks + 7) / 8; // bitmap + active blocks
+            int64_t active_subblocks = tensor_subblocks - tensor_zero_subblocks;
+            // per active block: 8 bytes header (d+energy+flags+scales) + 16 bytes per active sub-block + 1 byte sub-bitmap
+            total_bytes_subblock_sparse += active_blocks * (8 + 1) + active_subblocks * 16 + (tensor_blocks + 7) / 8;
+
+            double pct_zero_blk = 100.0 * tensor_zero_blocks / tensor_blocks;
+            double pct_zero_sub = tensor_subblocks > 0 ? 100.0 * tensor_zero_subblocks / tensor_subblocks : 0;
+
+            double elapsed = (ggml_time_us() - t_start) / 1e6;
+            double eta = (elapsed / (ti + 1)) * (n_tensors - ti - 1);
+            fprintf(stderr, "\r  [%d/%d] %.0fs ETA %.0fs  %s: %lld blocks, %.1f%% zero-block, %.1f%% zero-sub (%lld experts)       \n",
+                    ti+1, n_tensors, elapsed, eta, tname.c_str(),
+                    (long long)tensor_blocks, pct_zero_blk, pct_zero_sub, (long long)n_experts);
+        }
+
+        // Print summary
+        fprintf(stderr, "\n=== SUMMARY ===\n");
+        fprintf(stderr, "Tensors analyzed: %lld MoE + %lld non-MoE\n",
+                (long long)total_moe_tensors, (long long)total_non_moe_tensors);
+        fprintf(stderr, "Total blocks: %lld\n", (long long)total_blocks);
+        fprintf(stderr, "Zero-energy blocks: %lld (%.1f%%)\n",
+                (long long)total_zero_energy_blocks, 100.0 * total_zero_energy_blocks / total_blocks);
+        fprintf(stderr, "Zero sub-blocks (in active blocks): %lld / %lld (%.1f%%)\n",
+                (long long)total_zero_subblocks, (long long)total_subblocks,
+                total_subblocks > 0 ? 100.0 * total_zero_subblocks / total_subblocks : 0.0);
+
+        fprintf(stderr, "\nDense QD4_K:         %.2f GB\n", total_bytes_dense / 1e9);
+        fprintf(stderr, "Block-sparse:        %.2f GB (%.1fx compression)\n",
+                total_bytes_block_sparse / 1e9,
+                total_bytes_dense > 0 ? (double)total_bytes_dense / total_bytes_block_sparse : 0);
+        fprintf(stderr, "Sub-block-sparse:    %.2f GB (%.1fx compression)\n",
+                total_bytes_subblock_sparse / 1e9,
+                total_bytes_dense > 0 ? (double)total_bytes_dense / total_bytes_subblock_sparse : 0);
+
+        // Entropy analysis of quant values
+        fprintf(stderr, "\nQuant value histogram (0-15, 8=zero):\n");
+        int64_t total_quants = 0;
+        for (int v = 0; v < 16; v++) total_quants += quant_histogram[v];
+        double entropy = 0;
+        for (int v = 0; v < 16; v++) {
+            double p = total_quants > 0 ? (double)quant_histogram[v] / total_quants : 0;
+            if (p > 0) entropy -= p * log2(p);
+            fprintf(stderr, "  [%2d] %12lld (%.1f%%)\n", v, (long long)quant_histogram[v], 100.0*p);
+        }
+        fprintf(stderr, "Entropy: %.2f bits/value (vs 4.0 fixed) → potential %.0f%% reduction\n",
+                entropy, 100.0 * (1.0 - entropy / 4.0));
+
+        fprintf(stderr, "\nSub-block scale histogram (0-15):\n");
+        int64_t total_scales = 0;
+        for (int v = 0; v < 16; v++) total_scales += scale_histogram[v];
+        for (int v = 0; v < 16; v++) {
+            double p = total_scales > 0 ? (double)scale_histogram[v] / total_scales : 0;
+            fprintf(stderr, "  [%2d] %12lld (%.1f%%)\n", v, (long long)scale_histogram[v], 100.0*p);
+        }
+
+        fprintf(stderr, "\nEnergy histogram (top 10 + zero):\n");
+        fprintf(stderr, "  [  0] %12lld (%.1f%%) ← fully zero blocks\n",
+                (long long)energy_histogram[0], 100.0 * energy_histogram[0] / total_blocks);
+        // Find top 10 non-zero energy values
+        std::vector<std::pair<int64_t, int>> energy_sorted;
+        for (int v = 1; v < 256; v++) {
+            if (energy_histogram[v] > 0) energy_sorted.push_back({energy_histogram[v], v});
+        }
+        std::sort(energy_sorted.rbegin(), energy_sorted.rend());
+        for (int i = 0; i < (int)energy_sorted.size() && i < 10; i++) {
+            fprintf(stderr, "  [%3d] %12lld (%.1f%%)\n",
+                    energy_sorted[i].second, (long long)energy_sorted[i].first,
+                    100.0 * energy_sorted[i].first / total_blocks);
+        }
+
+        // Estimate combined compression with entropy coding
+        double ent_bytes_per_block = 8.0 + (entropy / 4.0) * 128.0; // header + compressed quants
+        double ent_total = 0;
+        int64_t active = total_blocks - total_zero_energy_blocks;
+        ent_total += active * ent_bytes_per_block + (total_blocks + 7) / 8; // bitmap
+        fprintf(stderr, "\nWith entropy-coded quants: %.2f GB (%.1fx vs dense)\n",
+                ent_total / 1e9, total_bytes_dense / ent_total);
+
+        return 0;
+    }
 
     // ==================================================================
     // Phase 1: Write GGUF headers (metadata + tensor descriptors, no data)

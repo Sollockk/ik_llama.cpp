@@ -6092,7 +6092,7 @@ ggml_cgraph * llm_build_context::build_gemma4() {
         // Q projection
         ggml_tensor * Qcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wq, cur);
         cb(Qcur, "Qcur", il);
-        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head_l, n_head_l, n_tokens, "Qcur");
+        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head_l, n_head_l, n_tokens);
         Qcur = llm_build_norm(ctx0, Qcur, hparams, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, cb, il);
         cb(Qcur, "Qcur_normed", il);
         Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
@@ -6111,8 +6111,8 @@ ggml_cgraph * llm_build_context::build_gemma4() {
                 : Kcur; // if v_proj is not present, use Kcur as Vcur
             cb(Vcur, "Vcur", il);
 
-            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head_l,   n_head_kv_l, n_tokens, "Kcur");
-            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v_l, n_head_kv_l, n_tokens, "Vcur");
+            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head_l,   n_head_kv_l, n_tokens);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head_v_l, n_head_kv_l, n_tokens);
 
             Kcur = llm_build_norm(ctx0, Kcur, hparams, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, cb, il);
             Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
@@ -6189,9 +6189,9 @@ ggml_cgraph * llm_build_context::build_gemma4() {
             ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);
             weights = ggml_div(ctx0, weights, weights_sum);
             cb(weights, "ffn_moe_weights_norm", il);
-            weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens, "moe_weights");
+            weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
 
-            cur_moe = ggml_reshape_3d(ctx0, cur_moe, n_embd, 1, n_tokens, "moe_cur_pre_upgate");
+            cur_moe = ggml_reshape_3d(ctx0, cur_moe, n_embd, 1, n_tokens);
             cur_moe = ggml_mul_mat_id(ctx0, model.layers[il].ffn_up_gate_exps, cur_moe, selected_experts); // [n_ff_exp*2, n_expert_used, n_tokens]
             cb(cur_moe, "ffn_moe_up_gate", il);
 

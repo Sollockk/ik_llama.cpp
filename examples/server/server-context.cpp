@@ -594,6 +594,12 @@ bool server_context::load_model(const gpt_params& params_) {
                 for (auto * be : llama_get_backends(ctx)) {
                     if (!ggml_backend_is_cpu(be)) {
                         ggml_backend_cuda_disable_graphs(be);
+                        // Enable static streaming pipeline for dense delta models.
+                        // Replaces LRU ring buffer with deterministic prefetch
+                        // (zero cache misses for fully predictable layer order).
+                        if (llama_blurry_sharp_is_dense_delta(bsctx)) {
+                            ggml_backend_cuda_set_delta_streaming(be, true, 0);
+                        }
                     }
                 }
             }

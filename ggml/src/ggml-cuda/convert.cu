@@ -1582,6 +1582,46 @@ static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t n
     dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
 }
 
+// QD4_K dequantization kernel: signed 4-bit delta quants, 4-bit sub-block scales, no min
+template<typename dst_t>
+static __global__ void dequantize_block_qd4_k(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int i = blockIdx.x;   // block index
+    const int tid = threadIdx.x; // 0..31
+
+    const block_qd4_k * x = (const block_qd4_k *)vx + i;
+    dst_t * y = yy + i * QK_K;
+
+    const float d = __half2float(x->d);
+    const uint8_t * qs = x->qs;
+
+    // Each thread handles 8 elements (256 / 32 threads)
+    // QD4_K packs 64 elements per 32-byte chunk: low nibbles [0-31], high nibbles [32-63]
+    // 4 chunks of 64 elements each
+    for (int chunk = 0; chunk < 4; chunk++) {
+        const int base = chunk * 64;
+        const uint8_t * q = qs + chunk * 32;
+
+        // Sub-block scales: 2 per chunk (each covers 32 elements)
+        const int sc_idx = chunk; // scales[chunk] has two 4-bit scales
+        const float d0 = d * ((x->scales[sc_idx] >> 0) & 0xF);
+        const float d1 = d * ((x->scales[sc_idx] >> 4) & 0xF);
+
+        if (tid < 32) {
+            // Low nibble: elements [base .. base+31]
+            y[base + tid] = (dst_t)(d0 * ((int)(q[tid] & 0xF) - 8));
+            // High nibble: elements [base+32 .. base+63]
+            y[base + 32 + tid] = (dst_t)(d1 * ((int)(q[tid] >> 4) - 8));
+        }
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_qd4_k_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    const int nb = k / QK_K;
+    dequantize_block_qd4_k<<<nb, 32, 0, stream>>>(vx, y);
+}
+
 template<typename dst_t>
 static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
     const int64_t k = nrows * n_per_row;
@@ -1994,6 +2034,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_q3_K_cuda;
         case GGML_TYPE_Q4_K:
             return dequantize_row_q4_K_cuda;
+        case GGML_TYPE_QD4_K:
+            return dequantize_row_qd4_k_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q6_K:
@@ -2099,6 +2141,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_q3_K_cuda;
         case GGML_TYPE_Q4_K:
             return dequantize_row_q4_K_cuda;
+        case GGML_TYPE_QD4_K:
+            return dequantize_row_qd4_k_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q6_K:

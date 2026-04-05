@@ -1884,6 +1884,12 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API int32_t llama_blurry_sharp_wire_delta_tensors(
             struct llama_blurry_sharp_context * bsctx);
 
+    // Returns true if the delta model is dense (no expert dimension on delta tensors).
+    // Dense models have fully deterministic layer execution order, enabling the
+    // static streaming pipeline for zero-miss delta prefetch.
+    LLAMA_API bool llama_blurry_sharp_is_dense_delta(
+            const struct llama_blurry_sharp_context * bsctx);
+
     // Load sparse delta GGUF to VRAM for fast GPU delta correction.
     // Packed blocks + uint16 index per tensor. Returns number of tensors loaded.
     LLAMA_API int32_t llama_blurry_sharp_load_sparse_delta_gpu(

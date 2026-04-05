@@ -2445,36 +2445,92 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
 
             struct pim_delta_cache * cache = (struct pim_delta_cache *)delta_src0->ray_march_delta_cache;
             auto & ring = ctx.delta_ring;
+            auto & pipeline = ctx.delta_pipeline;
             const char * delta_ptr = nullptr;
             const char * source = "pcie";
             const int64_t ne00 = delta_src0->ne[0];
             const int64_t ne01 = delta_src0->ne[1];
 
-            // O(1) ring buffer lookup (dense: expert_id=0)
-            uint64_t rk = ring.key(delta_src0, 0);
-            auto map_it = ring.slice_map.find(rk);
-            if (map_it != ring.slice_map.end()) {
-                if (ring.upload_pending) {
-                    CUDA_CHECK(cudaStreamWaitEvent(stream, ring.upload_done, 0));
-                    ring.upload_pending = false;
-                }
-                delta_ptr = (const char *)ring.vram + map_it->second.offset;
-                map_it->second.last_used = ring.token_counter;
-                source = "ring";
+            // Static streaming pipeline: O(1) positional slot access, circular schedule
+            if (pipeline.initialized && ring.dispatch_count < pipeline.n_layers) {
+                int layer_idx = ring.dispatch_count;
+                int slot = layer_idx % pipeline.n_slots;
+
+                // Wait for this slot's DMA to be complete
+                CUDA_CHECK(cudaStreamWaitEvent(stream, pipeline.slot_ready[slot], 0));
+                delta_ptr = (const char *)pipeline.vram + (size_t)slot * pipeline.slot_size;
+                source = "pipeline";
                 ring.n_hits++;
+
+                // Record per-layer compute-done event (not per-slot — avoids overwrite race)
+                CUDA_CHECK(cudaEventRecord(pipeline.layer_done[layer_idx], stream));
+
+                // Trigger circular DMA for a future layer (wraps across token boundaries)
+                {
+                    int up_layer = pipeline.next_upload % pipeline.n_layers;
+                    int up_slot  = up_layer % pipeline.n_slots;
+                    auto upload_stream = ctx.jit_upload_stream();
+
+                    // Wait for the layer that LAST used this slot to finish compute
+                    int wait_gen = pipeline.next_upload - pipeline.n_slots;
+                    if (wait_gen >= 0) {
+                        int wait_layer = wait_gen % pipeline.n_layers;
+                        CUDA_CHECK(cudaStreamWaitEvent(upload_stream, pipeline.layer_done[wait_layer], 0));
+                    }
+
+                    auto & info = pipeline.schedule[up_layer];
+                    if (info.host_ptr) {
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            (char *)pipeline.vram + (size_t)up_slot * pipeline.slot_size,
+                            info.host_ptr, info.bytes,
+                            cudaMemcpyHostToDevice, upload_stream));
+                        CUDA_CHECK(cudaEventRecord(pipeline.slot_ready[up_slot], upload_stream));
+                    }
+                    pipeline.next_upload++;
+                }
             }
-            // Fallback: PCIe zero-copy from mmap
+            // Fallback: O(1) ring buffer lookup (LRU cache)
+            else if (!delta_ptr) {
+                uint64_t rk = ring.key(delta_src0, 0);
+                auto map_it = ring.slice_map.find(rk);
+                if (map_it != ring.slice_map.end()) {
+                    if (ring.upload_pending) {
+                        CUDA_CHECK(cudaStreamWaitEvent(stream, ring.upload_done, 0));
+                        ring.upload_pending = false;
+                    }
+                    delta_ptr = (const char *)ring.vram + map_it->second.offset;
+                    map_it->second.last_used = ring.token_counter;
+                    source = "ring";
+                    ring.n_hits++;
+                }
+            }
+            // Fallback: upload host mmap to ring buffer, then use VRAM pointer
             if (!delta_ptr) {
+                const char * host_ptr = nullptr;
 #ifdef USE_CUDA_GRAPH
                 if (!ctx.cur_graph) {
 #endif
-                    delta_ptr = pim_delta_cache_get(cache, 0);
-                    source = "pcie";
+                    host_ptr = pim_delta_cache_get(cache, 0);
 #ifdef USE_CUDA_GRAPH
-                } else {
-                    source = "skipped(graph)";
                 }
 #endif
+                if (host_ptr && ring.vram) {
+                    // Upload to ring buffer so CUDA kernel gets a device pointer
+                    const ggml_type dt = delta_src0->ray_march_delta_type;
+                    const size_t slice_bytes = (size_t)ne01 * ggml_row_size(dt, ne00);
+                    uint64_t rk = ring.key(delta_src0, 0);
+                    if (ring.vram_used + slice_bytes <= ring.vram_size) {
+                        size_t off = ring.vram_used;
+                        CUDA_CHECK(cudaMemcpyAsync((char *)ring.vram + off, host_ptr,
+                                                   slice_bytes, cudaMemcpyHostToDevice, stream));
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                        ring.slice_map[rk] = {off, slice_bytes, ring.token_counter};
+                        ring.vram_used += slice_bytes;
+                        delta_ptr = (const char *)ring.vram + off;
+                        source = "pcie->ring";
+                    }
+                }
+                if (!host_ptr) source = "skipped(graph)";
                 ring.n_misses++;
             }
 
@@ -2516,47 +2572,64 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
                 const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(delta_type);
 
                 if (to_fp16) {
-                    // Dequantize delta weights [ne01 × ne00] to f16
-                    ggml_cuda_pool_alloc<half> delta_f16(ctx.pool(id), ne01 * ne00);
-                    to_fp16(delta_ptr, delta_f16.get(), ne01, ne00, stream);
+                    // Check base matmul result before delta
+                    {
+                        static int pre_check = 0;
+                        if (ne11 == 1 && pre_check < 5) {
+                            float pre_val = 0;
+                            CUDA_CHECK(cudaMemcpy(&pre_val, (float *)dst->data, sizeof(float), cudaMemcpyDeviceToHost));
+                            if (std::isnan(pre_val) || std::isinf(pre_val)) {
+                                fprintf(stderr, "[gpu-delta-PRE] %s batch=%lld dst[0]=%.4f ← BASE MATMUL ALREADY NaN!\n",
+                                        delta_src0->name, (long long)ne11, pre_val);
+                            }
+                            pre_check++;
+                        }
+                    }
+                    // Dequantize delta weights [ne01 × ne00] to f32 (fp16 overflows for large deltas)
+                    const to_fp32_cuda_t to_fp32_delta = ggml_get_to_fp32_cuda(delta_type);
+                    ggml_cuda_pool_alloc<float> delta_f32(ctx.pool(id), ne01 * ne00);
+                    to_fp32_delta(delta_ptr, delta_f32.get(), ne01, ne00, stream);
 
-                    // Input src1 is f32 [ne00 × ne11] — convert to f16
-                    ggml_cuda_pool_alloc<half> src1_f16(ctx.pool(id), ne00 * ne11);
-                    const to_fp16_cuda_t src1_to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-                    src1_to_fp16((const char *)src1->data, src1_f16.get(), ne11, ne00, stream);
-
-                    // GEMM: dst += delta @ input
-                    // delta is [ne00, ne01] row-major (transposed for cuBLAS)
-                    // src1 is [ne00, ne11]
-                    // result is [ne01, ne11]
-                    ggml_cuda_pool_alloc<half> tmp_f16(ctx.pool(id), ne01 * ne11);
-                    const half alpha_f16 = 1.0f;
-                    const half beta_f16  = 0.0f;
+                    // src1 is already f32 — use directly
+                    // GEMM: dst += delta @ input (f32 throughout)
+                    ggml_cuda_pool_alloc<float> tmp_f32(ctx.pool(id), ne01 * ne11);
+                    const float alpha_f32 = 1.0f;
+                    const float beta_f32  = 0.0f;
 
                     CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
                     CUBLAS_CHECK(
                         cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                                 ne01, ne11, ne00,
-                                &alpha_f16, delta_f16.get(), CUDA_R_16F, ne00,
-                                            src1_f16.get(),  CUDA_R_16F, ne00,
-                                &beta_f16,  tmp_f16.get(),   CUDA_R_16F, ne01,
-                                CUBLAS_COMPUTE_16F,
+                                &alpha_f32, delta_f32.get(), CUDA_R_32F, ne00,
+                                            (const float *)src1->data, CUDA_R_32F, ne00,
+                                &beta_f32,  tmp_f32.get(),   CUDA_R_32F, ne01,
+                                CUBLAS_COMPUTE_32F,
                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
-                    // Convert f16 result to f32 and add to dst
-                    ggml_cuda_pool_alloc<float> tmp_f32(ctx.pool(id), ne01 * ne11);
-                    const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
-                    to_fp32(tmp_f16.get(), tmp_f32.get(), ne01, ne11, stream);
-
+                    // Add result to dst
                     const int n = (int)(ne01 * ne11);
                     k_delta_add_f32<<<(n + 255)/256, 256, 0, stream>>>(
                         (float *)dst->data, tmp_f32.get(), n);
 
                     static int diag_cublas = 0;
-                    if (diag_cublas < 6) { diag_cublas++;
-                        fprintf(stderr, "[gpu-delta-cublas] %s ne=[%lld,%lld] batch=%lld src=%s\n",
-                                delta_src0->name, (long long)ne00, (long long)ne01,
-                                (long long)ne11, source);
+                    if (diag_cublas < 10 || ne11 == 1) {
+                        float check_val = 0, check_pre = 0, check_delta = 0;
+                        // Check dst after full accumulation
+                        CUDA_CHECK(cudaMemcpy(&check_val, (float *)dst->data, sizeof(float), cudaMemcpyDeviceToHost));
+                        // Check delta contribution
+                        CUDA_CHECK(cudaMemcpy(&check_delta, tmp_f32.get(), sizeof(float), cudaMemcpyDeviceToHost));
+                        if (diag_cublas < 10 || std::isnan(check_val) || std::isinf(check_val)) {
+                            fprintf(stderr, "[gpu-delta-cublas] %s ne=[%lld,%lld] batch=%lld src=%s dst[0]=%.4f delta[0]=%.4f\n",
+                                    delta_src0->name, (long long)ne00, (long long)ne01,
+                                    (long long)ne11, source, check_val, check_delta);
+                        }
+                        diag_cublas++;
+                    }
+                } else {
+                    static int diag_no_fp16 = 0;
+                    if (diag_no_fp16 < 3) { diag_no_fp16++;
+                        fprintf(stderr, "[gpu-delta-SKIP] %s: no to_fp16 for delta_type=%s\n",
+                                delta_src0->name, ggml_type_name(delta_type));
                     }
                 }
             }
@@ -2716,6 +2789,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         if (ggml_cuda_mmvq_type_supported(delta_type)) {
             struct pim_delta_cache * cache = (struct pim_delta_cache *)src0->ray_march_delta_cache;
             auto & ring = ctx.delta_ring;
+            auto & pipeline = ctx.delta_pipeline;
             const int64_t ne00 = src0->ne[0];
             const int64_t ne01 = src0->ne[1];
             const int64_t ne11 = src1->ne[1];
@@ -2730,8 +2804,46 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
             }
             if (skip) goto delta_nonq_done;
 
-            // Ring buffer lookup (O(1), dense: expert_id=0)
-            if (ring.vram) {
+            // Static streaming pipeline: O(1) positional slot access, circular schedule
+            if (pipeline.initialized && ring.dispatch_count < pipeline.n_layers) {
+                int layer_idx = ring.dispatch_count;
+                int slot = layer_idx % pipeline.n_slots;
+                auto s = ctx.stream();
+
+                // Wait for this slot's DMA to be complete
+                CUDA_CHECK(cudaStreamWaitEvent(s, pipeline.slot_ready[slot], 0));
+                delta_ptr = (const char *)pipeline.vram + (size_t)slot * pipeline.slot_size;
+                source = "pipeline";
+
+                // Record per-layer compute-done event (not per-slot — avoids overwrite race)
+                CUDA_CHECK(cudaEventRecord(pipeline.layer_done[layer_idx], s));
+
+                // Trigger circular DMA for a future layer (wraps across token boundaries)
+                {
+                    int up_layer = pipeline.next_upload % pipeline.n_layers;
+                    int up_slot  = up_layer % pipeline.n_slots;
+                    auto upload_stream = ctx.jit_upload_stream();
+
+                    // Wait for the layer that LAST used this slot to finish compute
+                    int wait_gen = pipeline.next_upload - pipeline.n_slots;
+                    if (wait_gen >= 0) {
+                        int wait_layer = wait_gen % pipeline.n_layers;
+                        CUDA_CHECK(cudaStreamWaitEvent(upload_stream, pipeline.layer_done[wait_layer], 0));
+                    }
+
+                    auto & info = pipeline.schedule[up_layer];
+                    if (info.host_ptr) {
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            (char *)pipeline.vram + (size_t)up_slot * pipeline.slot_size,
+                            info.host_ptr, info.bytes,
+                            cudaMemcpyHostToDevice, upload_stream));
+                        CUDA_CHECK(cudaEventRecord(pipeline.slot_ready[up_slot], upload_stream));
+                    }
+                    pipeline.next_upload++;
+                }
+            }
+            // Fallback: ring buffer lookup (O(1), dense: expert_id=0)
+            else if (ring.vram && !delta_ptr) {
                 uint64_t rk = ring.key(src0, 0);
                 auto map_it = ring.slice_map.find(rk);
                 if (map_it != ring.slice_map.end()) {
@@ -2744,51 +2856,92 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
                     source = "ring";
                 }
             }
-            // Fallback: host mmap (PCIe zero-copy)
+            // Fallback: upload host mmap to ring buffer, then use VRAM pointer
             if (!delta_ptr) {
-                delta_ptr = pim_delta_cache_get(cache, 0);
-                source = "pcie";
+                const char * host_ptr = pim_delta_cache_get(cache, 0);
+                if (host_ptr && ring.vram) {
+                    const size_t slice_bytes = (size_t)ne01 * ggml_row_size(delta_type, ne00);
+                    uint64_t rk = ring.key(src0, 0);
+                    if (ring.vram_used + slice_bytes <= ring.vram_size) {
+                        size_t off = ring.vram_used;
+                        auto s = ctx.stream();
+                        CUDA_CHECK(cudaMemcpyAsync((char *)ring.vram + off, host_ptr,
+                                                   slice_bytes, cudaMemcpyHostToDevice, s));
+                        CUDA_CHECK(cudaStreamSynchronize(s));
+                        ring.slice_map[rk] = {off, slice_bytes, ring.token_counter};
+                        ring.vram_used += slice_bytes;
+                        delta_ptr = (const char *)ring.vram + off;
+                        source = "pcie->ring";
+                    }
+                }
             }
 
             if (delta_ptr) {
                 auto stream = ctx.stream();
                 const size_t delta_nb01 = ggml_row_size(delta_type, ne00);
 
-                // Quantize float input to Q8_1 on GPU
-                auto ne10_padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
-                auto nb10_padded = ne10_padded * sizeof(block_q8_1) / QK8_1;
-                auto q8_size = nb10_padded * ne11;
-                ggml_cuda_pool_alloc<char> src1_q8(ctx.pool(), q8_size);
-                quantize_row_q8_1_cuda((const float *)src1->data, (void *)src1_q8.get(),
-                                       ne00, ne11, 1, ne10_padded, delta_type, stream);
-                CUDA_CHECK(cudaGetLastError());
+                if (ggml_cuda_mmvq_type_supported(delta_type)) {
+                    // MMVQ path: quantize input to Q8_1, dispatch MMVQ with accumulate
+                    auto ne10_padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+                    auto nb10_padded = ne10_padded * sizeof(block_q8_1) / QK8_1;
+                    auto q8_size = nb10_padded * ne11;
+                    ggml_cuda_pool_alloc<char> src1_q8(ctx.pool(), q8_size);
+                    quantize_row_q8_1_cuda((const float *)src1->data, (void *)src1_q8.get(),
+                                           ne00, ne11, 1, ne10_padded, delta_type, stream);
+                    CUDA_CHECK(cudaGetLastError());
 
-                // MMVQ delta dispatch with accumulate
-                mmvq_args delta_args{
-                    /* vx_u      */ delta_ptr,
-                    /* vx_g      */ nullptr,
-                    /* bias_u    */ nullptr,
-                    /* bias_g    */ nullptr,
-                    /* vy        */ src1_q8.get(),
-                    /* dst       */ (float *)dst->data,
-                    /* ids_data  */ nullptr,
-                    /* ncols_x   */ (int)ne00,
-                    /* nrows_x   */ (int)ne01,
-                    /* nrows_y   */ (int)ne10_padded,
-                    /* ncols_y   */ (int)ne11,
-                    /* nrows_dst */ (int)dst->ne[0],
-                    /* ne2       */ 1,
-                    /* nb02      */ (uint64_t)(ne01 * delta_nb01),
-                    /* nb12      */ (uint64_t)(ne10_padded * sizeof(block_q8_1) / QK8_1),
-                    /* nb2       */ (uint64_t)dst->nb[2],
-                    /* ids_nb0   */ 0,
-                    /* bias_nb1  */ 0,
-                    /* unary_op  */ GGML_UNARY_OP_COUNT,
-                    /* limit     */ INFINITY,
-                    /* accumulate*/ true
-                };
+                    mmvq_args delta_args{
+                        /* vx_u      */ delta_ptr,
+                        /* vx_g      */ nullptr,
+                        /* bias_u    */ nullptr,
+                        /* bias_g    */ nullptr,
+                        /* vy        */ src1_q8.get(),
+                        /* dst       */ (float *)dst->data,
+                        /* ids_data  */ nullptr,
+                        /* ncols_x   */ (int)ne00,
+                        /* nrows_x   */ (int)ne01,
+                        /* nrows_y   */ (int)ne10_padded,
+                        /* ncols_y   */ (int)ne11,
+                        /* nrows_dst */ (int)dst->ne[0],
+                        /* ne2       */ 1,
+                        /* nb02      */ (uint64_t)(ne01 * delta_nb01),
+                        /* nb12      */ (uint64_t)(ne10_padded * sizeof(block_q8_1) / QK8_1),
+                        /* nb2       */ (uint64_t)dst->nb[2],
+                        /* ids_nb0   */ 0,
+                        /* bias_nb1  */ 0,
+                        /* unary_op  */ GGML_UNARY_OP_COUNT,
+                        /* limit     */ INFINITY,
+                        /* accumulate*/ true
+                    };
 
-                ggml_cuda_mmvq_dispatch(delta_type, delta_args, stream);
+                    ggml_cuda_mmvq_dispatch(delta_type, delta_args, stream);
+                } else {
+                    // cuBLAS fallback: dequant delta to f32, GEMM, accumulate
+                    const int id = ggml_cuda_get_device();
+                    const to_fp32_cuda_t to_fp32_delta = ggml_get_to_fp32_cuda(delta_type);
+                    if (to_fp32_delta) {
+                        ggml_cuda_pool_alloc<float> delta_f32(ctx.pool(id), ne01 * ne00);
+                        to_fp32_delta(delta_ptr, delta_f32.get(), ne01, ne00, stream);
+
+                        ggml_cuda_pool_alloc<float> tmp_f32(ctx.pool(id), ne01 * ne11);
+                        const float alpha_f32 = 1.0f;
+                        const float beta_f32  = 0.0f;
+
+                        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+                        CUBLAS_CHECK(
+                            cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                                    ne01, ne11, ne00,
+                                    &alpha_f32, delta_f32.get(), CUDA_R_32F, ne00,
+                                                (const float *)src1->data, CUDA_R_32F, ne00,
+                                    &beta_f32,  tmp_f32.get(),   CUDA_R_32F, ne01,
+                                    CUBLAS_COMPUTE_32F,
+                                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+                        const int n = (int)(ne01 * ne11);
+                        k_delta_add_f32<<<(n + 255)/256, 256, 0, stream>>>(
+                            (float *)dst->data, tmp_f32.get(), n);
+                    }
+                }
 
                 // Register in ring buffer build list (first gen token)
                 if (ring.vram && !ring.built) {
@@ -3123,15 +3276,15 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                                             delta_ptr = (const char *)ring.vram + off;
                                             ring.n_evictions++;
                                         } else {
-                                            // Can't evict: fall back to PCIe zero-copy
-                                            delta_ptr = host_ptr;
+                                            // Can't evict: skip delta (host ptr unsafe for CUDA)
+                                            delta_ptr = nullptr;
                                         }
                                     }
                                     ring.n_misses++;
                                 }
                             } else {
-                                // No ring buffer: PCIe zero-copy
-                                delta_ptr = pim_delta_cache_get(cache, eid);
+                                // No ring buffer: skip delta (host ptr unsafe for CUDA)
+                                delta_ptr = nullptr;
                                 ring.n_misses++;
                             }
                             if (!delta_ptr) continue;
@@ -4863,9 +5016,90 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
     // Dense models: first token builds tensor list, second fills VRAM (one-time).
     // MoE models: slices loaded on-demand per expert, LRU eviction when full.
     auto & ring = cuda_ctx->delta_ring;
+    auto & pipeline = cuda_ctx->delta_pipeline;
     if (cuda_ctx->delta_ready && ring.vram) {
-        // Dense model path: one-time VRAM fill from tensor list
-        if (ring.built && !ring.filled && !ring.all_tensors.empty()) {
+
+        // Static streaming pipeline: initialize once when tensor list is ready.
+        // Replaces LRU ring with deterministic prefetch for dense models.
+        if (pipeline.enabled && ring.built && !pipeline.initialized && !ring.all_tensors.empty()) {
+            const int n_layers = (int)ring.all_tensors.size();
+            pipeline.n_layers = n_layers;
+            pipeline.schedule.resize(n_layers);
+
+            // Build schedule from dispatch-order tensor list
+            size_t max_bytes = 0;
+            for (int i = 0; i < n_layers; i++) {
+                auto & e = ring.all_tensors[i];
+                pipeline.schedule[i] = {e.host_ptr, e.bytes};
+                if (e.bytes > max_bytes) max_bytes = e.bytes;
+            }
+
+            // Fix 3: 256-byte align slot size for efficient PCIe DMA
+            constexpr size_t ALIGN = 256;
+            pipeline.slot_size = (max_bytes + ALIGN - 1) & ~(ALIGN - 1);
+
+            // Auto-size slots if not specified: fit as many as VRAM allows, up to K=4
+            if (pipeline.n_slots <= 0) {
+                int k = (int)(ring.vram_size / pipeline.slot_size);
+                if (k > ggml_backend_cuda_context::DELTA_PIPELINE_MAX_SLOTS)
+                    k = ggml_backend_cuda_context::DELTA_PIPELINE_MAX_SLOTS;
+                if (k > 4) k = 4;  // diminishing returns beyond 4
+                if (k < 2) k = 2;  // minimum for double-buffering
+                pipeline.n_slots = k;
+            }
+
+            // Allocate VRAM (reuse ring.vram if big enough, else realloc)
+            const size_t needed = (size_t)pipeline.n_slots * pipeline.slot_size;
+            if (needed <= ring.vram_size) {
+                pipeline.vram = ring.vram;
+            } else {
+                CUDA_CHECK(cudaFree(ring.vram));
+                CUDA_CHECK(cudaMalloc(&pipeline.vram, needed));
+                ring.vram = pipeline.vram;
+                ring.vram_size = needed;
+            }
+
+            // Fix 2: per-slot ready events + per-layer done events
+            // slot_ready[s]: upload stream records after filling slot s (safe, one writer)
+            // layer_done[l]: compute stream records after using layer l's data
+            //   Must be per-layer to avoid overwrite when CPU queues faster than GPU executes
+            ggml_cuda_set_device(cuda_ctx->device);
+            pipeline.slot_ready.resize(pipeline.n_slots);
+            for (int i = 0; i < pipeline.n_slots; i++) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&pipeline.slot_ready[i], cudaEventDisableTiming));
+            }
+            pipeline.layer_done.resize(n_layers);
+            for (int i = 0; i < n_layers; i++) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&pipeline.layer_done[i], cudaEventDisableTiming));
+            }
+
+            // Pre-fill first K slots (one-time, synchronous)
+            auto upload_stream = cuda_ctx->jit_upload_stream();
+            int pre_fill = std::min(pipeline.n_slots, pipeline.n_layers);
+            for (int i = 0; i < pre_fill; i++) {
+                auto & info = pipeline.schedule[i];
+                if (info.host_ptr) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        (char *)pipeline.vram + (size_t)i * pipeline.slot_size,
+                        info.host_ptr, info.bytes,
+                        cudaMemcpyHostToDevice, upload_stream));
+                    CUDA_CHECK(cudaEventRecord(pipeline.slot_ready[i], upload_stream));
+                }
+            }
+            CUDA_CHECK(cudaStreamSynchronize(upload_stream));
+            pipeline.next_upload = pre_fill;
+            pipeline.initialized = true;
+
+            // Mark ring as filled so it doesn't try its own one-shot fill
+            ring.filled = true;
+
+            fprintf(stderr, "[delta-pipeline] initialized: %d layers, %d slots, %.1f MB/slot (aligned), %.1f MB total\n",
+                    n_layers, pipeline.n_slots, pipeline.slot_size / (1024.0*1024.0),
+                    needed / (1024.0*1024.0));
+        }
+
+        // Fallback: original one-shot LRU ring fill for non-streaming mode
+        if (!pipeline.initialized && ring.built && !ring.filled && !ring.all_tensors.empty()) {
             size_t offset = 0;
             auto upload_stream = cuda_ctx->jit_upload_stream();
             int n_loaded = 0;
@@ -4886,6 +5120,15 @@ static void evaluate_and_capture_cuda_graph(ggml_backend_cuda_context * cuda_ctx
             ring.filled = true;
             fprintf(stderr, "[delta-ring] filled %d/%zu tensors (%.1f MB) into VRAM\n",
                     n_loaded, ring.all_tensors.size(), offset / (1024.0 * 1024.0));
+        }
+
+        // Fix 1: Token boundary — only reset dispatch counter.
+        // NO re-priming.  The circular upload schedule naturally wraps:
+        // while computing the last layers of token N, the upload stream
+        // already DMA'd token N+1's first layers into freed slots.
+        if (pipeline.initialized) {
+            ring.dispatch_count = 0;
+            pipeline.n_stalls = 0;
         }
 
         // Token boundary: increment counter, print stats
@@ -5923,6 +6166,17 @@ void ggml_backend_cuda_disable_graphs(ggml_backend_t backend) {
 void ggml_backend_cuda_set_delta_ready(ggml_backend_t backend, bool ready) {
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)backend->context;
     ctx->delta_ready = ready;
+}
+
+void ggml_backend_cuda_set_delta_streaming(ggml_backend_t backend, bool enable, int n_slots) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)backend->context;
+    auto & pipe = ctx->delta_pipeline;
+    pipe.enabled = enable;
+    if (n_slots > 0 && n_slots <= ggml_backend_cuda_context::DELTA_PIPELINE_MAX_SLOTS) {
+        pipe.n_slots = n_slots;
+    }
+    fprintf(stderr, "[delta-pipeline] streaming %s (requested slots=%d)\n",
+            enable ? "enabled" : "disabled", n_slots);
 }
 
 // Delta worker thread function

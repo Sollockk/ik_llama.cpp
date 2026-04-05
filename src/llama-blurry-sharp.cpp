@@ -6705,6 +6705,10 @@ void llama_blurry_sharp_deflate_expert_types(
 // Ray march PIM: wire delta correction data to model expert tensors
 // ---------------------------------------------------------------------------
 
+bool llama_blurry_sharp_is_dense_delta(const llama_blurry_sharp_context * bsctx) {
+    return bsctx && bsctx->is_dense_delta;
+}
+
 int32_t llama_blurry_sharp_wire_delta_tensors(
         llama_blurry_sharp_context * bsctx) {
     if (!bsctx || !bsctx->fractal_mode || bsctx->correction_levels.empty()) {
@@ -6785,6 +6789,24 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
     }
 #endif
 
+    // Detect dense model: all delta tensors have ne[2] == 1 (no expert dimension).
+    // When true, layer execution order is fully deterministic and the static
+    // streaming pipeline can replace the LRU ring buffer for zero cache misses.
+    {
+        bool all_dense = true;
+        for (auto & [name, dinfo] : level.delta_index) {
+            if (!dinfo.base_tensor) continue;
+            if (dinfo.base_tensor->ne[2] > 1) {
+                all_dense = false;
+                break;
+            }
+        }
+        bsctx->is_dense_delta = all_dense;
+        if (all_dense) {
+            LLAMA_LOG_INFO("%s: dense delta model detected — static streaming pipeline eligible\n", __func__);
+        }
+    }
+
     // Pre-build GPU delta tensor list for ring buffer (avoids first-token miss).
     // The actual DMA fill happens in enable_delta_post_graph (after ring buffer alloc).
     {
@@ -6810,18 +6832,16 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
     // Per-tensor VRAM upload REMOVED — ring buffer handles GPU delta.
 
     // CPU JIT Pre-Merge: build queue of CPU tensors for background merge.
-    // Only useful when the JIT eval callback is active (MoE with sharp overlay).
-    // In delta-only mode for dense models, PIM handles delta correction during
-    // mat-mul, so pre-merge is unnecessary and causes scheduler type mismatches
-    // when tensors need cross-device copies.
-    const bool skip_pre_merge = bsctx->sharp_files.empty();
-    if (!skip_pre_merge)
+    // Merges blurry+delta → Q8_0 before generation starts.
+    // Required for delta-only mode: PIM IQK additive path produces NaN
+    // during single-token generation (batch=1), so pre-merged tensors are needed.
     {
         auto & jm = bsctx->jit_merge;
+        int skip_no_cache = 0, skip_not_host = 0, skip_1d = 0, skip_no_delta = 0;
         for (auto & [name, dinfo] : level.delta_index) {
-            if (!dinfo.base_tensor || !dinfo.base_tensor->ray_march_delta_cache) continue;
-            if (!dinfo.base_tensor->buffer || !ggml_backend_buffer_is_host(dinfo.base_tensor->buffer)) continue;
-            if (dinfo.base_tensor->ne[1] <= 1) continue;
+            if (!dinfo.base_tensor || !dinfo.base_tensor->ray_march_delta_cache) { skip_no_cache++; continue; }
+            if (!dinfo.base_tensor->buffer || !ggml_backend_buffer_is_host(dinfo.base_tensor->buffer)) { skip_not_host++; continue; }
+            if (dinfo.base_tensor->ne[1] <= 1) { skip_1d++; continue; }
 
             ggml_tensor * base = dinfo.base_tensor;
             struct pim_delta_cache * cache = (struct pim_delta_cache *)base->ray_march_delta_cache;
@@ -6844,105 +6864,54 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
             });
         }
 
+        LLAMA_LOG_INFO("%s: pre-merge scan: %zu queued, skipped: %d no_cache, %d not_host, %d 1d, total_delta_index=%zu\n",
+                       __func__, jm.queue.size(), skip_no_cache, skip_not_host, skip_1d,
+                       level.delta_index.size());
         if (!jm.queue.empty()) {
-            // Allocate rotating buffer slots
-            // Find max tensor size for slot allocation
-            size_t max_bytes = 0;
-            for (auto & e : jm.queue) max_bytes = std::max(max_bytes, e.q8_total_bytes);
-            for (int s = 0; s < 4; s++) {
-                jm.buf[s].resize(max_bytes);
+            // Bulk pre-merge: merge ALL CPU tensors at startup.
+            // The JIT rotating-slot approach needs an eval callback to drive
+            // consumption, which delta-only mode doesn't have. So we merge
+            // everything upfront into persistent per-tensor Q8_0 buffers.
+            ggml_type_traits_t q8t = ggml_internal_get_type_traits(GGML_TYPE_Q8_0);
+            size_t total_bytes = 0;
+            int n_merged = 0;
+
+            for (auto & e : jm.queue) {
+                ggml_type_traits_t bt = ggml_internal_get_type_traits(e.blurry_type);
+                ggml_type_traits_t dt = ggml_internal_get_type_traits(e.delta_type);
+                if (!bt.to_float || !dt.to_float || !q8t.from_float) continue;
+
+                // Allocate persistent Q8_0 buffer for this tensor
+                std::vector<uint8_t> * buf = new std::vector<uint8_t>(e.q8_total_bytes);
+
+                // Row-by-row merge: blurry + delta → Q8_0
+                #pragma omp parallel for schedule(static) num_threads(8)
+                for (int64_t r = 0; r < e.n_rows; r++) {
+                    std::vector<float> rf(e.ne0), df(e.ne0);
+                    bt.to_float((const char *)e.original_data + r * e.blurry_row_bytes,
+                               rf.data(), e.ne0);
+                    dt.to_float(e.delta_host + r * e.delta_row_bytes,
+                               df.data(), e.ne0);
+                    for (int64_t i = 0; i < e.ne0; i++) rf[i] += df[i];
+                    q8t.from_float(rf.data(), buf->data() + r * e.q8_row_bytes, e.ne0);
+                }
+
+                // Permanently swap tensor to Q8_0
+                e.base->data = buf->data();
+                e.base->type = GGML_TYPE_Q8_0;
+                e.base->nb[0] = ggml_type_size(GGML_TYPE_Q8_0);
+                e.base->nb[1] = e.q8_row_bytes;
+                for (int d = 2; d < GGML_MAX_DIMS; d++)
+                    e.base->nb[d] = e.base->nb[d-1] * e.base->ne[d-1];
+                // Clear delta cache so matmul doesn't also try additive delta
+                e.base->ray_march_delta_cache = NULL;
+
+                total_bytes += e.q8_total_bytes;
+                n_merged++;
             }
 
-            // Start worker thread
-            jm.queue_built = true;
-            jm.worker = std::thread([bsctx]() {
-                auto & jm = bsctx->jit_merge;
-                while (!jm.stop.load()) {
-                    {
-                        std::unique_lock<std::mutex> lock(jm.mtx);
-                        jm.cv.wait(lock, [&]{ return jm.has_work.load() || jm.stop.load(); });
-                    }
-                    if (jm.stop.load()) break;
-
-                    // Merge tensors ahead of consumption
-                    while (jm.ready_count.load() < 4 && jm.queue_pos < (int)jm.queue.size()) {
-                        int slot = jm.next_slot;
-                        auto & e = jm.queue[jm.queue_pos];
-
-                        // Row-by-row merge: blurry + delta → Q8_0
-                        ggml_type_traits_t bt = ggml_internal_get_type_traits(e.blurry_type);
-                        ggml_type_traits_t dt = ggml_internal_get_type_traits(e.delta_type);
-                        ggml_type_traits_t q8t = ggml_internal_get_type_traits(GGML_TYPE_Q8_0);
-
-                        if (bt.to_float && dt.to_float && q8t.from_float) {
-                            // Row-by-row merge into slot buffer
-                            #pragma omp parallel for schedule(static) num_threads(4)
-                            for (int64_t r = 0; r < e.n_rows; r++) {
-                                std::vector<float> rf(e.ne0), df(e.ne0);
-                                bt.to_float((const char *)e.original_data + r * e.blurry_row_bytes,
-                                           rf.data(), e.ne0);
-                                dt.to_float(e.delta_host + r * e.delta_row_bytes,
-                                           df.data(), e.ne0);
-                                for (int64_t i = 0; i < e.ne0; i++) rf[i] += df[i];
-                                q8t.from_float(rf.data(), jm.buf[slot].data() + r * e.q8_row_bytes, e.ne0);
-                            }
-
-                            // Swap oldest slot back to blurry if slot is being reused
-                            if (jm.tensor[slot] != nullptr) {
-                                auto * old = jm.tensor[slot];
-                                // Find the old entry and restore
-                                for (auto & oe : jm.queue) {
-                                    if (oe.base == old) {
-                                        old->data = oe.original_data;
-                                        old->type = oe.blurry_type;
-                                        old->nb[0] = ggml_type_size(oe.blurry_type);
-                                        old->nb[1] = oe.blurry_row_bytes;
-                                        for (int d = 2; d < GGML_MAX_DIMS; d++)
-                                            old->nb[d] = old->nb[d-1] * old->ne[d-1];
-                                        // Re-enable delta cache (was cleared on swap-in)
-                                        // Actually, don't clear it — the delta path checks
-                                        // ray_march_delta_cache which stays set
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // Swap in: tensor now points to Q8_0 merged data
-                            e.base->data = jm.buf[slot].data();
-                            e.base->type = GGML_TYPE_Q8_0;
-                            e.base->nb[0] = ggml_type_size(GGML_TYPE_Q8_0);
-                            e.base->nb[1] = e.q8_row_bytes;
-                            for (int d = 2; d < GGML_MAX_DIMS; d++)
-                                e.base->nb[d] = e.base->nb[d-1] * e.base->ne[d-1];
-                            // Clear delta cache so IQK doesn't also do delta vec_dot
-                            e.base->ray_march_delta_cache = NULL;
-
-                            jm.tensor[slot] = e.base;
-                            jm.next_slot = (slot + 1) % 4;
-                            jm.ready_count.fetch_add(1);
-
-                            static int merge_diag = 0;
-                            if (merge_diag < 6) { merge_diag++;
-                                fprintf(stderr, "[jit-merge] %s → Q8_0 slot %d\n",
-                                        e.base->name, slot);
-                            }
-                        }
-
-                        jm.queue_pos++;
-                        if (jm.queue_pos >= (int)jm.queue.size()) {
-                            jm.queue_pos = 0; // wrap for next token
-                        }
-                    }
-                    jm.has_work.store(false);
-                }
-            });
-
-            LLAMA_LOG_INFO("%s: JIT pre-merge worker started: %zu CPU tensors, %d slots (%.1f MiB/slot)\n",
-                           __func__, jm.queue.size(), 4, max_bytes / (1024.0 * 1024.0));
-
-            // Kick off initial merge
-            jm.has_work.store(true);
-            jm.cv.notify_one();
+            LLAMA_LOG_INFO("%s: bulk pre-merged %d/%zu CPU tensors to Q8_0 (%.1f MiB)\n",
+                           __func__, n_merged, jm.queue.size(), total_bytes / (1024.0 * 1024.0));
         }
     }
 

@@ -956,6 +956,42 @@ struct ggml_backend_cuda_context {
         bool   fill_pending = false;
     } delta_ring;
 
+    // Static delta streaming pipeline: deterministic prefetch for dense models.
+    // Replaces LRU ring buffer when layer execution order is fully predictable.
+    // VRAM is divided into K slots; while GPU computes layer N, async DMA
+    // uploads layer N+K into slot (N+K)%K.  Zero cache misses by construction.
+    // Schedule is infinitely circular: no token-boundary re-priming needed.
+    static constexpr int DELTA_PIPELINE_MAX_SLOTS = 8;
+    struct {
+        void * vram = nullptr;           // single cudaMalloc, K * slot_size bytes
+        size_t slot_size = 0;            // max delta bytes per layer (256-byte aligned)
+        int    n_slots = 0;              // K (pipeline depth / lookahead)
+        int    n_layers = 0;             // total layers in schedule
+
+        struct layer_info {
+            const char * host_ptr;       // pinned host pointer to delta data
+            size_t bytes;                // actual delta bytes for this layer
+        };
+        std::vector<layer_info> schedule;  // [n_layers], in dispatch order
+
+        // Per-slot: DMA completion (upload stream records after each slot fill).
+        // Safe from overwrite: only upload stream writes, each slot filled once
+        // between reads.
+        std::vector<cudaEvent_t> slot_ready;   // [n_slots]
+
+        // Per-layer: compute completion (compute stream records after using data).
+        // Must be per-layer, NOT per-slot, because CPU queues events faster than
+        // GPU executes — per-slot events would alias and overwrite.
+        std::vector<cudaEvent_t> layer_done;   // [n_layers]
+
+        int  next_upload = 0;            // monotonic counter, wraps via % n_layers
+        bool initialized = false;
+        bool enabled = false;            // set by API call for dense models
+
+        // Stats
+        int  n_stalls = 0;              // times compute had to wait on DMA
+    } delta_pipeline;
+
     int   mmq_id_thresh = 32;
     float fa_offset = 0.6931f; // ln(2)
 #ifdef USE_CUDA_GRAPH

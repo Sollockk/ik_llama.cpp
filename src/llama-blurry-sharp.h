@@ -663,6 +663,10 @@ struct llama_blurry_sharp_context {
     // Skip GPU tensors in apply_non_expert_permanent (saves VRAM)
     bool skip_non_expert_gpu = false;
 
+    // Dense delta model detected (no expert dimension on delta tensors).
+    // Callers should enable static streaming pipeline on CUDA backend.
+    bool is_dense_delta = false;
+
     // -- graph-level delta tensors --
     ggml_context *          delta_tensor_ctx  = nullptr;
     ggml_backend_buffer_t   delta_tensor_buf  = nullptr;

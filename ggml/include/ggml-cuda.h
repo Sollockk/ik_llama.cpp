@@ -72,6 +72,13 @@ GGML_API void ggml_backend_cuda_fill_delta_ring(ggml_backend_t backend,
 GGML_API void ggml_backend_cuda_set_delta_ready(ggml_backend_t backend, bool ready);
 GGML_API void ggml_backend_cuda_unpin_host_memory(void * ptr);
 
+// Enable static delta streaming pipeline for dense models.
+// Replaces LRU ring buffer with deterministic prefetch when layer
+// execution order is fully predictable (no MoE routing).
+// n_slots = pipeline depth (0 = auto, typically 3-4).  Must be called
+// before first graph evaluation.
+GGML_API void ggml_backend_cuda_set_delta_streaming(ggml_backend_t backend, bool enable, int n_slots);
+
 // Disable CUDA graph capture/replay at init time (clean disable).
 // Call when delta correction is active — cooperative delta requires host sync
 // which is incompatible with graph capture. Must be called BEFORE first graph eval.

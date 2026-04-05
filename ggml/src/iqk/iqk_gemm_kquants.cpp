@@ -2821,9 +2821,12 @@ bool iqk_set_kernels_kquants(int ne00, int typeA, int typeB, std::array<mul_mat_
             IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_qX_K_q8_2_X4_T, DequantizerQ4K_AVX2, kernels);
             //set_functions<DequantizerQ4K>(kernels);
             break;
-        case GGML_TYPE_QD4_K:
-            IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_qd4_k_q8_2_X4_T, kernels);
-            break;
+        // QD4_K: disabled — block size (136) differs from Q4_K (144), so
+        // iqk_convert_q4_k_q8_1_r8 reads at wrong strides. Falls back to
+        // standard ggml vec_dot path which handles QD4_K correctly.
+        // case GGML_TYPE_QD4_K:
+        //     IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_qd4_k_q8_2_X4_T, kernels);
+        //     break;
         case GGML_TYPE_Q5_K:
             IQK_SET_MUL_MAT_FUNCTIONS_T(mul_mat_qX_K_q8_2_X4_T, DequantizerQ5K_AVX2, kernels);
             //set_functions<DequantizerQ5K>(kernels);
@@ -2886,7 +2889,8 @@ bool iqk_convert_kquants_q8X_r8(int type, int n, const void * vx, size_t bx, voi
         case GGML_TYPE_Q2_K: iqk_convert_q2_k_q8_k_r8(n, vx, bx, vy, nrc_x); break;
         case GGML_TYPE_Q3_K: iqk_convert_q3_k_q8_k_r8(n, vx, bx, vy, nrc_x); break;
         case GGML_TYPE_Q4_K: iqk_convert_q4_k_q8_1_r8(n, vx, bx, vy, nrc_x); break;
-        case GGML_TYPE_QD4_K: iqk_convert_q4_k_q8_1_r8(n, vx, bx, vy, nrc_x); break;
+        // QD4_K: don't use Q4_K converter — block sizes differ (136 vs 144)
+        // case GGML_TYPE_QD4_K: break;
         case GGML_TYPE_Q5_K: iqk_convert_q5_k_q8_1_r8(n, vx, bx, vy, nrc_x); break;
         case GGML_TYPE_Q6_K: iqk_convert_q6_k_q8_0_r8(n, vx, bx, vy, nrc_x); break;
         case GGML_TYPE_IQ4_XS: iqk_convert_iq4_xs_q8_k_r8(n, vx, bx, vy, nrc_x); break;
@@ -4609,7 +4613,8 @@ bool iqk_convert_kquants_q8X_r8(int type, int n, const void * vx, size_t bx, voi
         case GGML_TYPE_Q2_K: iqk_convert_q2_k_q8_k_r8(n, vx, bx, vy, nrc_x); break;
         case GGML_TYPE_Q3_K: iqk_convert_q3_k_q8_k_r8(n, vx, bx, vy, nrc_x); break;
         case GGML_TYPE_Q4_K: iqk_convert_q4_k_q8_1_r8(n, vx, bx, vy, nrc_x); break;
-        case GGML_TYPE_QD4_K: iqk_convert_q4_k_q8_1_r8(n, vx, bx, vy, nrc_x); break;
+        // QD4_K: don't use Q4_K converter — block sizes differ (136 vs 144)
+        // case GGML_TYPE_QD4_K: break;
         case GGML_TYPE_Q5_K: iqk_convert_q5_k_q8_1_r8(n, vx, bx, vy, nrc_x); break;
         case GGML_TYPE_Q6_K: iqk_convert_q6_k_q8_0_r8(n, vx, bx, vy, nrc_x); break;
         case GGML_TYPE_IQ4_XS: iqk_convert_iq4_xs_q8_k_r8(n, vx, bx, vy, nrc_x); break;
