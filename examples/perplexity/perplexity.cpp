@@ -2079,6 +2079,50 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Sharp ring buffer support (--sharp + --bs-gpu-cache-primary + --bs-moe)
+    if (!params.sharp_model.empty() && !bsctx) {
+        fprintf(stderr, "%s: loading sharp overlay for ring buffer...\n", __func__);
+        llama_blurry_sharp_params bs_params = llama_blurry_sharp_default_params();
+        bs_params.sharp_model_path = params.sharp_model.c_str();
+        bs_params.permanent = !params.bs_moe_combination;
+        bs_params.use_mmap = true;
+        bs_params.gpu_cache_primary = params.bs_gpu_cache_primary;
+        bs_params.gpu_cache_bytes = (int64_t)params.bs_gpu_cache_mb * 1024 * 1024;
+
+        bsctx = llama_blurry_sharp_init(model, bs_params);
+        if (bsctx) {
+            // Wire sharp tensors for ring buffer
+            if (params.bs_gpu_cache_primary) {
+                int32_t n_wired = llama_blurry_sharp_wire_sharp_tensors(bsctx);
+                fprintf(stderr, "%s: sharp ring buffer wired %d expert tensors\n", __func__, n_wired);
+
+                // Permanent upgrade for gates
+                llama_blurry_sharp_apply_gates_permanent(bsctx);
+
+                // Permanent upgrade for non-expert tensors (attention, norms, output head)
+                if (!params.bs_no_sharp_attn) {
+                    int32_t n_upgraded = llama_blurry_sharp_apply_non_expert_permanent(bsctx);
+                    fprintf(stderr, "%s: permanently upgraded %d non-expert tensors\n", __func__, n_upgraded);
+                }
+
+#ifdef GGML_USE_CUDA
+                extern std::vector<ggml_backend_t> & llama_get_backends(llama_context * ctx);
+                for (auto * be : llama_get_backends(ctx)) {
+                    if (!ggml_backend_is_cpu(be)) {
+                        ggml_backend_cuda_disable_graphs(be);
+                        ggml_backend_cuda_set_sharp_vram_budget(be, params.bs_gpu_cache_mb);
+                        ggml_backend_cuda_enable_sharp_ring(be, true);
+                    }
+                }
+#endif
+            } else {
+                // Non-ring-buffer path: permanent overlay for everything
+                int32_t n = llama_blurry_sharp_apply_all(bsctx);
+                fprintf(stderr, "%s: permanent sharp overlay applied to %d tensors\n", __func__, n);
+            }
+        }
+    }
+
     const int n_ctx_train = llama_n_ctx_train(model);
 
     if (params.n_ctx > n_ctx_train) {

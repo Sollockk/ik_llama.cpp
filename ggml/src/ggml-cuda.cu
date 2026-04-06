@@ -3324,6 +3324,16 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     CUDA_CHECK(cudaMemsetAsync((char *)dst->data, 0, ggml_nbytes(dst), ctx.stream()));
 
+    {
+        static int mmid_entry_diag = 0;
+        if (mmid_entry_diag < 5) {
+            mmid_entry_diag++;
+            fprintf(stderr, "[mmid-entry] %s sharp_cache=%p sharp_ready=%d batch=%lld\n",
+                    src0->name, src0->ray_march_sharp_cache,
+                    (int)ctx.sharp_ready, (long long)src1->ne[1]);
+        }
+    }
+
     // Skip Fast TG path when sharp ring is wired — it runs the base matmul
     // with blurry weights then tries to overwrite per-expert.  Instead, fall
     // through to the generic expert loop which swaps src0_row.data to sharp
@@ -3893,8 +3903,34 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 // expert's correct result with expert 0's data.
                 src0_row.ray_march_sharp_cache = nullptr;
                 sharp_swapped = true;
+
+                static int loop_sharp_diag = 0;
+                if (loop_sharp_diag < 3) {
+                    loop_sharp_diag++;
+                    // Sync compute stream so async upload is complete before reading
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    uint8_t ring_bytes[16] = {0}, orig_bytes[16] = {0};
+                    CUDA_CHECK(cudaMemcpy(ring_bytes, sharp_ptr, 16, cudaMemcpyDeviceToHost));
+                    void * orig_ptr = (char *)sharp_saved_data;
+                    if (orig_ptr) {
+                        CUDA_CHECK(cudaMemcpy(orig_bytes, orig_ptr, 16, cudaMemcpyDeviceToHost));
+                    }
+                    // Also check host source data
+                    const char * host_check = pim_delta_cache_get(scache, (int)i02);
+                    fprintf(stderr, "[loop-sharp] %s expert=%lld type=%s→%s batch=%lld "
+                            "ring[0..3]=%02x%02x%02x%02x orig[0..3]=%02x%02x%02x%02x "
+                            "host[0..3]=%02x%02x%02x%02x %s\n",
+                            src0->name, (long long)i02,
+                            ggml_type_name(sharp_saved_type),
+                            ggml_type_name(src0_row.type),
+                            (long long)num_src1_rows,
+                            ring_bytes[0], ring_bytes[1], ring_bytes[2], ring_bytes[3],
+                            orig_bytes[0], orig_bytes[1], orig_bytes[2], orig_bytes[3],
+                            (uint8_t)host_check[0], (uint8_t)host_check[1],
+                            (uint8_t)host_check[2], (uint8_t)host_check[3],
+                            memcmp(ring_bytes, orig_bytes, 16) == 0 ? "SAME!" : "different");
+                }
             }
-            sring.token_counter++;
         }
 
         GGML_ASSERT(nb11 == sizeof(float)*ne10);
@@ -3909,6 +3945,16 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_row.nb[1] = nb1;
         dst_row.nb[2] = num_src1_rows*nb1;
         dst_row.nb[3] = num_src1_rows*nb1;
+
+        {
+            static int pre_mm_diag = 0;
+            if (pre_mm_diag < 5 && sharp_swapped) {
+                pre_mm_diag++;
+                fprintf(stderr, "[pre-matmul] data=%p type=%s swapped=%d should_mmq=%d\n",
+                        src0_row.data, ggml_type_name(src0_row.type), (int)sharp_swapped,
+                        (int)ggml_cuda_should_use_mmq(src0_row.type, ggml_cuda_info().devices[ctx.device].cc, num_src1_rows));
+            }
+        }
 
         if (ggml_is_quantized(src0_row.type) &&
             ggml_cuda_should_use_mmq(src0_row.type, ggml_cuda_info().devices[ctx.device].cc, num_src1_rows)) {
@@ -3958,6 +4004,11 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     nb1, nb2);
             CUDA_CHECK(cudaGetLastError());
         }
+    }
+
+    // Increment sharp ring LRU counter once per tensor eval (not per expert)
+    if (src0->ray_march_sharp_cache && ctx.sharp_ready && ctx.sharp_ring.vram) {
+        ctx.sharp_ring.token_counter++;
     }
 
     return false;
