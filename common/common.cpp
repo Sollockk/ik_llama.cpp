@@ -471,14 +471,16 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
                 break;
             }
         }
-        if (!has_cpu_moe && !params.gpu_delta_priority && !params.bs_gpu_cache_primary) {
-            fprintf(stderr, "%s: --sharp active, auto-adding --cpu-moe "
-                    "(all MoE expert tensors → plain CPU for cross-type overlay)\n", __func__);
+        if (!has_cpu_moe && !params.gpu_delta_priority) {
+            if (params.bs_gpu_cache_primary) {
+                fprintf(stderr, "%s: --sharp + --bs-gpu-cache-primary active, auto-adding --cpu-moe "
+                        "(expert tensors → CPU to save VRAM; ring buffer serves Q8_0 on GPU)\n", __func__);
+            } else {
+                fprintf(stderr, "%s: --sharp active, auto-adding --cpu-moe "
+                        "(all MoE expert tensors → plain CPU for cross-type overlay)\n", __func__);
+            }
             params.tensor_buft_overrides.push_back(
-                {strdup("\\.ffn_(up|down|gate)_exps\\.weight"), ggml_backend_cpu_buffer_type()});
-        } else if (params.bs_gpu_cache_primary) {
-            fprintf(stderr, "%s: --bs-gpu-cache-primary active, skipping auto --cpu-moe "
-                    "(GPU experts served from sharp VRAM ring buffer at kernel level)\n", __func__);
+                {strdup("\\.ffn_.*_exps\\.weight"), ggml_backend_cpu_buffer_type()});
         } else if (params.gpu_delta_priority) {
             fprintf(stderr, "%s: --gpu-delta-priority active, skipping auto --cpu-moe "
                     "(GPU experts will be delta-upgraded at startup)\n", __func__);

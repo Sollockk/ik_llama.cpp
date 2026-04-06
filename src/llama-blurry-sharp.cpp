@@ -7027,7 +7027,7 @@ int32_t llama_blurry_sharp_wire_sharp_tensors(
     }
 
     int32_t n_wired = 0;
-    int n_skip_cpu = 0, n_skip_1d = 0, n_skip_non_expert = 0;
+    int n_skip_1d = 0, n_skip_non_expert = 0;
 
     for (auto & [name, sinfo] : bsctx->sharp_index) {
         // Only wire expert tensors (_exps) — these have top-K routing with
@@ -7049,9 +7049,11 @@ int32_t llama_blurry_sharp_wire_sharp_tensors(
         ggml_tensor * bt = sinfo.base_tensor;
         if (!bt) continue;
 
-        // Only wire GPU-resident tensors — CPU tensors use classic overlay
-        if (!bt->buffer || ggml_backend_buffer_is_host(bt->buffer)) {
-            n_skip_cpu++;
+        // Wire both GPU and CPU expert tensors — the scheduler's
+        // only_active_experts creates GPU device copies for CPU tensors,
+        // and the generic expert loop swap replaces src0_row.data with
+        // ring buffer data regardless of where the original tensor lives.
+        if (!bt->buffer) {
             continue;
         }
 
@@ -7086,9 +7088,9 @@ int32_t llama_blurry_sharp_wire_sharp_tensors(
                        __func__, n_wired);
         bsctx->sharp_ring_wired = true;
     }
-    if (n_skip_cpu > 0 || n_skip_1d > 0 || n_skip_non_expert > 0) {
-        LLAMA_LOG_INFO("%s: skipped %d non-expert (permanent upgrade), %d CPU, %d 1D\n",
-                       __func__, n_skip_non_expert, n_skip_cpu, n_skip_1d);
+    if (n_skip_1d > 0 || n_skip_non_expert > 0) {
+        LLAMA_LOG_INFO("%s: skipped %d non-expert (permanent upgrade), %d 1D\n",
+                       __func__, n_skip_non_expert, n_skip_1d);
     }
 
     // Pin sharp mmap for async DMA

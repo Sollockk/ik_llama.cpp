@@ -1128,6 +1128,13 @@ static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, co
     for (int i = 0; i < GGML_MAX_DIMS; i++) {
         dup->nb[i] = tensor->nb[i];
     }
+    // Propagate ray march caches so CUDA dispatch can serve sharp/delta
+    // data from ring buffers even when the original tensor is on CPU.
+    dup->ray_march_delta_cache = tensor->ray_march_delta_cache;
+    dup->ray_march_delta_type  = tensor->ray_march_delta_type;
+    dup->sparse_delta_gpu      = tensor->sparse_delta_gpu;
+    dup->ray_march_sharp_cache = tensor->ray_march_sharp_cache;
+    dup->ray_march_sharp_type  = tensor->ray_march_sharp_type;
     return dup;
 }
 
