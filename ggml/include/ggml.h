@@ -459,6 +459,9 @@ extern "C" {
 
         GGML_TYPE_QD4_K   = 160,  // Delta-optimized 4-bit K-quant (signed, no min, 4.22 bpw)
         GGML_TYPE_QD1_K   = 161,  // Delta-optimized 1-bit K-quant (sign-only, 1.125 bpw)
+        GGML_TYPE_GHOST   = 162,  // Zero-byte ghost type: metadata only, no data allocated.
+                                  // Used by ring_experts to keep tensor shape/ne[2] intact
+                                  // while allocating zero VRAM for device copies.
 
         GGML_TYPE_Q4_0_R8   = 202,
         GGML_TYPE_Q5_0_R4   = 206,

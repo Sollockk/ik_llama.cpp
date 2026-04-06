@@ -443,6 +443,10 @@ struct llama_model {
     // the model memory buffers for the tensor data
     std::vector<ggml_backend_buffer_t> bufs;
 
+    // ring experts: expert data served from mmap via VRAM ring buffer
+    bool ring_experts = false;
+    int  ring_experts_mb = 4096;
+
     // model memory mapped files
     llama_mmaps mappings;
 

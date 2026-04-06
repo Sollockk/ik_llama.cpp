@@ -594,6 +594,10 @@ struct gpt_params {
     bool        bs_no_sharp_attn       = false;         // keep blurry attention/norm weights (skip non-expert overlay)
     bool        bs_no_sharp_attn_gpu   = false;         // skip non-expert overlay on GPU tensors only (save VRAM)
 
+    // Ring buffer expert serving: skip loading expert data, serve from mmap via VRAM LRU cache.
+    bool        ring_experts           = false;
+    int         ring_experts_mb        = 4096;           // VRAM ring buffer size in MiB
+
     // Two-pass prompt with entropy-guided KV repair.
     // Pass 1: fast blurry prompt (+ layer-skip).  Gate entropy recorded per token.
     // Pass 2: re-decode difficult tokens (entropy > mean + 1 stddev) with JIT,

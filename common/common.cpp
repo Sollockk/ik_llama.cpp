@@ -486,6 +486,23 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
                     "(GPU experts will be delta-upgraded at startup)\n", __func__);
         }
     }
+    // --ring-experts: auto-add --cpu-moe to keep expert tensors on CPU.
+    // Data loading is skipped; ring buffer serves expert data from mmap.
+    if (params.ring_experts) {
+        bool has_cpu_moe = false;
+        for (const auto & ov : params.tensor_buft_overrides) {
+            if (ov.pattern && strstr(ov.pattern, "_exps")) {
+                has_cpu_moe = true;
+                break;
+            }
+        }
+        if (!has_cpu_moe) {
+            fprintf(stderr, "%s: --ring-experts active, auto-adding --cpu-moe "
+                    "(expert tensors → CPU; data served from mmap via VRAM ring buffer)\n", __func__);
+            params.tensor_buft_overrides.push_back(
+                {strdup("\\.ffn_.*_exps\\.weight"), ggml_backend_cpu_buffer_type()});
+        }
+    }
     if (!params.tensor_buft_overrides.empty()) {
         params.tensor_buft_overrides.push_back({nullptr, nullptr});
     }
@@ -2497,6 +2514,21 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.bs_gpu_cache_primary = true;
         return true;
     }
+    if (arg == "--ring-experts") {
+        params.ring_experts = true;
+        if (i + 1 < argc) {
+            try {
+                int mb = std::stoi(argv[i + 1]);
+                if (mb > 0) {
+                    params.ring_experts_mb = mb;
+                    i++;
+                }
+            } catch (...) {
+                // Not a number — use default, don't consume argv
+            }
+        }
+        return true;
+    }
     if (arg == "--bs-no-sharp-attn" || arg == "--bs-blurry-attn") {
         params.bs_no_sharp_attn = true;
         return true;
@@ -3774,6 +3806,8 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.merge_up_gate_exps = params.merge_up_gate_exps;
     mparams.mtp             = params.has_mtp;
     mparams.flash_attn      = params.flash_attn;
+    mparams.ring_experts    = params.ring_experts;
+    mparams.ring_experts_mb = params.ring_experts_mb;
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {

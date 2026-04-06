@@ -2123,6 +2123,25 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Ring experts: single-model mode, experts already wired during model load.
+    // Just need to activate the CUDA ring buffer.
+    if (params.ring_experts) {
+#ifdef GGML_USE_CUDA
+        extern std::vector<ggml_backend_t> & llama_get_backends(llama_context * ctx);
+        for (auto * be : llama_get_backends(ctx)) {
+            if (!ggml_backend_is_cpu(be)) {
+                ggml_backend_cuda_disable_graphs(be);
+                ggml_backend_cuda_set_sharp_vram_budget(be, params.ring_experts_mb);
+                ggml_backend_cuda_enable_sharp_ring(be, true);
+            }
+        }
+        fprintf(stderr, "%s: ring-experts mode active, ring buffer %d MiB\n",
+                __func__, params.ring_experts_mb);
+#else
+        fprintf(stderr, "%s: --ring-experts requires CUDA\n", __func__);
+#endif
+    }
+
     const int n_ctx_train = llama_n_ctx_train(model);
 
     if (params.n_ctx > n_ctx_train) {

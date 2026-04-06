@@ -1016,6 +1016,13 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
+    [GGML_TYPE_GHOST] = {
+        .type_name                = "ghost",
+        .blck_size                = 1,
+        .type_size                = 0,
+        .is_quantized             = true,
+        .row_meta_size            = 0,
+    },
     [GGML_TYPE_Q5_K] = {
         .type_name                = "q5_K",
         .blck_size                = QK_K,

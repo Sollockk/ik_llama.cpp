@@ -849,6 +849,10 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     *addr = mapping->addr();
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         try {
+            // Skip GHOST tensors — they have no data to map
+            if (tensor->type == GGML_TYPE_GHOST) {
+                continue;
+            }
             const auto * weight = get_weight(ggml_get_name(tensor));
             if (!weight) {
                 continue;
@@ -952,6 +956,11 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // Skip GHOST tensors (ring_experts expert weights) — no data to load.
+        if (cur->type == GGML_TYPE_GHOST) {
+            continue;
+        }
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1058,7 +1067,8 @@ bool llama_model_loader::load_all_data(
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
         // unmap offloaded tensors and metadata
-        if (use_mmap) {
+        // Skip when ring_experts — we need the full mmap alive for ring buffer.
+        if (use_mmap && !ring_experts) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);

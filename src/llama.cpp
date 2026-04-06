@@ -25,6 +25,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-pim-cache.h"
 
 // TODO: fix these includes
 #include "iqk/iqk_quantize.h"
@@ -2622,6 +2623,34 @@ static bool llm_load_tensors(
     ml.init_mappings(true, use_mlock ? &model.mlock_mmaps : nullptr, ml.use_thp);
     model.mappings.reserve(ml.mappings.size());
 
+    // Ring experts: set expert tensor type to GHOST (0 bytes) BEFORE
+    // buffer allocation.  Save original type for ring buffer wiring.
+    struct ring_orig_info { ggml_type type; size_t expert_bytes; };
+    std::unordered_map<ggml_tensor *, ring_orig_info> ring_orig;
+    if (ml.ring_experts) {
+        int n_ghost = 0;
+        for (auto & it : ctx_map) {
+            ggml_context * ctx = it.second;
+            for (auto * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+                const char * name = ggml_get_name(cur);
+                if (name && strstr(name, "_exps") && strstr(name, ".weight") && cur->ne[2] > 1) {
+                    // Save original type and per-expert byte size
+                    size_t total = ggml_nbytes(cur);
+                    ring_orig[cur] = { cur->type, total / (size_t)cur->ne[2] };
+
+                    cur->type = GGML_TYPE_GHOST;
+                    cur->nb[0] = 0;
+                    cur->nb[1] = 0;
+                    for (int d = 2; d < GGML_MAX_DIMS; d++)
+                        cur->nb[d] = 0;
+                    n_ghost++;
+                }
+            }
+        }
+        LLAMA_LOG_INFO("%s: ring_experts: set %d expert tensors to GHOST (0-byte allocation)\n",
+                       __func__, n_ghost);
+    }
+
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_bufs;
     ctx_bufs.reserve(ctx_map.size());
@@ -2762,10 +2791,79 @@ static bool llm_load_tensors(
         llm_prepare_mla(model, mla_attn);
     }
 
-    if (use_mmap_buffer) {
+    if (use_mmap_buffer || ml.ring_experts) {
         for (auto & mapping : ml.mappings) {
             model.mappings.emplace_back(std::move(mapping));
         }
+    }
+
+    // Wire ring expert caches: create pim_delta_cache for each expert tensor
+    // pointing to the model's own mmap.  Must be done while ml is still alive
+    // (need get_weight for file offsets).
+    if (ml.ring_experts && !model.mappings.empty()) {
+        int n_wired = 0;
+        for (auto & [name, tensor] : model.tensors_by_name) {
+            if (name.find("_exps") == std::string::npos) continue;
+            if (name.find(".weight") == std::string::npos) continue;
+            if (!tensor) continue;
+            if (tensor->ne[2] <= 1) continue;
+
+            const auto * w = ml.get_weight(name.c_str());
+            if (!w) continue;
+            if (w->idx >= model.mappings.size() || !model.mappings[w->idx]) continue;
+
+            const uint8_t * mmap_base = (const uint8_t *)model.mappings[w->idx]->addr();
+            const void * mmap_ptr = mmap_base + w->offs;
+            int n_experts = (int)tensor->ne[2];
+
+            // Get original type/size from before GHOST conversion
+            auto orig_it = ring_orig.find(tensor);
+            if (orig_it == ring_orig.end()) continue;
+            ggml_type orig_type = orig_it->second.type;
+            size_t expert_bytes = orig_it->second.expert_bytes;
+
+            struct pim_delta_cache * cache = pim_delta_cache_create(
+                mmap_ptr, -1, (int64_t)w->offs, expert_bytes, n_experts);
+
+            tensor->ray_march_sharp_cache = (void *)cache;
+            tensor->ray_march_sharp_type  = orig_type;  // Q8_0, not GHOST
+            n_wired++;
+        }
+
+        LLAMA_LOG_INFO("%s: wired %d expert tensors for ring buffer (self-mmap mode)\n",
+                       __func__, n_wired);
+
+        // Pin mmap for async CUDA DMA — only if it fits in RAM.
+        // For large models (>RAM), skip pinning; cudaMemcpyAsync
+        // falls back to synchronous copy which still works.
+#ifdef GGML_USE_CUDA
+        {
+            size_t total_mmap = 0;
+            for (auto & mapping : model.mappings) {
+                if (mapping) total_mmap += mapping->size();
+            }
+            // Only pin if total mmap < 75% of system RAM
+            long pages = sysconf(_SC_PHYS_PAGES);
+            long page_size = sysconf(_SC_PAGE_SIZE);
+            size_t sys_ram = (size_t)pages * (size_t)page_size;
+            if (total_mmap < sys_ram * 3 / 4) {
+                for (auto & mapping : model.mappings) {
+                    if (!mapping) continue;
+                    void * addr = const_cast<void *>((const void *)mapping->addr());
+                    size_t sz = mapping->size();
+                    if (addr && sz > 0) {
+                        if (ggml_backend_cuda_pin_host_memory(addr, sz)) {
+                            LLAMA_LOG_INFO("%s: pinned %.1f MiB model mmap for ring buffer DMA\n",
+                                           __func__, sz / (1024.0 * 1024.0));
+                        }
+                    }
+                }
+            } else {
+                LLAMA_LOG_INFO("%s: model mmap (%.1f GiB) exceeds 75%% of RAM (%.1f GiB), skipping pin\n",
+                               __func__, total_mmap / (1024.0*1024.0*1024.0), sys_ram / (1024.0*1024.0*1024.0));
+            }
+        }
+#endif
     }
 
     if (!ml.use_mmap) {
@@ -2849,6 +2947,10 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         llama_model_loader ml(fname, params.ncmoe, params.use_mmap, params.check_tensors,
                 params.repack_tensors, params.use_thp, params.merge_qkv, params.merge_up_gate_exps,
                 params.kv_overrides, params.tensor_buft_overrides);
+
+        ml.ring_experts = params.ring_experts;
+        model.ring_experts = params.ring_experts;
+        model.ring_experts_mb = params.ring_experts_mb;
 
         model.hparams.vocab_only = params.vocab_only;
 
@@ -5782,9 +5884,11 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
     if (need_reserve) {
         // TODO: extract to a function
         // build worst-case graph
+        // Note: when ring_experts is active, expert tensors are permanently
+        // set to IQ1_BN type so all reserves get small buffers.
         int n_tokens = (int)std::min(lctx.cparams.n_ctx, lctx.cparams.n_ubatch);
         int n_past = lctx.cparams.n_ctx - n_tokens;
-        llama_token token = llama_token_bos(&lctx.model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
+        llama_token token = llama_token_bos(&lctx.model);
         ggml_cgraph * gf = llm_build_context::llama_build_graph(lctx, llama_batch_get_one(&token, n_tokens, n_past, 0), true);
 
         // initialize scheduler with the worst-case graph
@@ -5792,6 +5896,8 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
         if (!ggml_backend_sched_reserve(lctx.sched, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         }
+
+        // Expert types stay as IQ1_BN permanently (ring_experts mode)
     }
     return 0;
 }
@@ -6108,6 +6214,8 @@ struct llama_model_params llama_model_default_params() {
         /*.mtp                         =*/ false,
         /*.dry_run                     =*/ false,
         /*.flash_attn                  =*/ true,
+        /*.ring_experts                =*/ false,
+        /*.ring_experts_mb             =*/ 4096,
     };
 
 #ifdef GGML_USE_METAL
@@ -6937,6 +7045,31 @@ struct llama_context * llama_init_from_model(
 
             llama_repack_up_gate_exps(*ctx);
 
+            // Set ring_experts BEFORE graph reservation so tensor copies
+            // are shrunk to 1 expert instead of all 128.
+            if (model->ring_experts) {
+                ggml_backend_sched_set_ring_experts(ctx->sched, true);
+
+                // Activate CUDA sharp ring buffer early so sharp_ready=true
+                // before the warmup graph eval.
+#ifdef GGML_USE_CUDA
+                for (auto * be : ctx->backends) {
+                    if (!ggml_backend_is_cpu(be)) {
+                        ggml_backend_cuda_set_sharp_vram_budget(be, model->ring_experts_mb);
+                        ggml_backend_cuda_enable_sharp_ring(be, true);
+                    }
+                }
+#endif
+            }
+
+            // Ring experts: temporarily change expert tensor type to the
+            // smallest available quant so the graph allocator computes
+            // tiny ggml_nbytes() → small GPU buffers.  ne[2] stays at 128
+            // so MoE routing works correctly.  The ring buffer swap
+            // provides actual Q8_0 data at matmul time.
+            // Expert tensors are already GHOST type from model loading
+            // (0-byte allocation) — no temporary shrink needed.
+
             // build worst-case graph
             int n_past = cparams.n_ctx - n_tokens;
             llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
@@ -6993,6 +7126,7 @@ struct llama_context * llama_init_from_model(
         LLAMA_LOG_INFO("%s: enabling only_active_experts scheduling\n", __func__);
         ggml_backend_sched_set_only_active_experts(ctx->sched, true);
     }
+    // ring_experts is set earlier (before reserve) to shrink device copies
     if (model->split_mode == LLAMA_SPLIT_MODE_GRAPH && (!model->has_tensor_overrides() || cparams.split_mode_graph_scheduling)) {
         ggml_backend_sched_set_split_mode_graph(ctx->sched, true, cparams.scheduler_async);
         ggml_backend_sched_set_max_extra_alloc(ctx->sched, params.max_extra_alloc);

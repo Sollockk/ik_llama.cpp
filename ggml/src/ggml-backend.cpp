@@ -1227,6 +1227,7 @@ struct ggml_backend_sched {
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
 
     bool only_active_experts;
+    bool ring_experts;  // expert data served from ring buffer — shrink device copies
     bool split_mode_graph;
     bool is_async = false;
     bool debug;
@@ -1253,6 +1254,11 @@ void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op 
 void ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off) {
     if (!sched) return;
     sched->only_active_experts = on_or_off;
+}
+
+void ggml_backend_sched_set_ring_experts(ggml_backend_sched_t sched, bool on_or_off) {
+    if (!sched) return;
+    sched->ring_experts = on_or_off;
 }
 
 void ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async) {
@@ -1862,6 +1868,7 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor

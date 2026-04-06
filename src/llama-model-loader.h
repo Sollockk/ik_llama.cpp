@@ -54,6 +54,7 @@ struct llama_model_loader {
     bool use_thp = false;
     bool merge_qkv = false;
     bool merge_up_gate_exps = false;
+    bool ring_experts = false;
 
     llama_files files;
     llama_ftype ftype;

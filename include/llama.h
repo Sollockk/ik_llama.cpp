@@ -413,6 +413,8 @@ extern "C" {
         bool mtp;           // if true, load MTP layers if present
         bool dry_run;       // skip loading tensors
         bool flash_attn;
+        bool ring_experts;  // skip expert data loading, serve from mmap via VRAM ring buffer
+        int32_t ring_experts_mb; // ring buffer size in MiB (default 4096)
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
