@@ -4023,10 +4023,19 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
             //
             // TODO: re-enable when we can confirm mul_mat_id runs on CPU for
             //       layers with --n-cpu-moe.
+            //
+            // NOTE: if re-enabling, check for conflict with gpu_cache_primary.
+            //       GPU cache primary serves sharp data directly to GPU dcpy,
+            //       so mul_mat_id runs on GPU — the CPU ray march kernel would
+            //       never see the data.  Either gate this bypass on
+            //       !params.gpu_cache_primary, or implement a GPU ray march path.
 
             // 2c) Static layer budget check: skip layers not in the priority set.
-            if (!lctx->jit_priority_layers.empty() &&
-                lctx->jit_priority_layers.find(layer_idx) == lctx->jit_priority_layers.end()) {
+            //     Bypassed when gpu_cache_primary is active — cache hits are free
+            //     GPU→GPU copies, so there's no PCIe/SSD cost to budget for.
+            if (!lctx->jit_priority_layers.empty()
+                && !(lctx->jit_bsctx && lctx->jit_bsctx->params.gpu_cache_primary)
+                && lctx->jit_priority_layers.find(layer_idx) == lctx->jit_priority_layers.end()) {
                 goto jit_done;
             }
 
@@ -4123,12 +4132,251 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                         }
                     }
 
-                    // 4b) Sharpen this layer's expert weights
+                    // 4b) GPU Cache Primary path — serve experts exclusively
+                    //     from the GPU cache, never touching the blurry CPU tensor.
+                    //     Cache hit:  GPU→GPU copy (~10μs), zero PCIe.
+                    //     Cache miss: read sharp slice → staging → GPU cache + dcpy.
+                    //
+                    //     SKIP when sharp_ring_wired: the CUDA mul_mat_id dispatch
+                    //     handles sharp replacement via the VRAM ring buffer — no
+                    //     need for dcpy uploads from the eval callback.
+                    const bool is_generation_4b = (n_tokens <= (int64_t)lctx->model.hparams.n_expert_used);
+                    if (is_generation_4b && lctx->jit_bsctx->params.gpu_cache_primary
+                        && !lctx->jit_bsctx->sharp_ring_wired
+                        && lctx->jit_bsctx->inflate_shrunk_ne2
+                        && lctx->jit_bsctx->params.gpu_cache_bytes > 0) {
+                        static bool gcp_logged = false;
+                        if (!gcp_logged) {
+                            fprintf(stderr, "[gpu-cache-primary] active for layer %d (%d experts)\n",
+                                    layer_idx, (int)expert_vec.size());
+                            // Dump first tensor's size info for diagnostics
+                            auto lt_it2 = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
+                            if (lt_it2 != lctx->jit_bsctx->layer_tensor_names.end()) {
+                                for (const auto & tn : lt_it2->second) {
+                                    if (tn.find("_exps") == std::string::npos) continue;
+                                    auto si2 = lctx->jit_bsctx->sharp_index.find(tn);
+                                    if (si2 != lctx->jit_bsctx->sharp_index.end()) {
+                                        const auto & s = si2->second;
+                                        fprintf(stderr, "  tensor=%s sharp_type=%d ne=[%lld,%lld,%lld] nbytes=%zu stride=%zu\n",
+                                                tn.c_str(), (int)s.type,
+                                                (long long)s.ne[0], (long long)s.ne[1], (long long)s.ne[2],
+                                                s.nbytes, s.nbytes / (size_t)s.ne[2]);
+                                        ggml_tensor * bt2 = s.base_tensor;
+                                        if (bt2) {
+                                            fprintf(stderr, "  base: type=%d ne=[%lld,%lld,%lld] nbytes=%zu\n",
+                                                    (int)bt2->type,
+                                                    (long long)bt2->ne[0], (long long)bt2->ne[1], (long long)bt2->ne[2],
+                                                    ggml_nbytes(bt2));
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                            gcp_logged = true;
+                        }
+                        auto & gcache = lctx->jit_bsctx->gpu_cache;
+                        int64_t t_gcp_start = now_us();
+                        t_overhead_us += (t_gcp_start - t1);
+
+                        // Collect unique active expert IDs
+                        std::vector<int32_t> active_eids;
+                        {
+                            std::unordered_set<int32_t> seen;
+                            for (int ei = 0; ei < (int)expert_vec.size(); ++ei) {
+                                if (seen.insert(expert_vec[ei]).second)
+                                    active_eids.push_back(expert_vec[ei]);
+                            }
+                            for (size_t i = 0; i < n_ids; ++i) {
+                                if (ids[i] >= 0 && seen.insert(ids[i]).second)
+                                    active_eids.push_back(ids[i]);
+                            }
+                        }
+
+                        [[maybe_unused]] ggml_backend_t cuda_be_for_sync = nullptr;
+                        int64_t n_pcie_bytes_gcp = 0;
+                        int gcp_n_tensors = 0, gcp_n_slices = 0;
+                        bool gcp_any_dcpy = false; // true if at least one dcpy was found
+                        auto lt_it = lctx->jit_bsctx->layer_tensor_names.find(layer_idx);
+                        if (lt_it != lctx->jit_bsctx->layer_tensor_names.end()) {
+                            int n_be = ggml_backend_sched_get_n_backends(lctx->sched);
+                            for (const auto & tname : lt_it->second) {
+                                if (tname.find("_exps") == std::string::npos) continue;
+                                auto si_it = lctx->jit_bsctx->sharp_index.find(tname);
+                                if (si_it == lctx->jit_bsctx->sharp_index.end()) continue;
+                                // Skip tensors without an expert dimension (e.g. .scale)
+                                if (si_it->second.ne[2] <= 1) continue;
+                                ggml_tensor * bt = si_it->second.base_tensor;
+                                if (!bt) continue;
+                                gcp_n_tensors++;
+
+                                // Lazy-init GPU cache on first use
+                                if (!gcache.enabled && lctx->jit_bsctx->params.gpu_cache_bytes > 0) {
+                                    // Find a GPU backend for cache init
+                                    for (int bi = 0; bi < n_be; ++bi) {
+                                        ggml_backend_t be = ggml_backend_sched_get_backend(lctx->sched, bi);
+                                        if (!ggml_backend_is_cpu(be)) {
+                                            llama_blurry_sharp_gpu_cache_init(lctx->jit_bsctx, be);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (!gcache.enabled) continue;
+
+                                for (int bi = 0; bi < n_be; ++bi) {
+                                    ggml_backend_t be = ggml_backend_sched_get_backend(lctx->sched, bi);
+                                    if (ggml_backend_is_cpu(be)) continue;
+#ifdef GGML_USE_CUDA
+                                    if (ggml_backend_is_cuda(be)) cuda_be_for_sync = be;
+#endif
+                                    ggml_tensor * dcpy = ggml_backend_sched_get_tensor_copy(
+                                        lctx->sched, bt, be);
+
+                                    const auto & sinfo = si_it->second;
+                                    size_t expert_stride = sinfo.nbytes / (size_t)sinfo.ne[2];
+
+                                    if (!dcpy) {
+                                        // get_tensor_copy hash lookup failed — find the
+                                        // device copy by scanning the compute graph for
+                                        // a GPU-resident tensor with the same name.
+                                        ggml_cgraph * gf = ggml_backend_sched_get_graph(lctx->sched);
+                                        if (gf) {
+                                            for (int ni = 0; ni < gf->n_nodes && !dcpy; ++ni) {
+                                                ggml_tensor * node = gf->nodes[ni];
+                                                if (!node) continue;
+                                                for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                                                    ggml_tensor * s = node->src[si];
+                                                    if (!s) break;
+                                                    if (s != bt && s->buffer &&
+                                                        !ggml_backend_buffer_is_host(s->buffer) &&
+                                                        strcmp(s->name, bt->name) == 0) {
+                                                        dcpy = s;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if (!dcpy) {
+                                            static int n_null = 0;
+                                            if (n_null++ < 3)
+                                                fprintf(stderr, "[gcp] no dcpy for %s (graph scan failed)\n", tname.c_str());
+                                            continue;
+                                        }
+                                    }
+
+                                    gcp_any_dcpy = true;
+
+                                    // Sync device copy type/strides to sharp type
+                                    dcpy->type  = sinfo.type;
+                                    dcpy->nb[0] = ggml_type_size(dcpy->type);
+                                    dcpy->nb[1] = ggml_row_size(dcpy->type, dcpy->ne[0]);
+                                    for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+                                        dcpy->nb[d] = dcpy->nb[d-1] * dcpy->ne[d-1];
+                                    }
+
+                                    for (int32_t eid : active_eids) {
+                                        size_t off = (size_t)eid * expert_stride;
+                                        if (off + expert_stride > ggml_nbytes(dcpy)) continue;
+
+                                        int64_t cache_off = bs_gpu_cache_lookup(
+                                            gcache, tname, eid);
+                                        if (cache_off >= 0) {
+                                            // HIT — GPU→GPU copy, zero PCIe
+                                            bs_gpu_cache_copy_to_dcpy(
+                                                gcache, cache_off, expert_stride, dcpy, off);
+                                            gcache.n_hits++;
+                                        } else {
+                                            // MISS — read sharp slice to staging, upload to cache
+                                            void * staging = lctx->jit_bsctx->pinned_staging_ptr;
+                                            std::vector<uint8_t> staging_fallback;
+                                            if (!staging || lctx->jit_bsctx->pinned_staging_size < expert_stride) {
+                                                staging_fallback.resize(expert_stride);
+                                                staging = staging_fallback.data();
+                                            }
+
+                                            int32_t rr = bs_read_sharp_expert_slice(
+                                                lctx->jit_bsctx, tname, eid,
+                                                staging, expert_stride);
+                                            if (rr == 0) {
+                                                int64_t coff = bs_gpu_cache_store(
+                                                    gcache, tname, eid, staging, expert_stride);
+                                                if (coff >= 0) {
+                                                    bs_gpu_cache_copy_to_dcpy(
+                                                        gcache, coff, expert_stride, dcpy, off);
+                                                } else {
+#ifdef GGML_USE_CUDA
+                                                    ggml_backend_cuda_jit_upload(be, dcpy, staging, off, expert_stride);
+#else
+                                                    ggml_backend_tensor_set_async(be, dcpy, staging, off, expert_stride);
+#endif
+                                                }
+                                                n_pcie_bytes_gcp += (int64_t)expert_stride;
+                                                gcp_n_slices++;
+                                            }
+                                            gcache.n_misses++;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+#ifdef GGML_USE_CUDA
+                        if (cuda_be_for_sync && n_pcie_bytes_gcp > 0) {
+                            ggml_backend_cuda_jit_sync_uploads(cuda_be_for_sync);
+                        }
+#endif
+                        int64_t t_gcp_end = now_us();
+                        t_upload_us += (t_gcp_end - t_gcp_start);
+                        n_pcie_bytes += n_pcie_bytes_gcp;
+
+                        // Don't set jit_current_layer — no restore needed
+                        {
+                            static int gcp_layer_log_count = 0;
+                            if (gcp_layer_log_count < 5) {
+                                fprintf(stderr, "[gcp] layer=%d tensors=%d slices=%d eids=%d pcie=%.1fKiB\n",
+                                        layer_idx, gcp_n_tensors, gcp_n_slices,
+                                        (int)active_eids.size(),
+                                        n_pcie_bytes_gcp / 1024.0);
+                                gcp_layer_log_count++;
+                            }
+                        }
+                        // Only skip classic overlay if we found at least one dcpy.
+                        // If dcpy was not found for any tensor (e.g. --n-cpu-moe
+                        // puts experts on CPU with no GPU copy), fall through to
+                        // the classic CPU overlay path instead.
+                        if (gcp_any_dcpy) {
+                            goto jit_done;
+                        }
+                    }
+
+                    {
+                        static bool gcp_skip_logged = false;
+                        if (!gcp_skip_logged && lctx->jit_bsctx->params.gpu_cache_primary) {
+                            if (lctx->jit_bsctx->sharp_ring_wired) {
+                                fprintf(stderr, "[gpu-cache-primary] BYPASSED: sharp ring buffer wired — "
+                                        "CUDA kernel handles GPU expert replacement\n");
+                            } else {
+                                fprintf(stderr, "[gpu-cache-primary] SKIPPED: gen=%d inflate=%d cache_bytes=%lld\n",
+                                        (int)is_generation_4b,
+                                        (int)lctx->jit_bsctx->inflate_shrunk_ne2,
+                                        (long long)lctx->jit_bsctx->params.gpu_cache_bytes);
+                            }
+                            gcp_skip_logged = true;
+                        }
+                    }
+
+                    // 4c) Sharpen this layer's expert weights (classic overlay path)
                     //     Disable parallel pread during prompt — with many experts
                     //     selected (up to 160), parallel I/O floods the SSD and
                     //     hangs the system.  Sequential reads are fine for prompt
                     //     since we're I/O bound anyway.  Keep parallel for generation
                     //     (few experts, parallelism helps latency).
+                    //
+                    //     SKIP when sharp_ring_wired: CUDA kernel handles all GPU
+                    //     tensors from the ring buffer.  Classic overlay would try
+                    //     to allocate cross-type CUDA buffers → OOM.
+                    if (lctx->jit_bsctx->sharp_ring_wired) {
+                        goto jit_done;
+                    }
                     bool saved_parallel_io = lctx->jit_bsctx->params.parallel_expert_io;
                     if (is_prompt) {
                         lctx->jit_bsctx->params.parallel_expert_io = false;
@@ -4383,6 +4631,25 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
 // ---------------------------------------------------------------------------
 // JIT Sharpening — start / stop
 // ---------------------------------------------------------------------------
+
+ggml_backend_sched_t llama_get_backend_sched(struct llama_context * ctx) {
+    return ctx ? ctx->sched : nullptr;
+}
+
+void llama_force_gpu_offload(struct llama_context * ctx) {
+    if (!ctx || !ctx->sched) return;
+    int n_be = ggml_backend_sched_get_n_backends(ctx->sched);
+    for (int bi = 0; bi < n_be; ++bi) {
+        ggml_backend_t be = ggml_backend_sched_get_backend(ctx->sched, bi);
+        if (ggml_backend_is_cpu(be)) continue;
+#ifdef GGML_USE_CUDA
+        if (ggml_backend_is_cuda(be)) {
+            ggml_backend_cuda_set_offload_batch_size(be, 1);
+            LLAMA_LOG_INFO("%s: set CUDA offload_batch_size=1 for backend %d\n", __func__, bi);
+        }
+#endif
+    }
+}
 
 void llama_blurry_sharp_start_jit(
         struct llama_blurry_sharp_context * bsctx,
@@ -4781,16 +5048,26 @@ static int llama_decode_internal(
             // Pre-inflate expert tensor types so scheduler allocates device
             // copies at the sharp (larger) size, enabling cross-type JIT overlay.
             if (lctx.jit_sharpening && lctx.jit_bsctx) {
-                // Pass priority layers so only those get inflated (type + ne[2]
-                // change).  Non-priority layers keep TQ1_0/ne[2]=n_expert, get
-                // normal device copies via only_active_experts, and compute
-                // on GPU with blurry data.
-                std::vector<int32_t> prio_vec(lctx.jit_priority_layers.begin(),
-                                              lctx.jit_priority_layers.end());
-                llama_blurry_sharp_inflate_expert_types(
-                    lctx.jit_bsctx, u_batch.n_tokens,
-                    prio_vec.empty() ? nullptr : prio_vec.data(),
-                    (int32_t)prio_vec.size());
+                if (lctx.jit_bsctx->params.gpu_cache_primary
+                    && !lctx.jit_bsctx->sharp_ring_wired) {
+                    // GPU cache primary (dcpy path): inflate ALL layers — cache hits
+                    // are free GPU→GPU copies, no reason to limit by priority budget.
+                    // Skip when sharp_ring_wired: kernel reads from ring buffer at
+                    // sharp type, base tensor stays blurry — no inflate needed.
+                    llama_blurry_sharp_inflate_expert_types(
+                        lctx.jit_bsctx, u_batch.n_tokens, nullptr, 0);
+                } else {
+                    // Pass priority layers so only those get inflated (type + ne[2]
+                    // change).  Non-priority layers keep TQ1_0/ne[2]=n_expert, get
+                    // normal device copies via only_active_experts, and compute
+                    // on GPU with blurry data.
+                    std::vector<int32_t> prio_vec(lctx.jit_priority_layers.begin(),
+                                                  lctx.jit_priority_layers.end());
+                    llama_blurry_sharp_inflate_expert_types(
+                        lctx.jit_bsctx, u_batch.n_tokens,
+                        prio_vec.empty() ? nullptr : prio_vec.data(),
+                        (int32_t)prio_vec.size());
+                }
             }
             ggml_backend_sched_alloc_graph(lctx.sched, gf);
             // Restore original (blurry) types now that device copies are sized.

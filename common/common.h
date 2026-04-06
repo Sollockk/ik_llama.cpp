@@ -590,6 +590,7 @@ struct gpt_params {
     int         bs_gpu_cache_mb        = 0;            // GPU expert cache size in MiB (0 = disabled)
     int         bs_ram_cache_mb        = 0;            // RAM expert cache in MiB (0 = auto 4096, -1 = off)
     bool        bs_flash_experts       = false;         // flash-moe style: stream Q4_K_M experts from SSD
+    bool        bs_gpu_cache_primary   = false;         // GPU cache as primary path: skip CPU overlay, serve from GPU cache
     bool        bs_no_sharp_attn       = false;         // keep blurry attention/norm weights (skip non-expert overlay)
     bool        bs_no_sharp_attn_gpu   = false;         // skip non-expert overlay on GPU tensors only (save VRAM)
 

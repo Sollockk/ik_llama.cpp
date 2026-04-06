@@ -508,6 +508,95 @@ static __device__ __forceinline__ float vec_dot_qd4_k_q8_1(
     return vec_dot_qd4_k_q8_1_impl_vmmq(v, u, sc, bqd4k->d, d8);
 }
 
+// ====================== QD1_K (1-bit delta, sign-only)
+// Each call processes 32 elements: 1 int32 of sign bits × 1 Q8_1 block.
+// Dequant: delta = d * (2*bit - 1) = ±d.
+// Dot product: d * sum((2*bit_i - 1) * q8_i) = d * (2*sum_where_1(q8) - sum_all(q8))
+
+#define VDR_QD1_K_Q8_1_MMVQ 1
+#define VDR_QD1_K_Q8_1_MMQ  1
+
+static __device__ __forceinline__ float vec_dot_qd1_k_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_qd1_k * bqd1k = (const block_qd1_k *) vbq + kbx;
+    const float d = __half2float(bqd1k->d);
+
+    // Read 4 bytes of sign bits (32 bits = 32 elements)
+    const uint32_t signs = ((const uint32_t *)bqd1k->qs)[iqs];
+
+    // Read corresponding Q8_1 block
+    const block_q8_1 * bq8 = bq8_1 + iqs;
+    const float d8 = __low2float(bq8->ds);
+
+    // Compute: sum((2*bit-1) * q8) using dp4a
+    // For each group of 4 bits, expand to 4 signed bytes (±1), dp4a with q8
+    int sumi = 0;
+
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        // Extract 4 sign bits
+        const int s4 = (signs >> (4*j)) & 0xF;
+
+        // Expand 4 bits to 4 signed bytes: bit=1 → 0x01 (+1), bit=0 → 0xFF (-1 as int8)
+        // Use arithmetic: for each bit position b, byte = (bit << 1) - 1
+        int expanded = 0;
+        expanded |= (( s4       & 1) * 2 - 1) & 0xFF;
+        expanded |= ((((s4 >> 1) & 1) * 2 - 1) & 0xFF) << 8;
+        expanded |= ((((s4 >> 2) & 1) * 2 - 1) & 0xFF) << 16;
+        expanded |= ((((s4 >> 3) & 1) * 2 - 1) & 0xFF) << 24;
+
+        sumi = ggml_cuda_dp4a(expanded, ((const int *)bq8->qs)[j], sumi);
+    }
+
+    return d * d8 * (float)sumi;
+}
+
+// QD1_K vec_dot against WHT-preprocessed INT8 input.
+// The input was WHT'd and re-quantized to int8 with a per-block scale.
+// The delta was WHT'd at quantization time, so dot(H·delta_signs, H·input) = dot(delta, input).
+// This function processes one full 256-element super-block.
+struct wht_q8_block;  // forward decl (defined in wht-preprocess.cuh)
+
+static __device__ __forceinline__ float vec_dot_qd1_k_wht_q8(
+    const void * __restrict__ vbq,
+    const void * __restrict__ vwht,   // wht_q8_block array
+    const int & kbx) {
+
+    const block_qd1_k * bd = (const block_qd1_k *)vbq + kbx;
+    const float d_delta = __half2float(bd->d);
+
+    // WHT'd input block (256 int8 values + scale)
+    const int8_t * wht_qs = ((const int8_t *)vwht) + kbx * (256 + 4);  // sizeof(wht_q8_block) = 260
+    const float d_wht = *(const float *)(wht_qs + 256);
+
+    // dp4a: dot product of ±1 sign bytes with WHT'd int8 values
+    // Process all 256 elements as 64 groups of 4
+    int sumi = 0;
+
+    const uint32_t * signs_u32 = (const uint32_t *)bd->qs;  // 8 uint32s = 256 bits
+    const int * wht_i32 = (const int *)wht_qs;               // 64 int32s = 256 int8s
+
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        uint32_t s = signs_u32[j];
+        // Expand 32 sign bits → 8 groups of 4 bytes (±1)
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int s4 = (s >> (4*k)) & 0xF;
+            int expanded = 0;
+            expanded |= (( s4       & 1) * 2 - 1) & 0xFF;
+            expanded |= ((((s4 >> 1) & 1) * 2 - 1) & 0xFF) << 8;
+            expanded |= ((((s4 >> 2) & 1) * 2 - 1) & 0xFF) << 16;
+            expanded |= ((((s4 >> 3) & 1) * 2 - 1) & 0xFF) << 24;
+
+            sumi = ggml_cuda_dp4a(expanded, wht_i32[j*8 + k], sumi);
+        }
+    }
+
+    return d_delta * d_wht * (float)sumi;
+}
+
 #define VDR_Q5_K_Q8_1_MMVQ 2
 #define VDR_Q5_K_Q8_1_MMQ  8
 

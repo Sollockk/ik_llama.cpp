@@ -500,6 +500,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_QD4_K> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_QD1_K> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = 8;              // 8 elements per quantized byte (1 bit each)
+    static constexpr int qi = QK_K / (4*8);   // = 8: int32 reads per block
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q5_K> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR5_K;
@@ -955,6 +962,39 @@ struct ggml_backend_cuda_context {
         cudaEvent_t fill_done = nullptr;
         bool   fill_pending = false;
     } delta_ring;
+
+    // Sharp expert ring buffer: VRAM LRU cache for sharp (full-quality) expert
+    // slices.  Same mechanism as delta_ring but dispatches MMVQ with
+    // accumulate=false (replaces blurry base result instead of adding correction).
+    // Wired via ray_march_sharp_cache on expert tensors.
+    struct {
+        void * vram = nullptr;
+        size_t vram_size = 0;
+        size_t vram_used = 0;
+
+        struct slice_info {
+            size_t offset;
+            size_t bytes;
+            int64_t last_used;
+        };
+        std::unordered_map<uint64_t, slice_info> slice_map;
+
+        int64_t token_counter = 0;
+        int    n_hits = 0;
+        int    n_misses = 0;
+        int    n_evictions = 0;
+        cudaEvent_t upload_done = nullptr;
+        bool   upload_pending = false;
+
+        static uint64_t key(const void * tensor, int expert_id) {
+            uint64_t h = (uint64_t)(uintptr_t)tensor;
+            h ^= (uint64_t)expert_id * 0x9E3779B97F4A7C15ULL;
+            return h;
+        }
+    } sharp_ring;
+
+    bool    sharp_ready = false;
+    int     sharp_vram_budget = 0;   // MB, set via --bs-gpu-cache when --bs-gpu-cache-primary
 
     // Static delta streaming pipeline: deterministic prefetch for dense models.
     // Replaces LRU ring buffer when layer execution order is fully predictable.

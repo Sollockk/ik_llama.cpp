@@ -289,6 +289,7 @@ bool server_context::load_model(const gpt_params& params_) {
         bs_params.gpu_cache_bytes    = (int64_t)params_base.bs_gpu_cache_mb * 1024 * 1024;
         bs_params.ram_cache_bytes    = (int64_t)params_base.bs_ram_cache_mb * 1024 * 1024;
         bs_params.flash_experts      = params_base.bs_flash_experts;
+        bs_params.gpu_cache_primary  = params_base.bs_gpu_cache_primary;
 
         // Fractal delta correction chain
         std::vector<const char *> delta_cstrs;
@@ -305,8 +306,10 @@ bool server_context::load_model(const gpt_params& params_) {
             LOG_WARNING("Failed to initialize blurry-sharp overlay, proceeding without it", {});
         } else {
             // Allocate GPU expert cache AFTER model loading.
-            // Try the requested size first; if OOM, halve repeatedly.
-            if (params_base.bs_gpu_cache_mb > 0) {
+            // Skip when --bs-gpu-cache-primary: the CUDA ring buffer (allocated
+            // later via cudaMalloc) replaces this eval-callback cache entirely.
+            // Allocating both wastes ~512 MiB VRAM.
+            if (params_base.bs_gpu_cache_mb > 0 && !params_base.bs_gpu_cache_primary) {
                 size_t n_reg = ggml_backend_reg_get_count();
                 size_t gpu_reg = SIZE_MAX;
                 for (size_t ri = 0; ri < n_reg; ++ri) {
@@ -347,6 +350,17 @@ bool server_context::load_model(const gpt_params& params_) {
                 // Delta GPU upgrade (dequant+add+requant) is pointless when sharp
                 // overlay is available — requant destroys the correction.
                 LOG_INFO("GPU tensors will be handled by --sharp permanent overlay", {});
+            }
+
+            // Wire sharp expert data for kernel-level ring buffer replacement.
+            // When --bs-gpu-cache-primary is set, GPU expert tensors get sharp
+            // data served from a VRAM ring buffer during mul_mat_id dispatch,
+            // bypassing the eval callback dcpy path entirely.
+            if (bs_params.gpu_cache_primary && !params_base.sharp_model.empty()) {
+                int32_t n_wired = llama_blurry_sharp_wire_sharp_tensors(bsctx);
+                if (n_wired > 0) {
+                    LOG_INFO("Sharp tensors wired for GPU ring buffer replacement", {{"n_wired", n_wired}});
+                }
             }
 
             // Determine mode
@@ -434,8 +448,23 @@ bool server_context::load_model(const gpt_params& params_) {
                 // Uses the same first-half + last-half strategy as the
                 // blurry-sharp example: early layers set representations,
                 // final layers drive output logits.
+                // Skipped when gpu_cache_primary is active — cache hits are free
+                // GPU→GPU copies, so all layers can be sharpened.
                 int top_k = params_base.bs_dynamic_top_k; // default 8
-                if (top_k > 0 && st.n_layers_total > top_k) {
+                if (params_base.bs_gpu_cache_primary) {
+                    // No layer budget — sharpen everything via GPU cache
+                    llama_blurry_sharp_set_jit_layers(ctx, nullptr, 0);
+                    LOG_INFO("GPU cache primary: no JIT layer budget (all layers sharpened)", {
+                        {"n_total", st.n_layers_total},
+                    });
+
+                    // Force all MoE ops to offload to GPU even for single-token
+                    // generation.  Without this, the scheduler keeps MoE ops on CPU
+                    // (batch_size < min_batch_size heuristic) and never creates GPU
+                    // device copies — making the GPU cache useless.
+                    llama_force_gpu_offload(ctx);
+                    LOG_INFO("GPU cache primary: forced GPU offload for all batch sizes", {});
+                } else if (top_k > 0 && st.n_layers_total > top_k) {
                     int n_layers_total = st.n_layers_total;
                     int half = std::max(1, top_k / 2);
                     std::vector<int32_t> priority;
@@ -475,6 +504,12 @@ bool server_context::load_model(const gpt_params& params_) {
                 // Use --bs-no-sharp-attn to skip (keeps blurry, saves VRAM on huge models).
                 // Always sharpen gate/router tensors — they're tiny (~59 MiB)
                 // and ensure correct expert routing even with blurry experts.
+                //
+                // SKIP ALL permanent upgrades when sharp ring is wired — the CUDA
+                // kernel serves ALL tensors (expert + non-expert + gates) from the
+                // VRAM ring buffer.  No permanent data inflation needed.
+                // Gates + attention: always upgrade permanently (tiny + always active).
+                // Expert tensors: ring buffer handles them (top-K routing, LRU).
                 {
                     const auto t0_g = ggml_time_us();
                     int32_t n_gates = llama_blurry_sharp_apply_gates_permanent(bsctx);
@@ -524,13 +559,18 @@ bool server_context::load_model(const gpt_params& params_) {
                     for (int il = params_base.ncmoe; il < n_layer; il++) {
                         llama_blurry_sharp_apply_layer(bsctx, il);
                     }
-                } else {
+                } else if (!params_base.bs_gpu_cache_primary) {
                     LOG_INFO("Applying sharp overlay to all layers (static/permanent mode, no backup)", {});
                 }
 
                 const auto t_start = ggml_time_us();
                 int32_t n_sharpened = 0;
-                if (!params_base.gpu_delta_priority || params_base.ncmoe == 0) {
+                if (params_base.bs_gpu_cache_primary) {
+                    // GPU cache primary: sharpen non-expert tensors permanently.
+                    // Expert data served from ring buffer at kernel level.
+                    LOG_INFO("GPU cache primary: sharpening non-expert tensors only", {});
+                    n_sharpened = llama_blurry_sharp_apply_non_expert_permanent(bsctx);
+                } else if (!params_base.gpu_delta_priority || params_base.ncmoe == 0) {
                     // Full apply_all for non-delta-priority mode
                     n_sharpened = llama_blurry_sharp_apply_all(bsctx);
                 }

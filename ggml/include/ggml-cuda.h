@@ -70,7 +70,13 @@ GGML_API void ggml_backend_cuda_fill_delta_ring(ggml_backend_t backend,
     const struct ggml_tensor * const * tensors, const char * const * host_ptrs,
     const size_t * sizes, int n_tensors);
 GGML_API void ggml_backend_cuda_set_delta_ready(ggml_backend_t backend, bool ready);
+GGML_API void ggml_backend_cuda_set_offload_batch_size(ggml_backend_t backend, int batch_size);
 GGML_API void ggml_backend_cuda_unpin_host_memory(void * ptr);
+
+// Sharp expert ring buffer: enables kernel-level sharp replacement
+// via ray_march_sharp_cache, bypassing the eval callback dcpy path.
+GGML_API void ggml_backend_cuda_set_sharp_vram_budget(ggml_backend_t backend, int mb);
+GGML_API void ggml_backend_cuda_enable_sharp_ring(ggml_backend_t backend, bool enable);
 
 // Enable static delta streaming pipeline for dense models.
 // Replaces LRU ring buffer with deterministic prefetch when layer

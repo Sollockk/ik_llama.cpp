@@ -471,11 +471,14 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
                 break;
             }
         }
-        if (!has_cpu_moe && !params.gpu_delta_priority) {
+        if (!has_cpu_moe && !params.gpu_delta_priority && !params.bs_gpu_cache_primary) {
             fprintf(stderr, "%s: --sharp active, auto-adding --cpu-moe "
                     "(all MoE expert tensors → plain CPU for cross-type overlay)\n", __func__);
             params.tensor_buft_overrides.push_back(
                 {strdup("\\.ffn_(up|down|gate)_exps\\.weight"), ggml_backend_cpu_buffer_type()});
+        } else if (params.bs_gpu_cache_primary) {
+            fprintf(stderr, "%s: --bs-gpu-cache-primary active, skipping auto --cpu-moe "
+                    "(GPU experts served from sharp VRAM ring buffer at kernel level)\n", __func__);
         } else if (params.gpu_delta_priority) {
             fprintf(stderr, "%s: --gpu-delta-priority active, skipping auto --cpu-moe "
                     "(GPU experts will be delta-upgraded at startup)\n", __func__);
@@ -2486,6 +2489,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "--bs-flash-experts" || arg == "--flash-experts") {
         params.bs_flash_experts = true;
+        return true;
+    }
+    if (arg == "--bs-gpu-cache-primary") {
+        params.bs_gpu_cache_primary = true;
         return true;
     }
     if (arg == "--bs-no-sharp-attn" || arg == "--bs-blurry-attn") {

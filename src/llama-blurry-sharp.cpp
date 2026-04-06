@@ -324,10 +324,11 @@ static bool bs_is_gate_tensor(const std::string & name) {
 static bool bs_is_expert_tensor(const std::string & name) {
     // Match tensor names ending with "_exps" (the merged expert format)
     // but NOT "_shexp" (shared expert) or "_inp" (gate input)
-    if (name.find("ffn_gate_exps") != std::string::npos) return true;
-    if (name.find("ffn_up_exps")   != std::string::npos) return true;
-    if (name.find("ffn_down_exps") != std::string::npos) return true;
-    if (name.find("ffn_norm_exps") != std::string::npos) return true;
+    if (name.find("ffn_gate_exps")    != std::string::npos) return true;
+    if (name.find("ffn_up_exps")      != std::string::npos) return true;
+    if (name.find("ffn_down_exps")    != std::string::npos) return true;
+    if (name.find("ffn_norm_exps")    != std::string::npos) return true;
+    if (name.find("ffn_gate_up_exps") != std::string::npos) return true;  // fused gate+up (gemma-4 etc.)
     return false;
 }
 
@@ -6347,6 +6348,99 @@ int32_t llama_blurry_sharp_apply_experts(
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// bs_read_sharp_expert_slice — read one expert slice to caller buffer
+//
+// Used by the GPU-cache-primary path to populate the GPU cache without
+// touching the blurry base tensor.  Reads from the best available source:
+//   1. ram_expert_cache (anonymous heap, fast)
+//   2. mmap (may page-fault)
+//   3. pread (SSD)
+// ---------------------------------------------------------------------------
+int32_t bs_read_sharp_expert_slice(
+        llama_blurry_sharp_context * bsctx,
+        const std::string          & tensor_name,
+        int32_t                      expert_id,
+        void                       * dst,
+        size_t                       dst_bytes) {
+    auto si_it = bsctx->sharp_index.find(tensor_name);
+    if (si_it == bsctx->sharp_index.end()) return -1;
+    const auto & si = si_it->second;
+
+    int64_t n_expert_total = si.ne[2];
+    if (n_expert_total <= 0) return -1;
+    size_t expert_slice = si.nbytes / (size_t)n_expert_total;
+    if (dst_bytes < expert_slice) return -1;
+    if ((size_t)expert_id >= (size_t)n_expert_total) return -1;
+
+    size_t off_in_tensor = (size_t)expert_id * expert_slice;
+
+    // 1) Try RAM expert cache
+    auto & rcache = bsctx->ram_expert_cache;
+    if (rcache.enabled) {
+        uint64_t key = bs_gpu_cache_key(tensor_name, expert_id);
+        auto it = rcache.entries.find(key);
+        if (it != rcache.entries.end()) {
+            std::memcpy(dst, it->second.data.data(), expert_slice);
+            it->second.last_access = ++rcache.access_counter;
+            rcache.n_hits++;
+            return 0;
+        }
+    }
+
+    // 2) Try mmap
+    int split = si.split_idx;
+    bool have_mmap = (split >= 0 && split < (int)bsctx->sharp_mmaps.size()
+                      && bsctx->sharp_mmaps[split]
+                      && si.file_offset + si.nbytes <= bsctx->sharp_mmaps[split]->size());
+    if (have_mmap) {
+        const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[split]->addr();
+        std::memcpy(dst, mmap_base + si.file_offset + off_in_tensor, expert_slice);
+
+        // Populate RAM expert cache on read
+        if (rcache.enabled && rcache.budget_bytes > 0) {
+            uint64_t key = bs_gpu_cache_key(tensor_name, expert_id);
+            if (rcache.used_bytes + expert_slice <= rcache.budget_bytes) {
+                llama_blurry_sharp_context::ram_expert_cache::entry e;
+                e.data.assign((const uint8_t *)dst, (const uint8_t *)dst + expert_slice);
+                e.last_access = ++rcache.access_counter;
+                rcache.used_bytes += expert_slice;
+                rcache.entries[key] = std::move(e);
+            }
+            rcache.n_misses++;
+        }
+        return 0;
+    }
+
+    // 3) Try pread
+    bool have_file = (split >= 0 && split < (int)bsctx->sharp_files.size()
+                      && bsctx->sharp_files[split]);
+    if (have_file) {
+        int fd = bsctx->sharp_files[split]->file_id();
+        ssize_t rd = pread(fd, dst, expert_slice,
+                           (off_t)(si.file_offset + off_in_tensor));
+        if (rd == (ssize_t)expert_slice) {
+            // Populate RAM expert cache
+            if (rcache.enabled && rcache.budget_bytes > 0) {
+                uint64_t key = bs_gpu_cache_key(tensor_name, expert_id);
+                if (rcache.used_bytes + expert_slice <= rcache.budget_bytes) {
+                    llama_blurry_sharp_context::ram_expert_cache::entry e;
+                    e.data.assign((const uint8_t *)dst, (const uint8_t *)dst + expert_slice);
+                    e.last_access = ++rcache.access_counter;
+                    rcache.used_bytes += expert_slice;
+                    rcache.entries[key] = std::move(e);
+                }
+                rcache.n_misses++;
+            }
+            return 0;
+        }
+    }
+
+    LLAMA_LOG_ERROR("%s: no source for expert slice '%s' eid=%d\n",
+                    __func__, tensor_name.c_str(), expert_id);
+    return -1;
+}
+
 // GPU Expert Cache
 //
 // Persistent GPU-side cache of sharp (Q3_K_M) expert slices.  Cache hits
@@ -6709,6 +6803,10 @@ bool llama_blurry_sharp_is_dense_delta(const llama_blurry_sharp_context * bsctx)
     return bsctx && bsctx->is_dense_delta;
 }
 
+bool llama_blurry_sharp_is_sharp_ring_wired(const llama_blurry_sharp_context * bsctx) {
+    return bsctx && bsctx->sharp_ring_wired;
+}
+
 int32_t llama_blurry_sharp_wire_delta_tensors(
         llama_blurry_sharp_context * bsctx) {
     if (!bsctx || !bsctx->fractal_mode || bsctx->correction_levels.empty()) {
@@ -6914,6 +7012,105 @@ int32_t llama_blurry_sharp_wire_delta_tensors(
                            __func__, n_merged, jm.queue.size(), total_bytes / (1024.0 * 1024.0));
         }
     }
+
+    return n_wired;
+}
+
+// ---------------------------------------------------------------------------
+// Wire sharp expert data for kernel-level ring buffer replacement
+// ---------------------------------------------------------------------------
+
+int32_t llama_blurry_sharp_wire_sharp_tensors(
+        llama_blurry_sharp_context * bsctx) {
+    if (!bsctx || bsctx->sharp_index.empty()) {
+        return 0;
+    }
+
+    int32_t n_wired = 0;
+    int n_skip_cpu = 0, n_skip_1d = 0, n_skip_non_expert = 0;
+
+    for (auto & [name, sinfo] : bsctx->sharp_index) {
+        // Only wire expert tensors (_exps) — these have top-K routing with
+        // temporal locality, making ring buffer LRU effective (~80% hit rate).
+        // Non-expert tensors (attention, gates, norms) are ALL active EVERY
+        // token — zero locality, ring buffer would thrash.  Those get
+        // permanent upgrade via apply_non_expert_permanent instead.
+        if (name.find("_exps") == std::string::npos) {
+            n_skip_non_expert++;
+            continue;
+        }
+
+        // Must have expert dimension
+        if (sinfo.ne[2] <= 1) {
+            n_skip_1d++;
+            continue;
+        }
+
+        ggml_tensor * bt = sinfo.base_tensor;
+        if (!bt) continue;
+
+        // Only wire GPU-resident tensors — CPU tensors use classic overlay
+        if (!bt->buffer || ggml_backend_buffer_is_host(bt->buffer)) {
+            n_skip_cpu++;
+            continue;
+        }
+
+        // Skip if already wired
+        if (bt->ray_march_sharp_cache != NULL) {
+            n_wired++;
+            continue;
+        }
+
+        // Need mmap to create the cache
+        int si = sinfo.split_idx;
+        if (si < 0 || si >= (int)bsctx->sharp_mmaps.size() || !bsctx->sharp_mmaps[si]) {
+            continue;
+        }
+
+        const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+        const void * mmap_ptr = (const void *)(mmap_base + sinfo.file_offset);
+        int fd = bsctx->sharp_files[si]->file_id();
+        int n_experts = (int)sinfo.ne[2];
+        size_t expert_bytes = sinfo.nbytes / (size_t)n_experts;
+
+        struct pim_delta_cache * cache = pim_delta_cache_create(
+            mmap_ptr, fd, (int64_t)sinfo.file_offset, expert_bytes, n_experts);
+
+        bt->ray_march_sharp_cache = (void *)cache;
+        bt->ray_march_sharp_type  = sinfo.type;
+        n_wired++;
+    }
+
+    if (n_wired > 0) {
+        LLAMA_LOG_INFO("%s: wired %d GPU expert tensors for sharp ring buffer\n",
+                       __func__, n_wired);
+        bsctx->sharp_ring_wired = true;
+    }
+    if (n_skip_cpu > 0 || n_skip_1d > 0 || n_skip_non_expert > 0) {
+        LLAMA_LOG_INFO("%s: skipped %d non-expert (permanent upgrade), %d CPU, %d 1D\n",
+                       __func__, n_skip_non_expert, n_skip_cpu, n_skip_1d);
+    }
+
+    // Pin sharp mmap for async DMA
+#ifdef GGML_USE_CUDA
+    if (n_wired > 0 && !bsctx->sharp_mmaps.empty()) {
+        for (int si = 0; si < (int)bsctx->sharp_mmaps.size(); si++) {
+            if (!bsctx->sharp_mmaps[si]) continue;
+            const uint8_t * mmap_base = (const uint8_t *)bsctx->sharp_mmaps[si]->addr();
+            size_t mmap_size = bsctx->sharp_mmaps[si]->size();
+            if (mmap_base && mmap_size > 0) {
+                madvise((void *)mmap_base, mmap_size, MADV_WILLNEED);
+                if (ggml_backend_cuda_pin_host_memory((void *)mmap_base, mmap_size)) {
+                    LLAMA_LOG_INFO("%s: pinned %.1f MiB sharp mmap (split %d) for async DMA\n",
+                                   __func__, mmap_size / (1024.0 * 1024.0), si);
+                } else {
+                    LLAMA_LOG_WARN("%s: failed to pin sharp mmap (split %d) — ring buffer will use sync DMA\n",
+                                   __func__, si);
+                }
+            }
+        }
+    }
+#endif
 
     return n_wired;
 }

@@ -508,6 +508,12 @@ struct llama_blurry_sharp_context {
     // slices to GPU device copies (type was inflated for correct sizing).
     bool inflate_shrunk_ne2 = false;
 
+    // True when GPU expert tensors have ray_march_sharp_cache wired.
+    // When set, the eval callback skips the dcpy-based GPU cache primary
+    // path — the CUDA mul_mat_id dispatch handles sharp replacement via
+    // the VRAM ring buffer instead.
+    bool sharp_ring_wired = false;
+
     // Saved original types for inflate/deflate cycle.
     // Populated by llama_blurry_sharp_inflate_expert_types(), consumed by deflate.
     struct inflate_saved_entry {
@@ -745,6 +751,16 @@ void bs_gpu_cache_copy_to_dcpy(
         size_t  size,
         ggml_tensor * dcpy,
         size_t  dcpy_offset);
+
+// Read a single sharp expert slice into a caller-provided buffer WITHOUT
+// modifying the base tensor.  Sources tried: ram_expert_cache → mmap → pread.
+// Returns 0 on success, -1 on failure.
+int32_t bs_read_sharp_expert_slice(
+        llama_blurry_sharp_context * bsctx,
+        const std::string          & tensor_name,
+        int32_t                      expert_id,
+        void                       * dst,
+        size_t                       dst_bytes);
 
 // Pre-read all sharp tensor data into anonymous heap buffers (RAM cache).
 // This populates the RAM tier so that data can be swapped out under pressure

@@ -625,7 +625,12 @@ int main(int argc, char ** argv) {
                 }
                 ggml_backend_cuda_enable_delta_post_graph(be, true);
 
-                // Pre-fill disabled — runtime build captures correct dispatch-order tensors
+                // Sharp ring buffer: kernel-level sharp replacement via VRAM LRU cache.
+                // Reuses --bs-gpu-cache budget for the ring buffer allocation.
+                if (params.bs_gpu_cache_primary && params.bs_gpu_cache_mb > 0) {
+                    ggml_backend_cuda_set_sharp_vram_budget(be, params.bs_gpu_cache_mb);
+                    ggml_backend_cuda_enable_sharp_ring(be, true);
+                }
             }
         }
     }

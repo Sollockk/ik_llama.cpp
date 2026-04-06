@@ -3113,6 +3113,149 @@ size_t quantize_qd4_k(const float * restrict src, void * restrict dst, int64_t n
     return nrow * row_size;
 }
 
+// ====================== QD1_K: 1-bit delta quantization
+
+// QD1_K reserved byte flags
+#define QD1_K_FLAG_WHT 0x01  // block was WHT-transformed before sign extraction
+
+// 256-point Walsh-Hadamard Transform (in-place, unnormalized)
+static void qd1k_wht_256(float * restrict buf) {
+    for (int step = 1; step < QK_K; step <<= 1) {
+        for (int i = 0; i < QK_K; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = buf[j];
+                float b = buf[j + step];
+                buf[j]        = a + b;
+                buf[j + step] = a - b;
+            }
+        }
+    }
+    // Normalize: divide by sqrt(256) = 16
+    const float norm = 1.0f / 16.0f;
+    for (int l = 0; l < QK_K; ++l) {
+        buf[l] *= norm;
+    }
+}
+
+void quantize_row_qd1_k_ref(const float * restrict x, block_qd1_k * restrict y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    float wht_buf[QK_K];
+
+    for (int64_t i = 0; i < nb; i++) {
+        // Compute energy byte on ORIGINAL data (same formula as QD4_K)
+        float sum_abs = 0;
+        for (int l = 0; l < QK_K; ++l) {
+            sum_abs += fabsf(x[l]);
+        }
+
+        if (sum_abs < 1e-10f) {
+            y[i].energy = 0;
+            y[i].d = GGML_FP32_TO_FP16(0.0f);
+            y[i].reserved = 0;
+            memset(y[i].qs, 0, QK_K/8);
+        } else {
+            float avg_abs = sum_abs / QK_K;
+            y[i].energy = (uint8_t)MIN(255, MAX(1, nearest_int(128.0f + 16.0f * log2f(avg_abs))));
+
+            // Apply WHT before sign extraction.
+            // WHT spreads energy uniformly, making sign-only quantization
+            // retain ~85-95% of correction energy instead of ~55-65%.
+            memcpy(wht_buf, x, QK_K * sizeof(float));
+            qd1k_wht_256(wht_buf);
+
+            // Scale = mean absolute value of WHT'd coefficients (MSE-optimal for sign-only)
+            float wht_sum_abs = 0;
+            for (int l = 0; l < QK_K; ++l) {
+                wht_sum_abs += fabsf(wht_buf[l]);
+            }
+            y[i].d = GGML_FP32_TO_FP16(wht_sum_abs / QK_K);
+            y[i].reserved = QD1_K_FLAG_WHT;
+
+            // Pack sign bits of WHT'd coefficients
+            memset(y[i].qs, 0, QK_K/8);
+            for (int l = 0; l < QK_K; ++l) {
+                if (wht_buf[l] >= 0.0f) {
+                    y[i].qs[l / 8] |= (1 << (l % 8));
+                }
+            }
+        }
+
+        x += QK_K;
+    }
+}
+
+void quantize_row_qd1_k(const float * restrict x, void * restrict vy, int64_t k) {
+    assert(k % QK_K == 0);
+    block_qd1_k * restrict y = vy;
+    quantize_row_qd1_k_ref(x, y, k);
+}
+
+void dequantize_row_qd1_k(const block_qd1_k * restrict x, float * restrict y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        float * yb = y;
+        for (int l = 0; l < QK_K; ++l) {
+            int bit = (x[i].qs[l / 8] >> (l % 8)) & 1;
+            yb[l] = d * (2 * bit - 1);
+        }
+        // If WHT-encoded, apply inverse WHT to recover original-domain delta
+        if (x[i].reserved & QD1_K_FLAG_WHT) {
+            qd1k_wht_256(yb);  // WHT is its own inverse (with normalization)
+        }
+        y += QK_K;
+    }
+}
+
+void ggml_vec_dot_qd1_k_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(nrc);
+
+    const block_qd1_k * restrict x = vx;
+    const block_q8_K  * restrict y = vy;
+
+    const int nb = n / QK_K;
+    float sumf = 0;
+
+    for (int i = 0; i < nb; i++) {
+        // Skip zero-energy blocks
+        if (x[i].energy == 0) continue;
+
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        // sum((2*bit-1) * q8) = 2*sum_where_bit_1(q8) - sum_all(q8)
+        // sum_all available as y[i].bsums
+        int32_t sum_masked = 0;
+        for (int l = 0; l < QK_K; ++l) {
+            int bit = (x[i].qs[l / 8] >> (l % 8)) & 1;
+            if (bit) {
+                sum_masked += y[i].qs[l];
+            }
+        }
+        int32_t sum_all = 0;
+        for (int j = 0; j < QK_K/16; j++) {
+            sum_all += y[i].bsums[j];
+        }
+        int32_t dot = 2 * sum_masked - sum_all;
+        sumf += d * y[i].d * (float)dot;
+    }
+    *s = sumf;
+}
+
+size_t quantize_qd1_k(const float * restrict src, void * restrict dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    size_t row_size = ggml_row_size(GGML_TYPE_QD1_K, n_per_row);
+    quantize_row_qd1_k_ref(src, dst, (int64_t)nrow * n_per_row);
+    return nrow * row_size;
+}
+
 // ====================== 5-bit (de)-quantization
 
 void quantize_row_q5_K_ref(const float * restrict x, block_q5_K * restrict y, int64_t k) {

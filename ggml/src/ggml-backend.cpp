@@ -2747,6 +2747,11 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
     return sched->backends[backend_index];
 }
 
+struct ggml_cgraph * ggml_backend_sched_get_graph(ggml_backend_sched_t sched) {
+    if (!sched) return NULL;
+    return &sched->graph;
+}
+
 struct ggml_tensor * ggml_backend_sched_get_tensor_copy(
         ggml_backend_sched_t sched,
         struct ggml_tensor * tensor,
@@ -2755,10 +2760,34 @@ struct ggml_tensor * ggml_backend_sched_get_tensor_copy(
     int backend_id = ggml_backend_sched_backend_id(sched, backend);
     if (backend_id < 0) return NULL;
     size_t id = ggml_hash_find(&sched->hash_set, tensor);
-    if (id == GGML_HASHSET_FULL || !ggml_bitset_get(sched->hash_set.used, id)) return NULL;
+    if (id == GGML_HASHSET_FULL || !ggml_bitset_get(sched->hash_set.used, id)) {
+        // Debug: log hash miss for expert tensors
+        static int n_hash_miss_log = 0;
+        if (n_hash_miss_log < 5 && tensor->name[0] != '\0') {
+            const char * reason = (id == GGML_HASHSET_FULL) ? "FULL" : "unused";
+            fprintf(stderr, "[get_tensor_copy] hash %s for '%s' ptr=%p be=%d\n",
+                    reason, tensor->name, (void*)tensor, backend_id);
+            n_hash_miss_log++;
+        }
+        return NULL;
+    }
     struct ggml_tensor * cpy = sched->hv_tensor_copies[id * sched->n_backends * sched->n_copies + backend_id * sched->n_copies + sched->cur_copy];
     // Don't return the tensor itself (same backend = no copy needed)
-    if (cpy == tensor) return NULL;
+    if (cpy == tensor) {
+        static int n_self_log = 0;
+        if (n_self_log < 5) {
+            fprintf(stderr, "[get_tensor_copy] self-ref for '%s' (assigned to same backend)\n", tensor->name);
+            n_self_log++;
+        }
+        return NULL;
+    }
+    if (!cpy) {
+        static int n_null_cpy = 0;
+        if (n_null_cpy < 5) {
+            fprintf(stderr, "[get_tensor_copy] NULL copy for '%s' be=%d\n", tensor->name, backend_id);
+            n_null_cpy++;
+        }
+    }
     return cpy;
 }
 

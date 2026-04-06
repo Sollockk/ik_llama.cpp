@@ -1665,6 +1665,15 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
                                                 //  - No backup/restore overhead
                                                 //  - Blurry expert data never loaded → ~14GB less RAM
                                                 //  - Freed RAM becomes OS page cache for expert reads
+
+        bool     gpu_cache_primary;             // GPU cache as primary execution path.  During generation,
+                                                // serve expert data exclusively from the GPU cache:
+                                                //  - Cache hit  → GPU→GPU copy (~10μs), zero PCIe
+                                                //  - Cache miss → read sharp slice from RAM/disk into
+                                                //                 staging buf, upload to GPU cache + dcpy
+                                                // Never touches the blurry CPU tensor — no overlay,
+                                                // no restore.  Full Q4_K_M quality with no CPU overhead
+                                                // on cache hits.  Requires gpu_cache_bytes > 0.
     };
 
     struct llama_blurry_sharp_state {
@@ -1883,6 +1892,18 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // Call once after delta GGUFs are loaded. Returns number of tensors wired.
     LLAMA_API int32_t llama_blurry_sharp_wire_delta_tensors(
             struct llama_blurry_sharp_context * bsctx);
+
+    // Wire sharp expert data for kernel-level ring buffer replacement.
+    // Attaches pim_delta_cache structs to GPU-resident expert tensors via
+    // ray_march_sharp_cache, enabling the CUDA mul_mat_id dispatch to serve
+    // sharp slices from the VRAM ring buffer (accumulate=false, overwrites
+    // blurry base result).  Returns number of tensors wired.
+    LLAMA_API int32_t llama_blurry_sharp_wire_sharp_tensors(
+            struct llama_blurry_sharp_context * bsctx);
+
+    // Returns true if sharp ring buffer tensors are wired (kernel-level path active).
+    LLAMA_API bool llama_blurry_sharp_is_sharp_ring_wired(
+            const struct llama_blurry_sharp_context * bsctx);
 
     // Returns true if the delta model is dense (no expert dimension on delta tensors).
     // Dense models have fully deterministic layer execution order, enabling the
@@ -2147,6 +2168,15 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // Installs an eval callback that sharpens/restores one layer at a time.
     // When host_only is true, only CPU-resident MoE layers are sharpened;
     // GPU layers are left at blurry quality to preserve CUDA graph capture.
+    // Get the backend scheduler from a llama context.
+    LLAMA_API ggml_backend_sched_t llama_get_backend_sched(struct llama_context * ctx);
+
+    // Force GPU offload for all batch sizes (set offload_batch_size=1 on all
+    // GPU backends).  Required for gpu_cache_primary — without this, the
+    // scheduler keeps MoE ops on CPU for small batches and never creates
+    // GPU device copies.
+    LLAMA_API void llama_force_gpu_offload(struct llama_context * ctx);
+
     LLAMA_API void llama_blurry_sharp_start_jit(
             struct llama_blurry_sharp_context * bsctx,
             struct llama_context              * ctx,

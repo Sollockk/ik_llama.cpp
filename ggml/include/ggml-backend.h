@@ -201,6 +201,9 @@ extern "C" {
     // Returns NULL if no copy exists.
     GGML_API struct ggml_tensor *  ggml_backend_sched_get_tensor_copy(ggml_backend_sched_t sched, struct ggml_tensor * tensor, ggml_backend_t backend);
 
+    // Get the scheduler's internal copy of the compute graph (for graph scanning).
+    GGML_API struct ggml_cgraph * ggml_backend_sched_get_graph(ggml_backend_sched_t sched);
+
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);

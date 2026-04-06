@@ -376,6 +376,19 @@ typedef struct {
 } block_qd4_k;
 static_assert(sizeof(block_qd4_k) == sizeof(ggml_half) + 2 + 4 + QK_K/2, "wrong qd4_k block size/padding");
 
+// Delta-optimized 1-bit quantization (QD1_K)
+// 256 elements per block, each stored as a single sign bit
+// Dequant: delta[i] = d * (2*bit[i] - 1) = ±d
+// Energy byte enables O(1) block-level sparsity skip (~50% of blocks)
+// Effectively 1.125 bits per weight (0.55 bpw with 50% sparsity)
+typedef struct {
+    ggml_half d;             // block scale (max |delta| in this block)
+    uint8_t energy;          // log-scale block energy for sparsity skip
+    uint8_t reserved;        // alignment padding / future flags
+    uint8_t qs[QK_K/8];     // 256 sign bits, packed 8 per byte (LSB first)
+} block_qd1_k;
+static_assert(sizeof(block_qd1_k) == sizeof(ggml_half) + 2 + QK_K/8, "wrong qd1_k block size/padding");
+
 // 5-bit quantization
 // 8 blocks of 32 elements each
 // weight is represented as x = a * q + b

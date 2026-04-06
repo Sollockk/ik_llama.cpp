@@ -458,6 +458,7 @@ extern "C" {
         GGML_TYPE_IQ1_KT  = 158,
 
         GGML_TYPE_QD4_K   = 160,  // Delta-optimized 4-bit K-quant (signed, no min, 4.22 bpw)
+        GGML_TYPE_QD1_K   = 161,  // Delta-optimized 1-bit K-quant (sign-only, 1.125 bpw)
 
         GGML_TYPE_Q4_0_R8   = 202,
         GGML_TYPE_Q5_0_R4   = 206,
@@ -815,6 +816,13 @@ extern "C" {
         void *         ray_march_delta_cache; // pim_delta_cache * (NULL = no delta, full delta CPU RAM)
         void *         sparse_delta_gpu;     // pim_sparse_delta_gpu * (NULL = no sparse VRAM delta)
         enum ggml_type ray_march_delta_type;  // quantization type of the delta
+
+        // Sharp expert replacement: like delta but overwrites base result instead
+        // of adding to it.  Uses the same pim_delta_cache / ring buffer mechanism
+        // but dispatches MMVQ with accumulate=false (replacement, not correction).
+        void *         ray_march_sharp_cache; // pim_delta_cache * (NULL = no sharp overlay)
+        enum ggml_type ray_march_sharp_type;  // quantization type of the sharp data
+
         char           padding[8];
     };
 
