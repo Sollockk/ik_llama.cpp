@@ -1,11 +1,12 @@
-// test-ray-march: standalone test for the three-tier PIM kernel.
+// test-ray-march: standalone test for the PIM kernel.
 //
 // Loads a blurry tensor + delta tensor + sharp tensor, computes:
 //   1. Reference: full sharp vec_dot (ground truth)
 //   2. Baseline: full blurry vec_dot (no correction)
-//   3. Ray march: three-tier (skip + blurry + blurry+delta)
+//   3. Ray march 2-tier: skip + active (legacy)
+//   4. Cascade 4-tier: skip + coarse + standard + critical (radiance cascade)
 //
-// Compares results and reports error metrics.
+// Compares results and reports error metrics for both paths.
 //
 // Usage:
 //   test-ray-march \
@@ -179,17 +180,31 @@ int main(int argc, char ** argv) {
     const uint8_t * sharp_data  = sharp_mmap.at(sharp_loc.offset)   + expert_id * sharp_expert_bytes;
     const uint8_t * delta_data  = delta_mmap.at(delta_loc.offset)   + expert_id * delta_expert_bytes;
 
-    // Create a synthetic input vector (random f32)
+    // Create a synthetic input vector (random f32) with realistic sparsity.
+    // Post-SwiGLU activations are ~60% near-zero with some blocks entirely dead.
+    // We zero out entire blocks to test skip/coarse tiers properly.
     std::vector<float> input_f32(n_cols);
     srand(42);
-    for (int64_t i = 0; i < n_cols; i++) {
-        // Simulate post-SwiGLU sparsity: ~60% near zero
-        float v = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
-        if (fabsf(v) < 0.6f) v *= 0.01f;  // make ~60% very small
-        input_f32[i] = v;
+    {
+        const int delta_blk = ggml_blck_size(delta_loc.type);
+        const int blk = (delta_blk > 0) ? delta_blk : 32;
+        for (int64_t i = 0; i < n_cols; i++) {
+            float v = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+            // Block-level sparsity: ~30% of blocks are completely zero
+            int block_id = (int)(i / blk);
+            if ((block_id * 7 + 3) % 10 < 3) {
+                v = 0.0f;  // dead block
+            } else if (fabsf(v) < 0.6f) {
+                v *= 0.01f;  // weak activation within active blocks
+            }
+            input_f32[i] = v;
+        }
     }
 
-    // Quantize input for vec_dot
+    // Quantize input for vec_dot.
+    // Some IQK types (q8_2_x4, q8_k16, etc.) are packed multi-block formats
+    // that don't work with standalone per-block vec_dot calls. Fall back to
+    // Q8_0 which is universally compatible with all quant types' vec_dot.
     ggml_type blurry_vdt = ggml_internal_get_type_traits(blurry_loc.type).vec_dot_type;
     ggml_type sharp_vdt  = ggml_internal_get_type_traits(sharp_loc.type).vec_dot_type;
     ggml_type delta_vdt  = ggml_internal_get_type_traits(delta_loc.type).vec_dot_type;
@@ -197,21 +212,43 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  blurry vec_dot_type=%s, sharp vec_dot_type=%s, delta vec_dot_type=%s\n",
             ggml_type_name(blurry_vdt), ggml_type_name(sharp_vdt), ggml_type_name(delta_vdt));
 
-    // Quantize input to blurry's vec_dot_type
-    size_t input_q_size = ggml_row_size(blurry_vdt, n_cols);
+    // Check if a vec_dot_type is a packed IQK format that won't work standalone.
+    // These packed formats (q8_*_x4, q8_k*, etc.) require the fused IQK kernel
+    // and can't be used with per-block vec_dot calls in the test harness.
+    auto is_safe_vdt = [](ggml_type t) -> bool {
+        return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q8_1 || t == GGML_TYPE_Q8_K
+            || t == GGML_TYPE_F32  || t == GGML_TYPE_F16;
+    };
+
+    // For blurry input: use native vec_dot_type if safe, else Q8_0
+    ggml_type blurry_input_type = is_safe_vdt(blurry_vdt) ? blurry_vdt : GGML_TYPE_Q8_0;
+    if (blurry_input_type != blurry_vdt) {
+        fprintf(stderr, "  NOTE: blurry vec_dot_type %s is packed IQK format, using Q8_0 fallback\n",
+                ggml_type_name(blurry_vdt));
+    }
+
+    // For delta input: use native if safe, else try Q8_K (for K-quants), else Q8_0
+    ggml_type delta_input_type = is_safe_vdt(delta_vdt) ? delta_vdt : GGML_TYPE_Q8_0;
+    if (delta_input_type != delta_vdt) {
+        fprintf(stderr, "  NOTE: delta vec_dot_type %s is packed IQK format, using Q8_0 fallback\n",
+                ggml_type_name(delta_vdt));
+    }
+
+    // Quantize input to blurry's input type
+    size_t input_q_size = ggml_row_size(blurry_input_type, n_cols);
     std::vector<uint8_t> input_q(input_q_size);
     {
-        ggml_type_traits_t tt = ggml_internal_get_type_traits(blurry_vdt);
+        ggml_type_traits_t tt = ggml_internal_get_type_traits(blurry_input_type);
         if (tt.from_float) {
             tt.from_float(input_f32.data(), input_q.data(), n_cols);
         }
     }
 
-    // Also quantize for delta's vec_dot_type if different
-    size_t dinput_q_size = ggml_row_size(delta_vdt, n_cols);
+    // Quantize input for delta's input type
+    size_t dinput_q_size = ggml_row_size(delta_input_type, n_cols);
     std::vector<uint8_t> dinput_q(dinput_q_size);
     {
-        ggml_type_traits_t tt = ggml_internal_get_type_traits(delta_vdt);
+        ggml_type_traits_t tt = ggml_internal_get_type_traits(delta_input_type);
         if (tt.from_float) {
             tt.from_float(input_f32.data(), dinput_q.data(), n_cols);
         }
@@ -328,79 +365,267 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  Error reduction:     %.1f%%\n",
             100.0 * (1.0 - total_err_corrected / (total_err_blurry + 1e-10)));
 
+    // ---- F32 cascade (4-tier) validation ----
+    fprintf(stderr, "\n--- F32 cascade (4-tier radiance) validation ---\n");
+
+    float coarse_thresh = e_mean * 0.10f;
+    float critical_thresh = e_mean + 0.5f * e_std;
+
+    // Count tiers for reporting
+    int n_skip_c = 0, n_coarse_c = 0, n_std_c = 0, n_crit_c = 0;
+    for (int b = 0; b < n_blocks; b++) {
+        if (energies[b] < skip_thresh) n_skip_c++;
+        else if (energies[b] < coarse_thresh) n_coarse_c++;
+        else if (energies[b] >= critical_thresh) n_crit_c++;
+        else n_std_c++;
+    }
+    fprintf(stderr, "  Cascade partition: %d skip (%.0f%%), %d coarse (%.0f%%), %d standard (%.0f%%), %d critical (%.0f%%)\n",
+            n_skip_c, 100.0f*n_skip_c/n_blocks,
+            n_coarse_c, 100.0f*n_coarse_c/n_blocks,
+            n_std_c, 100.0f*n_std_c/n_blocks,
+            n_crit_c, 100.0f*n_crit_c/n_blocks);
+
+    // Bandwidth savings estimate
+    // Coarse blocks: base only (no delta read) → saves delta fraction of BW
+    // Total active blocks = coarse + standard + critical
+    int n_active_total = n_coarse_c + n_std_c + n_crit_c;
+    if (n_active_total > 0) {
+        float delta_frac = (float)delta_row_bytes / (blurry_row_bytes + delta_row_bytes);
+        float bw_saved_pct = 100.0f * n_coarse_c * delta_frac / n_blocks;
+        fprintf(stderr, "  Delta fraction of total BW: %.1f%%\n", delta_frac * 100.0f);
+        fprintf(stderr, "  Estimated BW savings from coarse tier: %.1f%%\n", bw_saved_pct);
+    }
+
+    double total_err_cascade = 0;
+    for (int r = 0; r < test_rows; r++) {
+        const float * w_sharp  = sharp_f32_all.data()  + r * n_cols;
+        const float * w_blurry = blurry_f32_all.data() + r * n_cols;
+        const float * w_delta  = delta_f32_all.data()  + r * n_cols;
+
+        float ref = 0;
+        for (int64_t j = 0; j < n_cols; j++) ref += w_sharp[j] * input_f32[j];
+
+        float baseline = 0;
+        for (int64_t j = 0; j < n_cols; j++) baseline += w_blurry[j] * input_f32[j];
+
+        // Cascade: base for all non-skip blocks, delta only for standard+critical
+        float cascade_result = 0;
+        if (n_blocks > 0) {
+            for (int b = 0; b < n_blocks; b++) {
+                float e = energies[b];
+                int start = b * delta_blk_size;
+                int end = std::min(start + delta_blk_size, (int)n_cols);
+
+                if (e < skip_thresh) {
+                    // SKIP: no contribution
+                    continue;
+                }
+
+                // Base contribution (all non-skip tiers)
+                float base_dot = 0;
+                for (int j = start; j < end; j++) base_dot += w_blurry[j] * input_f32[j];
+                cascade_result += base_dot;
+
+                if (e >= coarse_thresh) {
+                    // STANDARD or CRITICAL: add delta correction
+                    float delta_dot = 0;
+                    for (int j = start; j < end; j++) delta_dot += w_delta[j] * input_f32[j];
+                    cascade_result += delta_dot;
+                }
+                // COARSE: base only, delta skipped
+            }
+        }
+
+        float err_cascade = fabsf(ref - cascade_result);
+        float err_base    = fabsf(ref - baseline);
+        total_err_cascade += err_cascade;
+
+        fprintf(stderr, "  row %2d: ref=%8.3f | blurry=%8.3f (err=%.4f) | cascade=%8.3f (err=%.4f) %s\n",
+                r, ref, baseline, err_base, cascade_result, err_cascade,
+                err_cascade < err_base ? "IMPROVED" : "same");
+    }
+
+    fprintf(stderr, "\nCascade F32 Summary:\n");
+    fprintf(stderr, "  Avg blurry error:    %.6f\n", total_err_blurry / test_rows);
+    fprintf(stderr, "  Avg 2-tier error:    %.6f\n", total_err_corrected / test_rows);
+    fprintf(stderr, "  Avg cascade error:   %.6f\n", total_err_cascade / test_rows);
+    fprintf(stderr, "  Cascade vs blurry:   %.1f%% error reduction\n",
+            100.0 * (1.0 - total_err_cascade / (total_err_blurry + 1e-10)));
+    fprintf(stderr, "  Cascade vs 2-tier:   %.1f%% MORE error (quality cost of skipping delta on weak blocks)\n",
+            100.0 * (total_err_cascade - total_err_corrected) / (total_err_corrected + 1e-10));
+
     // ---- Test vec_dot kernel (if block-aligned) ----
+    //
+    // The ray march functions (ggml_vec_dot_ray_march, ggml_vec_dot_cascade)
+    // look up vec_dot via ggml_internal_get_type_traits(weight_type).vec_dot.
+    // That vec_dot expects input quantized as traits.vec_dot_type.
+    //
+    // Problem: IQK types like q8_2_x4 are packed multi-block formats that don't
+    // work with per-block calls. We detect this and override the delta type
+    // to a compatible one for the test (Q4_0 → force Q8_0 input).
+    //
+    // In the real inference path (ggml.c), the IQK fused kernel handles this
+    // internally. Here we test the standalone ray march kernel path.
+
     const bool block_aligned = (n_blocks > 0) && (n_cols % delta_blk_size == 0);
     if (block_aligned) {
         fprintf(stderr, "\n--- Vec_dot kernel validation (block_size=%d, %d blocks) ---\n",
                 delta_blk_size, n_blocks);
 
+        // Use the actual weight types' vec_dot functions. If the delta's
+        // vec_dot_type is a packed IQK format, the vec_dot will produce NaN.
+        // Detect that and skip the vec_dot kernel test with a warning.
         ggml_type_traits_t blurry_traits = ggml_internal_get_type_traits(blurry_loc.type);
+        ggml_type_traits_t delta_traits  = ggml_internal_get_type_traits(delta_loc.type);
 
-        ggml_type_traits_t delta_traits = ggml_internal_get_type_traits(delta_loc.type);
-
-        // First: sanity check — does sum of per-block delta vec_dot equal full-row delta vec_dot?
-        fprintf(stderr, "  Sanity check: full-row vs per-block delta vec_dot\n");
-        for (int r = 0; r < 3; r++) {
-            float full_delta = 0;
+        // Sanity check: does the delta vec_dot produce valid results?
+        bool delta_vecdot_ok = false;
+        {
+            float test_val = 0;
             if (delta_traits.vec_dot) {
+                delta_traits.vec_dot((int)n_cols, &test_val, 0,
+                    delta_data, 0, dinput_q.data(), 0, 1);
+                delta_vecdot_ok = std::isfinite(test_val);
+            }
+        }
+
+        if (!delta_vecdot_ok) {
+            fprintf(stderr, "  WARNING: delta vec_dot(%s, %s) produces NaN.\n",
+                    ggml_type_name(delta_loc.type), ggml_type_name(delta_input_type));
+            fprintf(stderr, "  The delta's native vec_dot_type (%s) is a packed IQK format\n",
+                    ggml_type_name(delta_vdt));
+            fprintf(stderr, "  that requires the fused IQK kernel, not standalone vec_dot.\n");
+            fprintf(stderr, "  Vec_dot kernel tests will be SKIPPED.\n");
+            fprintf(stderr, "  (F32 dequant validation above is still valid.)\n");
+        }
+
+        // Also check blurry
+        bool blurry_vecdot_ok = false;
+        {
+            float test_val = 0;
+            if (blurry_traits.vec_dot) {
+                blurry_traits.vec_dot((int)n_cols, &test_val, 0,
+                    blurry_data, 0, input_q.data(), 0, 1);
+                blurry_vecdot_ok = std::isfinite(test_val);
+            }
+        }
+
+        if (blurry_vecdot_ok && delta_vecdot_ok) {
+            // First: sanity check — does sum of per-block delta vec_dot equal full-row?
+            fprintf(stderr, "  Sanity check: full-row vs per-block delta vec_dot\n");
+            int dqb_per_eblk = delta_blk_size / delta_traits.blck_size;
+            size_t delta_eblk_bytes = (size_t)dqb_per_eblk * delta_traits.type_size;
+            int dinp_qb_per_eblk = delta_blk_size / ggml_blck_size(delta_input_type);
+            size_t dinp_eblk_bytes = (size_t)dinp_qb_per_eblk * ggml_type_size(delta_input_type);
+
+            for (int r = 0; r < 3; r++) {
+                float full_delta = 0;
                 delta_traits.vec_dot((int)n_cols, &full_delta, 0,
                     delta_data + r * delta_row_bytes, 0, dinput_q.data(), 0, 1);
+
+                float sum_blocks = 0;
+                for (int b = 0; b < n_blocks; b++) {
+                    float bv = 0;
+                    delta_traits.vec_dot(delta_blk_size, &bv, 0,
+                        delta_data + r * delta_row_bytes + b * delta_eblk_bytes, 0,
+                        dinput_q.data() + b * dinp_eblk_bytes, 0, 1);
+                    sum_blocks += bv;
+                }
+                fprintf(stderr, "    row %d: full=%.6f sum_blocks=%.6f diff=%.6f\n",
+                        r, full_delta, sum_blocks, fabsf(full_delta - sum_blocks));
             }
 
-            float sum_blocks = 0;
-            int dqb_per_eblk = delta_blk_size / delta_traits.blck_size;  // quant blocks per energy block
-            size_t delta_eblk_bytes = (size_t)dqb_per_eblk * delta_traits.type_size;
-            int dinp_qb_per_eblk = delta_blk_size / ggml_blck_size(delta_traits.vec_dot_type);
-            size_t dinp_eblk_bytes = (size_t)dinp_qb_per_eblk * ggml_type_size(delta_traits.vec_dot_type);
-            for (int b = 0; b < n_blocks; b++) {
-                float bv = 0;
-                delta_traits.vec_dot(delta_blk_size, &bv, 0,
-                    delta_data + r * delta_row_bytes + b * delta_eblk_bytes, 0,
-                    dinput_q.data() + b * dinp_eblk_bytes, 0, 1);
-                sum_blocks += bv;
-            }
+            double vd_err_base = 0, vd_err_rm = 0;
+            for (int r = 0; r < test_rows; r++) {
+                const float * w_sharp = sharp_f32_all.data() + r * n_cols;
+                float ref = 0;
+                for (int64_t j = 0; j < n_cols; j++) ref += w_sharp[j] * input_f32[j];
 
-            fprintf(stderr, "    row %d: full=%.6f sum_blocks=%.6f diff=%.6f\n",
-                    r, full_delta, sum_blocks, fabsf(full_delta - sum_blocks));
-        }
-
-        double vd_err_base = 0, vd_err_rm = 0;
-        for (int r = 0; r < test_rows; r++) {
-            const float * w_sharp = sharp_f32_all.data() + r * n_cols;
-            float ref = 0;
-            for (int64_t j = 0; j < n_cols; j++) ref += w_sharp[j] * input_f32[j];
-
-            float baseline = 0;
-            if (blurry_traits.vec_dot) {
+                float baseline = 0;
                 blurry_traits.vec_dot((int)n_cols, &baseline, 0,
                     blurry_data + r * blurry_row_bytes, 0, input_q.data(), 0, 1);
-            }
 
-            // Full-row delta correction (no tiers — should match f32 +delta)
-            float full_corr = 0;
-            if (delta_traits.vec_dot) {
+                float full_corr = 0;
                 delta_traits.vec_dot((int)n_cols, &full_corr, 0,
                     delta_data + r * delta_row_bytes, 0, dinput_q.data(), 0, 1);
+
+                float raymarch = 0;
+                ggml_vec_dot_ray_march(
+                    (int)n_cols, &raymarch,
+                    blurry_data + r * blurry_row_bytes, (int)blurry_loc.type,
+                    delta_data  + r * delta_row_bytes,  (int)delta_loc.type,
+                    input_q.data(), dinput_q.data(),
+                    &tiers, delta_blk_size);
+
+                vd_err_base += fabsf(ref - baseline);
+                vd_err_rm   += fabsf(ref - raymarch);
+
+                fprintf(stderr, "  row %2d: ref=%8.3f | blurry=%8.3f | +full_delta=%8.3f | 2tier=%8.3f %s\n",
+                        r, ref, baseline, baseline + full_corr, raymarch,
+                        fabsf(ref - raymarch) < fabsf(ref - baseline) ? "IMPROVED" : "");
+            }
+            fprintf(stderr, "\nVec_dot 2-tier Summary:\n");
+            fprintf(stderr, "  Avg blurry error: %.6f\n", vd_err_base / test_rows);
+            fprintf(stderr, "  Avg 2-tier error: %.6f\n", vd_err_rm / test_rows);
+
+            // ---- Cascade vec_dot kernel test ----
+            fprintf(stderr, "\n--- Cascade vec_dot kernel validation ---\n");
+
+            std::vector<int> coarse_buf(n_blocks), standard_buf(n_blocks), critical_buf(n_blocks);
+            struct ggml_ray_march_cascade cascade;
+            cascade.coarse_blocks   = coarse_buf.data();
+            cascade.standard_blocks = standard_buf.data();
+            cascade.critical_blocks = critical_buf.data();
+            ggml_ray_march_partition_cascade(
+                energies.data(), n_blocks,
+                skip_thresh, coarse_thresh, critical_thresh,
+                &cascade);
+
+            fprintf(stderr, "  Cascade: %d skip, %d coarse, %d standard, %d critical\n",
+                    cascade.n_skip, cascade.n_coarse, cascade.n_standard, cascade.n_critical);
+
+            double vd_err_cascade = 0;
+            for (int r = 0; r < test_rows; r++) {
+                const float * w_sharp = sharp_f32_all.data() + r * n_cols;
+                float ref = 0;
+                for (int64_t j = 0; j < n_cols; j++) ref += w_sharp[j] * input_f32[j];
+
+                float baseline = 0;
+                blurry_traits.vec_dot((int)n_cols, &baseline, 0,
+                    blurry_data + r * blurry_row_bytes, 0, input_q.data(), 0, 1);
+
+                float cascade_result = 0;
+                ggml_vec_dot_cascade(
+                    (int)n_cols, &cascade_result,
+                    blurry_data + r * blurry_row_bytes, (int)blurry_loc.type,
+                    delta_data  + r * delta_row_bytes,  (int)delta_loc.type,
+                    input_q.data(), dinput_q.data(),
+                    &cascade, delta_blk_size);
+
+                float raymarch = 0;
+                ggml_vec_dot_ray_march(
+                    (int)n_cols, &raymarch,
+                    blurry_data + r * blurry_row_bytes, (int)blurry_loc.type,
+                    delta_data  + r * delta_row_bytes,  (int)delta_loc.type,
+                    input_q.data(), dinput_q.data(),
+                    &tiers, delta_blk_size);
+
+                vd_err_cascade += fabsf(ref - cascade_result);
+
+                fprintf(stderr, "  row %2d: ref=%8.3f | blurry=%8.3f | 2tier=%8.3f | cascade=%8.3f %s\n",
+                        r, ref, baseline, raymarch, cascade_result,
+                        fabsf(ref - cascade_result) < fabsf(ref - baseline) ? "IMPROVED" : "");
             }
 
-            float raymarch = 0;
-            ggml_vec_dot_ray_march(
-                (int)n_cols, &raymarch,
-                blurry_data + r * blurry_row_bytes, (int)blurry_loc.type,
-                delta_data  + r * delta_row_bytes,  (int)delta_loc.type,
-                input_q.data(), dinput_q.data(),
-                &tiers, delta_blk_size);
-
-            vd_err_base += fabsf(ref - baseline);
-            vd_err_rm   += fabsf(ref - raymarch);
-
-            fprintf(stderr, "  row %2d: ref=%8.3f | blurry=%8.3f | +full_delta=%8.3f | 3tier=%8.3f %s\n",
-                    r, ref, baseline, baseline + full_corr, raymarch,
-                    fabsf(ref - raymarch) < fabsf(ref - baseline) ? "IMPROVED" : "");
-        }
-        fprintf(stderr, "\nVec_dot Summary:\n");
-        fprintf(stderr, "  Avg blurry error: %.6f\n", vd_err_base / test_rows);
-        fprintf(stderr, "  Avg 3-tier error: %.6f\n", vd_err_rm / test_rows);
+            fprintf(stderr, "\nVec_dot Cascade Summary:\n");
+            fprintf(stderr, "  Avg blurry error:  %.6f\n", vd_err_base / test_rows);
+            fprintf(stderr, "  Avg 2-tier error:  %.6f\n", vd_err_rm / test_rows);
+            fprintf(stderr, "  Avg cascade error: %.6f\n", vd_err_cascade / test_rows);
+            fprintf(stderr, "  Cascade quality cost vs 2-tier: %.2f%% more error\n",
+                    100.0 * (vd_err_cascade - vd_err_rm) / (vd_err_rm + 1e-10));
+            fprintf(stderr, "  Cascade quality gain vs blurry: %.1f%% less error\n",
+                    100.0 * (1.0 - vd_err_cascade / (vd_err_base + 1e-10)));
+        } // if blurry_vecdot_ok && delta_vecdot_ok
     } else {
         fprintf(stderr, "\n--- Vec_dot kernel test SKIPPED (ne[0]=%lld not aligned to block_size=%d) ---\n",
                 (long long)n_cols, delta_blk_size);

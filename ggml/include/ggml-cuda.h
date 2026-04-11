@@ -78,6 +78,33 @@ GGML_API void ggml_backend_cuda_unpin_host_memory(void * ptr);
 GGML_API void ggml_backend_cuda_set_sharp_vram_budget(ggml_backend_t backend, int mb);
 GGML_API void ggml_backend_cuda_enable_sharp_ring(ggml_backend_t backend, bool enable);
 
+// PIM full expert: on ring cache miss, compute expert matmul on CPU from
+// RAM-resident weights instead of uploading to VRAM.  3000x PCIe reduction.
+GGML_API void ggml_backend_cuda_enable_pim_experts(ggml_backend_t backend, bool enable);
+
+// Condensed expert ring: store only N important rows per expert in VRAM ring.
+// GPU computes N rows instantly, CPU fills remaining rows from RAM in parallel.
+// N_alive rows determined by offline condensation analysis (.cidx file).
+GGML_API void ggml_backend_cuda_enable_condensed_experts(ggml_backend_t backend, int n_alive);
+
+// Load .cidx file mapping tensor+expert → alive row indices.
+GGML_API void ggml_backend_cuda_load_condense_index(ggml_backend_t backend, const char * cidx_path);
+
+// Belady-optimal expert eviction: set the expert demand matrix for the
+// sharp ring buffer.  Each step is a 256-bit bitmask (4 x uint64) of
+// expert IDs needed at that point.  Steps are linearized:
+//   [tok0_layer0, tok0_layer1, ..., tok1_layer0, ...]
+// Call before each token's forward pass.  Resets the demand cursor.
+// Pass n_steps=0 to clear demand and fall back to LRU eviction.
+GGML_API void ggml_backend_cuda_set_expert_demand(
+        ggml_backend_t backend,
+        const uint64_t (* demand)[4],   // [n_steps][4] bitmask array, or NULL
+        int n_steps);
+
+// Advance the sharp ring demand cursor by one MoE layer.
+// Call after each MoE layer completes during inference.
+GGML_API void ggml_backend_cuda_advance_expert_demand(ggml_backend_t backend);
+
 // Enable static delta streaming pipeline for dense models.
 // Replaces LRU ring buffer with deterministic prefetch when layer
 // execution order is fully predictable (no MoE routing).

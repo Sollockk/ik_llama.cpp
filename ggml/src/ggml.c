@@ -17644,42 +17644,64 @@ IQK_MulMat_Not_Available:;
                         }
 
                         if (delta_use_raymarch && rm_n_blocks > 0) {
-                            // --- Prompt batch: ray march with block skipping ---
+                            // --- Prompt batch: radiance cascade with 4-tier block skipping ---
                             const float * src1_f32 = (src1->type == GGML_TYPE_F32)
                                 ? (const float *)((const char *)src1->data + i11*nb11 + i12*nb12) : NULL;
 
                             float rm_energies_buf[512];
-                            int   rm_active_buf[512];
+                            int   rm_coarse_buf[512];
+                            int   rm_standard_buf[512];
+                            int   rm_critical_buf[512];
 
-                            struct ggml_ray_march_tiers tiers;
-                            tiers.active_blocks = rm_active_buf;
-                            tiers.n_active = 0;
-                            tiers.n_skip   = 0;
-                            tiers.n_total  = rm_n_blocks;
+                            struct ggml_ray_march_cascade cascade;
+                            cascade.coarse_blocks   = rm_coarse_buf;
+                            cascade.standard_blocks = rm_standard_buf;
+                            cascade.critical_blocks = rm_critical_buf;
+                            cascade.n_skip     = 0;
+                            cascade.n_coarse   = 0;
+                            cascade.n_standard = 0;
+                            cascade.n_critical = 0;
+                            cascade.n_total    = rm_n_blocks;
 
                             if (src1_f32 && rm_n_blocks <= 512) {
                                 ggml_ray_march_block_energies(src1_f32, rm_energies_buf, (int)ne00, rm_block_size);
 
-                                float e_sum = 0.0f;
+                                float e_sum = 0.0f, e_sq = 0.0f;
                                 for (int b = 0; b < rm_n_blocks; b++) {
                                     e_sum += rm_energies_buf[b];
+                                    e_sq  += rm_energies_buf[b] * rm_energies_buf[b];
                                 }
                                 float e_mean = e_sum / rm_n_blocks;
+                                float e_var  = (e_sq / rm_n_blocks) - (e_mean * e_mean);
+                                float e_std  = e_var > 0 ? sqrtf(e_var) : 0;
 
-                                ggml_ray_march_partition_blocks(
+                                // Cascade thresholds:
+                                //   skip:     < 1% of mean energy (near-zero activation)
+                                //   coarse:   < 10% of mean energy (weak — base only, delta skipped)
+                                //   critical: > mean + 0.5σ (strong — full precision)
+                                //   standard: everything between coarse and critical
+                                float skip_thresh     = e_mean * 0.01f;
+                                float coarse_thresh   = e_mean * 0.10f;
+                                float critical_thresh = e_mean + 0.5f * e_std;
+
+                                ggml_ray_march_partition_cascade(
                                     rm_energies_buf, rm_n_blocks,
-                                    e_mean * 0.01f, &tiers);
+                                    skip_thresh, coarse_thresh, critical_thresh,
+                                    &cascade);
                             } else {
-                                for (int b = 0; b < rm_n_blocks; b++) rm_active_buf[tiers.n_active++] = b;
+                                // Can't partition — treat all as standard (base + delta)
+                                for (int b = 0; b < rm_n_blocks; b++) {
+                                    rm_standard_buf[cascade.n_standard++] = b;
+                                }
                             }
 
                             for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir011; ++ir0) {
-                                ggml_vec_dot_ray_march(
+                                ggml_vec_dot_cascade(
                                     (int)ne00, &tmp[ir0 - iir0],
                                     src0_cur + ir0*nb01, (int)src0->type,
                                     delta_expert + ir0 * delta_row_stride, (int)ray_march_delta_type,
                                     src1_col, dinput,
-                                    &tiers, rm_block_size);
+                                    &cascade, rm_block_size);
                             }
                         } else {
                             // --- Generation: fast two full-row vec_dots ---

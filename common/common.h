@@ -146,6 +146,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_DFLASH,        // block diffusion draft model (DFlash)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -596,7 +597,14 @@ struct gpt_params {
 
     // Ring buffer expert serving: skip loading expert data, serve from mmap via VRAM LRU cache.
     bool        ring_experts           = false;
-    int         ring_experts_mb        = 4096;           // VRAM ring buffer size in MiB
+    int         ring_experts_mb        = 0;              // VRAM ring buffer size in MiB (0 = disabled)
+    bool        pim_experts            = false;          // CPU-side MoE on ring miss (RAM vec_dot instead of PCIe upload)
+    int         condense_experts       = 0;              // --condense-experts N: two-tier ring (N alive rows in VRAM, rest via CPU PIM)
+    std::string condense_index_path;                     // --condense-index PATH: .cidx file from condense_experts.py
+
+    // Routing predictor for expert prefetching (optional)
+    std::string routing_predictor_path;                   // path to predictor weights file
+    std::string routing_collector_path;                   // path to output training data file
 
     // Two-pass prompt with entropy-guided KV repair.
     // Pass 1: fast blurry prompt (+ layer-skip).  Gate entropy recorded per token.

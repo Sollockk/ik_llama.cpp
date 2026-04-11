@@ -152,6 +152,8 @@ struct create_tensors_helper : public create_tensors_helper_interface {
 
     bool create_step35_tensors(const LLM_TN & tn);
 
+    bool create_dflash_tensors(const LLM_TN & tn);
+
     llama_model_loader & ml;
     llama_model        & model;
 
@@ -1217,6 +1219,48 @@ bool create_tensors_helper::create_step35_tensors(const LLM_TN & tn) {
             layer.ffn_down_shexp = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {hparams.n_ff_shexp, n_embd},
                     llama_model_loader::TENSOR_NOT_REQUIRED);
         }
+    }
+    return use_mmap_buffer;
+}
+
+bool create_tensors_helper::create_dflash_tensors(const LLM_TN & tn) {
+    LOADING_PRELUDE
+
+    model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+
+    // output
+    model.output_norm = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd});
+    model.output      = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab},
+                                      llama_model_loader::TENSOR_NOT_REQUIRED);
+    if (model.output == NULL) {
+        model.output = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab},
+                                     llama_model_loader::TENSOR_DUPLICATED);
+    }
+
+    // dflash-specific global tensors
+    // fc projects concatenated multi-layer hidden states down to n_embd
+    const int n_target_layers = (int)hparams.dflash_n_target_layer_ids;
+    model.dflash_fc          = create_tensor(ctx_input, tn(LLM_TENSOR_DFLASH_FC, "weight"),
+                                             {n_embd * n_target_layers, n_embd});
+    model.dflash_hidden_norm = create_tensor(ctx_input, tn(LLM_TENSOR_DFLASH_HIDDEN_NORM, "weight"), {n_embd});
+
+    for (int i = 0; i < n_layer; ++i) {
+        ggml_context * ctx_split = ctx_for_layer_split(i);
+
+        auto & layer = model.layers[i];
+
+        layer.attn_norm   = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd});
+        layer.wq          = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,    "weight", i), {n_embd, n_embd_head_k * n_head});
+        layer.wk          = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,    "weight", i), {n_embd, n_embd_k_gqa});
+        layer.wv          = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,    "weight", i), {n_embd, n_embd_v_gqa});
+        layer.wo          = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT,  "weight", i), {n_embd_head_k * n_head, n_embd});
+        layer.attn_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k});
+        layer.attn_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k});
+
+        layer.ffn_norm = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd});
+        layer.ffn_gate = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff});
+        layer.ffn_down = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd});
+        layer.ffn_up   = create_tensor(ctx_split, tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff});
     }
     return use_mmap_buffer;
 }
@@ -4048,6 +4092,8 @@ bool create_tensors_helper::create_tensors() {
             use_mmap_buffer = create_seedoss_tensors(tn); break;
         case LLM_ARCH_STEP35:
             use_mmap_buffer = create_step35_tensors(tn); break;
+        case LLM_ARCH_DFLASH:
+            use_mmap_buffer = create_dflash_tensors(tn); break;
         default:
             throw std::runtime_error("unknown architecture");
     }

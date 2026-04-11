@@ -1745,8 +1745,9 @@ ggml_tensor * llm_build_context::llm_build_kv(
     const llama_cparams & cparams = lctx.cparams;
 
     if (cparams.k_cache_hadamard) {
-        q_cur = ggml_hadamard(ctx, q_cur, hparams.n_embd_head_k);
-        k_cur = ggml_hadamard(ctx, k_cur, hparams.n_embd_head_k);
+        const int64_t n_embd_head_k_il = hparams.n_embd_head_k_l(il);
+        q_cur = ggml_hadamard(ctx, q_cur, n_embd_head_k_il);
+        k_cur = ggml_hadamard(ctx, k_cur, n_embd_head_k_il);
         cb(q_cur, "Qcur_hadamard", il);
         cb(k_cur, "Kcur_hadamard", il);
     }
@@ -3855,6 +3856,194 @@ ggml_cgraph * llm_build_context::build_step35() {
     }
 
     cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
+    cb(cur, "result_output", -1);
+
+    ggml_build_forward_expand(gf, cur);
+
+    return gf;
+}
+
+// ---------------------------------------------------------------------------
+// DFlash: Block diffusion draft model for speculative decoding
+//
+// The DFlash draft model uses KV-injection attention:
+//   Q comes from the noise (block token embeddings)
+//   K = concat(k_proj(target_hidden), k_proj(noise))
+//   V = concat(v_proj(target_hidden), v_proj(noise))
+//   Attention is non-causal (bidirectional within block)
+//
+// The target_hidden is passed via lctx.dflash_target_hidden (set by the
+// speculative decoding state before calling llama_decode on the draft ctx).
+// It contains concatenated hidden states from sampled target model layers,
+// already in float32, with shape [ctx_len, n_embd * n_target_layers].
+// The graph projects this with fc + hidden_norm before injection.
+// ---------------------------------------------------------------------------
+ggml_cgraph * llm_build_context::build_dflash() {
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, llama_model_max_nodes(model, n_tokens), false);
+
+    const int64_t n_embd_head = hparams.n_embd_head_v;
+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+
+    const int n_target_layers = (int)hparams.dflash_n_target_layer_ids;
+    const int ctx_len = lctx.dflash_ctx_len;  // number of context tokens from target model
+
+    struct ggml_tensor * cur;
+
+    // --- Input: noise embeddings (block tokens) ---
+    struct ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
+
+    // --- Input: position IDs for the full range (context + noise) ---
+    struct ggml_tensor * inp_pos = build_inp_pos();
+
+    // --- Input: target hidden states from the target model ---
+    // Shape: [n_embd * n_target_layers, ctx_len]
+    struct ggml_tensor * target_raw = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
+                                                          n_embd * n_target_layers, ctx_len);
+    ggml_set_name(target_raw, "dflash_target_raw");
+    ggml_set_input(target_raw);
+    lctx.inp_dflash_target = target_raw;
+
+    // --- Project target hidden states: fc + hidden_norm ---
+    // target_raw: [n_embd * n_target_layers, ctx_len]
+    // fc weight:  [n_embd * n_target_layers, n_embd]
+    // result:     [n_embd, ctx_len]
+    struct ggml_tensor * target_hidden = llm_build_lora_mm(lctx, ctx0, model.dflash_fc, target_raw);
+    cb(target_hidden, "dflash_fc_out", -1);
+
+    target_hidden = llm_build_norm(ctx0, target_hidden, hparams,
+                                   model.dflash_hidden_norm, NULL, LLM_NORM_RMS, cb, -1);
+    cb(target_hidden, "dflash_target_hidden", -1);
+
+    // --- Compute RoPE position embeddings for the full range ---
+    // The position IDs in the batch cover positions for both context and noise tokens.
+    // For Q (noise only), we use positions [ctx_len .. ctx_len + n_tokens - 1]
+    // For K (context + noise), we need positions [0 .. ctx_len + n_tokens - 1]
+    //
+    // We create separate position tensors for Q and K RoPE application.
+
+    // --- Attention mask ---
+    // DFlash uses non-causal attention. The mask allows all queries to attend
+    // to all keys (both context and noise). We use build_inp_KQ_mask(false)
+    // to get a non-causal mask, but we need a larger mask since K has ctx_len + n_tokens.
+    // For simplicity, we compute attention without a mask (all-attend).
+
+    // --- Iterate layers ---
+    for (int il = 0; il < n_layer; ++il) {
+        struct ggml_tensor * inpSA = inpL;
+
+        // norm
+        cur = llm_build_norm(ctx0, inpL, hparams, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, cb, il);
+        cb(cur, "attn_norm", il);
+
+        // --- DFlash KV-injection attention ---
+        {
+            // Q from noise (hidden_states) only
+            struct ggml_tensor * Qcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wq, cur);
+            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
+            Qcur = llm_build_norm(ctx0, Qcur, hparams, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, cb, il);
+            cb(Qcur, "Qcur", il);
+
+            // K from target_hidden AND noise, concatenated
+            struct ggml_tensor * Kcur_ctx   = llm_build_lora_mm(lctx, ctx0, model.layers[il].wk, target_hidden);
+            struct ggml_tensor * Kcur_noise = llm_build_lora_mm(lctx, ctx0, model.layers[il].wk, cur);
+            struct ggml_tensor * Kcur = ggml_concat(ctx0, Kcur_ctx, Kcur_noise, 1); // [n_embd_k_gqa, ctx_len + n_tokens]
+            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, ctx_len + n_tokens);
+            Kcur = llm_build_norm(ctx0, Kcur, hparams, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, cb, il);
+            cb(Kcur, "Kcur", il);
+
+            // V from target_hidden AND noise, concatenated
+            struct ggml_tensor * Vcur_ctx   = llm_build_lora_mm(lctx, ctx0, model.layers[il].wv, target_hidden);
+            struct ggml_tensor * Vcur_noise = llm_build_lora_mm(lctx, ctx0, model.layers[il].wv, cur);
+            struct ggml_tensor * Vcur = ggml_concat(ctx0, Vcur_ctx, Vcur_noise, 1); // [n_embd_v_gqa, ctx_len + n_tokens]
+            cb(Vcur, "Vcur", il);
+
+            // Apply RoPE
+            // Q positions: the noise token positions (from the batch's inp_pos)
+            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
+                                 n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            cb(Qcur, "Qcur_rope", il);
+
+            // K positions: we need positions for ctx_len + n_tokens keys
+            // Create a position tensor covering [0, 1, ..., ctx_len + n_tokens - 1]
+            // For simplicity, use a custom position tensor for K
+            struct ggml_tensor * pos_k;
+            if (il == 0) {
+                pos_k = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ctx_len + n_tokens);
+                ggml_set_name(pos_k, "dflash_pos_k");
+                ggml_set_input(pos_k);
+                lctx.inp_dflash_pos_k = pos_k;
+            } else {
+                pos_k = lctx.inp_dflash_pos_k;
+            }
+
+            Kcur = ggml_rope_ext(ctx0, Kcur, pos_k, nullptr,
+                                 n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                                 ext_factor, attn_factor, beta_fast, beta_slow);
+            cb(Kcur, "Kcur_rope", il);
+
+            // --- Manual attention computation (no KV cache) ---
+            // Q: [n_embd_head, n_head, n_tokens] -> permute to [n_embd_head, n_tokens, n_head]
+            struct ggml_tensor * q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+
+            // K: [n_embd_head, n_head_kv, ctx_len + n_tokens] -> permute to [n_embd_head, ctx_len + n_tokens, n_head_kv]
+            struct ggml_tensor * k = ggml_cont(ctx0, ggml_permute(ctx0, Kcur, 0, 2, 1, 3));
+
+            // V: [n_embd_v_gqa, ctx_len + n_tokens] -> reshape + transpose
+            struct ggml_tensor * v = ggml_cont(ctx0, ggml_transpose(ctx0,
+                    ggml_reshape_2d(ctx0, Vcur, n_embd_head * n_head_kv, ctx_len + n_tokens)));
+            cb(v, "v", il);
+
+            // Q @ K^T -> [ctx_len + n_tokens, n_tokens, n_head]
+            struct ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+            cb(kq, "kq", il);
+
+            // Softmax (no mask = non-causal, all-attend)
+            kq = ggml_soft_max_ext(ctx0, kq, nullptr, 1.0f/sqrtf(float(n_embd_head)), 0.0f);
+            cb(kq, "kq_softmax", il);
+
+            // kq @ V -> [n_embd_head, n_tokens, n_head]
+            struct ggml_tensor * kqv = ggml_mul_mat(ctx0,
+                    ggml_reshape_3d(ctx0, v, ctx_len + n_tokens, n_embd_head, n_head_kv), kq);
+            cb(kqv, "kqv", il);
+
+            struct ggml_tensor * kqv_merged = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+            cb(kqv_merged, "kqv_merged", il);
+
+            cur = ggml_cont_2d(ctx0, kqv_merged, n_embd_head * n_head, n_tokens);
+            cb(cur, "kqv_merged_cont", il);
+
+            ggml_build_forward_expand(gf, cur);
+
+            // output projection
+            cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur);
+            cb(cur, "kqv_out", il);
+        }
+
+        // residual
+        cur = ggml_add(ctx0, cur, inpSA);
+        cb(cur, "attn_out", il);
+
+        // feed-forward network (SwiGLU)
+        cur = llm_build_ffn(ctx0, lctx, model.layers[il].ffn_norm, cur,
+                model.layers[il].ffn_up,   NULL, NULL,
+                model.layers[il].ffn_gate, NULL, NULL,
+                model.layers[il].ffn_down, NULL, NULL,
+                NULL,
+                LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, true);
+        cb(cur, "ffn_out", il);
+
+        // input for next layer
+        inpL = cur;
+    }
+
+    // --- Output: norm + lm_head ---
+    cur = llm_build_norm(ctx0, inpL, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, -1);
+    cb(cur, "result_norm", -1);
+
+    // Only output logits for positions [1, block_size) (skip anchor token at position 0)
+    // The speculative state handles this slicing externally
+    cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
     cb(cur, "result_output", -1);
 
     ggml_build_forward_expand(gf, cur);
@@ -6067,6 +6256,46 @@ ggml_cgraph * llm_build_context::build_gemma4() {
     struct ggml_tensor * KQ_mask     = build_inp_KQ_mask(true);
     struct ggml_tensor * KQ_mask_swa = build_inp_KQ_mask_swa(true);
 
+    // per-layer embeddings (Gemma 4)
+    const int64_t n_embd_per_layer = hparams.n_embd_per_layer;
+    struct ggml_tensor * inp_per_layer = nullptr;
+    if (n_embd_per_layer > 0 && model.tok_embd_per_layer) {
+        // Step 1: look up per-layer token embeddings
+        // tok_embd_per_layer shape: [n_embd_per_layer * n_layer, n_vocab]
+        if (batch.token) {
+            inp_per_layer = ggml_get_rows(ctx0, model.tok_embd_per_layer, lctx.inp_tokens);
+            // shape: [n_embd_per_layer * n_layer, n_tokens]
+            inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, n_tokens);
+            inp_per_layer = ggml_scale(ctx0, inp_per_layer, sqrtf((float)n_embd_per_layer));
+            cb(inp_per_layer, "inp_per_layer_selected", -1);
+        } else {
+            // Vision embedding path: use padding token (ID=0) embedding
+            const int64_t embd_size = model.tok_embd_per_layer->ne[0];
+            ggml_tensor * padding = ggml_view_1d(ctx0, model.tok_embd_per_layer, embd_size, 0);
+            inp_per_layer = ggml_cast(ctx0, padding, GGML_TYPE_F32);
+            inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_per_layer, n_layer, 1);
+            cb(inp_per_layer, "inp_per_layer_vision", -1);
+        }
+
+        // Step 2: project main embeddings and combine
+        const float per_layer_projection_scale = 1.0f / sqrtf((float)n_embd);
+        const float per_layer_input_scale      = 1.0f / sqrtf(2.0f);
+
+        ggml_tensor * per_layer_proj = llm_build_lora_mm(lctx, ctx0, model.per_layer_model_proj, inpL);
+        per_layer_proj = ggml_scale(ctx0, per_layer_proj, per_layer_projection_scale);
+        // shape: [n_embd_per_layer * n_layer, n_tokens] -> [n_embd_per_layer, n_layer, n_tokens]
+        per_layer_proj = ggml_reshape_3d(ctx0, per_layer_proj, n_embd_per_layer, n_layer, n_tokens);
+        per_layer_proj = llm_build_norm(ctx0, per_layer_proj, hparams, model.per_layer_proj_norm, NULL, LLM_NORM_RMS, cb, -1);
+        cb(per_layer_proj, "per_layer_proj", -1);
+
+        inp_per_layer = ggml_add(ctx0, per_layer_proj, inp_per_layer);
+        inp_per_layer = ggml_scale(ctx0, inp_per_layer, per_layer_input_scale);
+        cb(inp_per_layer, "inp_per_layer", -1);
+
+        // permute to shape: [n_embd_per_layer, n_tokens, n_layer]
+        inp_per_layer = ggml_cont(ctx0, ggml_permute(ctx0, inp_per_layer, 0, 2, 1, 3));
+    }
+
     for (int il = 0; il < n_layer; ++il) {
         const bool is_swa = hparams.is_swa(il);
         const int64_t n_head_l      = hparams.n_head(il);
@@ -6100,15 +6329,14 @@ ggml_cgraph * llm_build_context::build_gemma4() {
         cb(Qcur, "Qcur_pos", il);
 
         // self-attention
-        // NOTE: shared KV layer reuse (has_kv) not supported in this fork yet,
-        // so all layers compute their own KV cache entries.
-        {
+        if (hparams.has_kv(il)) {
+            // This layer has its own KV cache: compute K, V, store, attend
             ggml_tensor * Kcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wk, cur);
             cb(Kcur, "Kcur", il);
 
             ggml_tensor * Vcur = model.layers[il].wv
                 ? llm_build_lora_mm(lctx, ctx0, model.layers[il].wv, cur)
-                : Kcur; // if v_proj is not present, use Kcur as Vcur
+                : Kcur;
             cb(Vcur, "Vcur", il);
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head_l,   n_head_kv_l, n_tokens);
@@ -6128,6 +6356,20 @@ ggml_cgraph * llm_build_context::build_gemma4() {
                     Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, kv_head, n_kv,
                     hparams.f_attention_scale, cb, il, nullptr,
                     is_swa ? hparams.n_swa : 0);
+        } else {
+            // Shared KV layer: reuse KV cache from an earlier layer
+            // SWA layers reuse n_layer_kv_from_start - 2, full attention reuses n_layer_kv_from_start - 1
+            const int32_t kv_reuse_il = hparams.n_layer_kv_from_start - (is_swa ? 2 : 1);
+
+            ggml_build_forward_expand(gf, Qcur);
+
+            // Read K/V from the reuse source layer's cache and do attention
+            cur = llm_build_kqv(ctx0, lctx, kv_self, gf,
+                    model.layers[il].wo, NULL,
+                    Qcur, KQ_mask_l, n_tokens, n_kv,
+                    hparams.f_attention_scale, cb, kv_reuse_il, nullptr,
+                    is_swa ? hparams.n_swa : 0);
+            cb(cur, "kqv_out", il);
         }
 
         if (il == n_layer - 1) {
@@ -6261,6 +6503,33 @@ ggml_cgraph * llm_build_context::build_gemma4() {
         if (model.layers[il].out_scale) {
             cur = ggml_mul(ctx0, cur, model.layers[il].out_scale);
             cb(cur, "out_scaled", il);
+        }
+
+        // per-layer embedding
+        if (inp_per_layer && model.layers[il].per_layer_inp_gate) {
+            ggml_tensor * pe_in = cur;
+
+            cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].per_layer_inp_gate, cur); // [n_embd_per_layer, n_tokens]
+            cur = ggml_gelu(ctx0, cur);
+
+            // slice per-layer input for this layer: [n_embd_per_layer, n_tokens]
+            ggml_tensor * inp_this_layer = ggml_view_2d(ctx0, inp_per_layer,
+                    inp_per_layer->ne[0], inp_per_layer->ne[1],
+                    ggml_row_size(inp_per_layer->type, inp_per_layer->ne[0]),
+                    (int64_t)il * inp_per_layer->ne[0] * inp_per_layer->ne[1] * ggml_element_size(inp_per_layer));
+
+            if (il == n_layer - 1 && n_tokens != this->n_tokens) {
+                // last layer after inp_out_ids filtering - need to filter per-layer input too
+                inp_this_layer = ggml_get_rows(ctx0, inp_this_layer, lctx.inp_out_ids);
+            }
+
+            cur = ggml_mul(ctx0, cur, inp_this_layer);
+            cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].per_layer_proj, cur); // [n_embd, n_tokens]
+            cur = llm_build_norm(ctx0, cur, hparams, model.layers[il].per_layer_post_norm, NULL, LLM_NORM_RMS, cb, il);
+            cb(cur, "per_layer_embd_out", il);
+
+            // residual connection
+            cur = ggml_add(ctx0, pe_in, cur);
         }
 
         cur = lctx.cvec.apply_to(ctx0, cur, il);
@@ -9660,8 +9929,9 @@ ggml_cgraph* llm_build_context::build_minimaxm2() {
                 cb(Kcur, "Kcur_roped", il_id);
 
                 if (cparams.k_cache_hadamard) {
-                    Qcur = ggml_hadamard(ctx0, Qcur, hparams.n_embd_head_k);
-                    Kcur = ggml_hadamard(ctx0, Kcur, hparams.n_embd_head_k);
+                    const int64_t n_embd_head_k_il = hparams.n_embd_head_k_l(il);
+                    Qcur = ggml_hadamard(ctx0, Qcur, n_embd_head_k_il);
+                    Kcur = ggml_hadamard(ctx0, Kcur, n_embd_head_k_il);
                     cb(Qcur, "Qcur_hadamard", il_id);
                     cb(Kcur, "Kcur_hadamard", il_id);
                 }
@@ -10028,6 +10298,24 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             }
         }
 
+        // Ring experts: force MoE ops to GPU regardless of -ngl.
+        // Expert weights are GHOST (0-byte) on CPU — the CUDA ring buffer
+        // serves real data from mmap into VRAM on demand.  The CPU backend
+        // has no ring buffer and segfaults on GHOST tensors.
+        if (lctx.model.ring_experts && il >= 0 &&
+            (strcmp(name, "ffn_moe_up") == 0 ||
+             strcmp(name, "ffn_moe_gate") == 0 ||
+             strcmp(name, "ffn_moe_down") == 0 ||
+             strcmp(name, "ffn_moe_gate_par") == 0)) {
+            for (auto * backend : lctx.backends) {
+                if (!ggml_backend_is_cpu(backend) &&
+                    ggml_backend_supports_op(backend, cur)) {
+                    ggml_backend_sched_set_tensor_backend(lctx.sched, cur, backend);
+                    break;
+                }
+            }
+        }
+
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = lctx.model.n_gpu_layers > (int)lctx.model.hparams.n_layer;
@@ -10039,6 +10327,16 @@ ggml_cgraph * llm_build_context::llama_build_graph(
                         ggml_backend_sched_set_tensor_backend(lctx.sched, cur, backend);
                         break;
                     }
+                }
+            }
+        }
+
+        // DFlash: mark specific layer outputs as persistent so we can read them after eval
+        if (!lctx.dflash_capture_layers.empty() && il >= 0 && strcmp(name, "l_out") == 0) {
+            for (int32_t cap_il : lctx.dflash_capture_layers) {
+                if (cap_il == il) {
+                    ggml_set_output(cur);
+                    break;
                 }
             }
         }
@@ -10327,6 +10625,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_step35();
             } break;
+        case LLM_ARCH_DFLASH:
+            {
+                result = llm.build_dflash();
+            } break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -10474,8 +10776,9 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                     cb(Qcur, "Qcur_temp_scaled", il_cb);
                 }
                 if (cparams.k_cache_hadamard) {
-                    Qcur = ggml_hadamard(ctx0, Qcur, hparams.n_embd_head_k);
-                    Kcur = ggml_hadamard(ctx0, Kcur, hparams.n_embd_head_k);
+                    const int64_t n_embd_head_k_il = hparams.n_embd_head_k_l(il);
+                    Qcur = ggml_hadamard(ctx0, Qcur, n_embd_head_k_il);
+                    Kcur = ggml_hadamard(ctx0, Kcur, n_embd_head_k_il);
                     cb(Qcur, "Qcur_hadamard", il_cb);
                     cb(Kcur, "Kcur_hadamard", il_cb);
                 }
@@ -10483,7 +10786,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 ggml_build_forward_expand(gf, Kcur);
                 ggml_build_forward_expand(gf, Vcur);
 
-                const int64_t n_embd_head_k = hparams.n_embd_head_k;
+                const int64_t n_embd_head_k = hparams.n_embd_head_k_l(il);
                 const int64_t n_head_kv     = split_wk->ne[1] / n_embd_head_k;
 
                 GGML_ASSERT(kv_self.size == cparams.n_ctx);

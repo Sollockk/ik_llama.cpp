@@ -78,6 +78,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_STEP35,          "step35"       },
     { LLM_ARCH_GLM_DSA,         "glm-dsa"      },
     { LLM_ARCH_MISTRAL4,        "mistral4"     },
+    { LLM_ARCH_DFLASH,          "dflash"       },
     { LLM_ARCH_UNKNOWN,         "(unknown)"    },
 };
 
@@ -238,6 +239,11 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 
     { LLM_KV_ADAPTER_TYPE,                  "adapter.type"       },
     { LLM_KV_ADAPTER_LORA_ALPHA,            "adapter.lora.alpha" },
+
+    { LLM_KV_DFLASH_BLOCK_SIZE,             "%s.dflash.block_size"        },
+    { LLM_KV_DFLASH_TARGET_LAYER_IDS,       "%s.dflash.target_layer_ids"  },
+    { LLM_KV_DFLASH_MASK_TOKEN_ID,          "%s.dflash.mask_token_id"     },
+    { LLM_KV_DFLASH_NUM_TARGET_LAYERS,      "%s.dflash.num_target_layers" },
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char* suffix) : arch(arch), suffix(suffix) {}

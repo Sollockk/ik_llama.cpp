@@ -26,7 +26,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE
+    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,
+    COMMON_SPECULATIVE_TYPE_DFLASH
 };
 
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
@@ -38,7 +39,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH}
 };
 
 struct common_speculative_config {
@@ -496,6 +498,179 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     }
 };
 
+// ---------------------------------------------------------------------------
+// DFlash: block diffusion draft model for speculative decoding
+//
+// On each draft() call:
+// 1. Extract multi-layer hidden states from the target model context
+// 2. Concatenate them into the DFlash fc input format
+// 3. Build a block of [anchor, mask, mask, ...] tokens
+// 4. Run the DFlash draft model with the target hidden states injected
+// 5. Sample from the draft logits to produce draft tokens
+// ---------------------------------------------------------------------------
+struct common_speculative_state_dflash : public common_speculative_state {
+    llama_context * ctx_tgt;
+    llama_context * ctx_dft;
+
+    common_sampler * smpl;
+    llama_batch batch;
+
+    // DFlash model parameters
+    int block_size;
+    int mask_token_id;
+    std::vector<int32_t> target_layer_ids;
+    int n_embd_tgt;  // target model hidden dimension
+
+    // accumulated target hidden states for context
+    std::vector<float> target_hidden_buf;
+    int ctx_tokens_count = 0;  // how many context tokens we have
+
+    common_speculative_state_dflash(
+            enum common_speculative_type type,
+            llama_context * ctx_tgt,
+            llama_context * ctx_dft)
+        : common_speculative_state(type)
+        , ctx_tgt(ctx_tgt)
+        , ctx_dft(ctx_dft)
+    {
+        const auto * model_dft = llama_get_model(ctx_dft);
+
+        block_size    = llama_model_dflash_block_size(model_dft);
+        mask_token_id = llama_model_dflash_mask_token_id(model_dft);
+
+        const int n_tgt_layers = llama_model_dflash_n_target_layers(model_dft);
+        const int32_t * tgt_ids = llama_model_dflash_target_layer_ids(model_dft);
+        target_layer_ids.assign(tgt_ids, tgt_ids + n_tgt_layers);
+
+        const auto * model_tgt = llama_get_model(ctx_tgt);
+        n_embd_tgt = llama_model_n_embd(model_tgt);
+
+        batch = llama_batch_init(block_size, 0, 1);
+
+        // Set up the sampler for draft tokens
+        struct common_params_sampling params;
+        params.samplers_sequence = {
+            llama_sampler_type::DIST,
+        };
+        smpl = common_sampler_init(model_dft, params);
+
+        // Enable layer capture on the target model
+        llama_set_dflash_capture_layers(ctx_tgt, target_layer_ids.data(), (int32_t)target_layer_ids.size());
+    }
+
+    ~common_speculative_state_dflash() override {
+        common_sampler_free(smpl);
+        llama_batch_free(batch);
+        // Disable layer capture
+        llama_set_dflash_capture_layers(ctx_tgt, nullptr, 0);
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        // Reset accumulated context
+        target_hidden_buf.clear();
+        ctx_tokens_count = 0;
+        GGML_UNUSED(prompt);
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+
+        result.clear();
+        result.reserve(block_size - 1);
+
+        const int n_layers = (int)target_layer_ids.size();
+        const int n_embd = n_embd_tgt;
+
+        // --- Step 1: Extract hidden states from the target model ---
+        // The target model should have been decoded already (by the main pipeline).
+        // We read the captured layer outputs and concatenate them.
+        //
+        // For each token position, we need [n_embd * n_layers] floats.
+        // We extract hidden states for the LAST token (id_last's position).
+
+        // Get the number of tokens in the last target decode batch
+        const int n_batch_tokens = llama_get_dflash_captured_n_tokens(ctx_tgt);
+        if (n_batch_tokens <= 0) {
+            LOG_WRN("DFlash: no captured hidden states from target model\n");
+            return;
+        }
+
+        const int n_new = 1;  // extract last token's hidden states
+
+        // Read pre-captured layer outputs and concatenate
+        std::vector<float> new_hidden(n_new * n_embd * n_layers);
+        for (int li = 0; li < n_layers; li++) {
+            const float * layer_data = llama_get_dflash_layer_output(ctx_tgt, target_layer_ids[li]);
+            if (!layer_data) {
+                LOG_WRN("DFlash: could not read layer %d output from target model\n", target_layer_ids[li]);
+                return;
+            }
+            // layer_data is [n_embd * n_batch_tokens] - copy last token's hidden state
+            memcpy(new_hidden.data() + li * n_embd,
+                   layer_data + (n_batch_tokens - 1) * n_embd,
+                   n_embd * sizeof(float));
+        }
+
+        // Append to accumulated context
+        target_hidden_buf.insert(target_hidden_buf.end(), new_hidden.begin(), new_hidden.end());
+        ctx_tokens_count += n_new;
+
+        // --- Step 2: Build the block batch ---
+        // Block: [id_last (anchor), mask, mask, ..., mask]
+        common_batch_clear(batch);
+        common_batch_add(batch, id_last, 0, { 0 }, true);  // anchor at position 0
+        for (int i = 1; i < block_size; i++) {
+            common_batch_add(batch, mask_token_id, i, { 0 }, true);
+        }
+
+        // --- Step 3: Set target hidden states on draft context ---
+        llama_set_dflash_target_hidden(ctx_dft, target_hidden_buf.data(), ctx_tokens_count);
+
+        // --- Step 4: Decode the draft model ---
+        llama_kv_cache_clear(ctx_dft);  // no KV cache reuse for now
+        int ret = llama_decode(ctx_dft, batch);
+        if (ret != 0) {
+            LOG_ERR("DFlash: draft model decode failed with error %d\n", ret);
+            return;
+        }
+
+        // --- Step 5: Sample draft tokens from logits ---
+        // The draft model outputs logits for all block_size positions.
+        // We sample from positions 1..block_size-1 (skip the anchor).
+        common_sampler_reset(smpl);
+
+        for (int i = 1; i < block_size && (int)result.size() < params.n_max; i++) {
+            common_sampler_sample(smpl, ctx_dft, i, true);
+            const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+            const llama_token id = cur_p->data[0].id;
+            common_sampler_accept(smpl, nullptr, id, true);
+            result.push_back(id);
+
+            // Stop on low-confidence tokens
+            if (cur_p->data[0].p < params.p_min) {
+                break;
+            }
+        }
+
+        // --- Step 6: Batch route prediction + expert prefetch ---
+        // Now that we know the draft tokens, evaluate the MoE gate projection
+        // for each token at every MoE layer using token embeddings as proxy for
+        // hidden states.  This builds the full expert demand matrix and
+        // prefetches all predicted experts before the target model verifies.
+        if (!result.empty()) {
+            llama_batch_route_prefetch(ctx_tgt, result.data(), (int32_t)result.size());
+        }
+    }
+
+    void accept(uint16_t n_accepted) override {
+        GGML_UNUSED(n_accepted);
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_state_ngram_simple : public common_speculative_state {
     common_ngram_simple_config config;
@@ -821,6 +996,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
+        case COMMON_SPECULATIVE_TYPE_DFLASH:        return "dflash";
         default:                                    return "unknown";
     }
 }
@@ -932,6 +1108,17 @@ common_speculative * common_speculative_init(
         if (has_draft_eagle3) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_EAGLE3, params));
         }
+
+        // DFlash: detect if the draft model is a DFlash architecture
+        if (has_draft && params.model_dft) {
+            char desc[256];
+            llama_model_desc(params.model_dft, desc, sizeof(desc));
+            if (strstr(desc, "dflash") != nullptr) {
+                // Replace the draft config with DFlash
+                configs.clear();
+                configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DFLASH, params));
+            }
+        }
     }
 
     std::vector<std::unique_ptr<common_speculative_state>> impls = {};
@@ -993,6 +1180,11 @@ common_speculative * common_speculative_init(
                 auto state = create_state_ngram_cache(
                         params.lookup_cache_static, params.lookup_cache_dynamic, config);
                 impls.push_back(std::make_unique<common_speculative_state_ngram_cache>(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DFLASH: {
+                impls.push_back(std::make_unique<common_speculative_state_dflash>(
+                    config.type, ctx_tgt, ctx_dft));
                 break;
             }
             default:

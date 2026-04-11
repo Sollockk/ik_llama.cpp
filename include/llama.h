@@ -415,6 +415,9 @@ extern "C" {
         bool flash_attn;
         bool ring_experts;  // skip expert data loading, serve from mmap via VRAM ring buffer
         int32_t ring_experts_mb; // ring buffer size in MiB (default 4096)
+        bool pim_experts;   // CPU-side MoE on ring miss (RAM vec_dot instead of PCIe upload)
+        int32_t condense_experts;      // two-tier ring: N alive rows in VRAM, rest via CPU PIM (0=disabled)
+        const char * condense_index_path; // path to .cidx file (NULL = none)
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -2304,6 +2307,61 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API void llama_set_mtp_op_type(struct llama_context * ctx, enum llama_mtp_op_type mtp_op_type);
 
     LLAMA_API void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state);
+
+    // Routing predictor for expert prefetching (optional, disabled by default)
+    // Load predictor weights from a binary file. Returns 0 on success.
+    LLAMA_API int32_t llama_routing_predictor_load(struct llama_context * ctx, const char * path);
+
+    // Unload predictor and disable prefetching.
+    LLAMA_API void llama_routing_predictor_free(struct llama_context * ctx);
+
+    // Get prediction accuracy stats (for monitoring).
+    LLAMA_API void llama_routing_predictor_stats(struct llama_context * ctx,
+                                                  int64_t * n_predictions, int64_t * n_correct, int64_t * n_total);
+
+    // Enable training data collection: log (hidden_state, expert_ids) pairs to file.
+    // path = output file path. Set to NULL to disable.
+    LLAMA_API void llama_routing_collector_start(struct llama_context * ctx, const char * path);
+    LLAMA_API void llama_routing_collector_stop(struct llama_context * ctx);
+
+    // Batch route prediction: evaluate MoE gate projections for B draft tokens
+    // using token embeddings as proxy for hidden states.  Builds a full expert
+    // demand matrix and prefetches all predicted experts via pim_delta_cache.
+    // Call after DFlash draft to warm caches before target-model verification.
+    //
+    // llama_batch_route_init: one-time setup — dequantizes gate weights to CPU.
+    //   Returns number of MoE layers (0 if model has no MoE).
+    // llama_batch_route_prefetch: predict routing for draft_tokens and prefetch.
+    //   Returns total number of unique experts prefetched across all layers.
+    LLAMA_API int32_t llama_batch_route_init(struct llama_context * ctx);
+    LLAMA_API int32_t llama_batch_route_prefetch(
+            struct llama_context * ctx,
+            const llama_token  * draft_tokens,
+            int32_t              n_draft_tokens);
+
+    // DFlash model parameter accessors
+    LLAMA_API int32_t llama_model_dflash_block_size(const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_mask_token_id(const struct llama_model * model);
+    LLAMA_API int32_t llama_model_dflash_n_target_layers(const struct llama_model * model);
+    // Returns pointer to internal array of target layer IDs; n = llama_model_dflash_n_target_layers()
+    LLAMA_API const int32_t * llama_model_dflash_target_layer_ids(const struct llama_model * model);
+
+    // Set target model hidden states for DFlash speculative decoding
+    // data: pointer to concatenated hidden states [n_ctx_tokens * n_embd * n_target_layers] floats
+    // n_ctx_tokens: number of context tokens the hidden states correspond to
+    LLAMA_API void llama_set_dflash_target_hidden(struct llama_context * ctx, const float * data, int32_t n_ctx_tokens);
+
+    // Enable/disable DFlash multi-layer hidden state capture on the target model context
+    // layer_ids: array of layer indices to capture, n_layers: count (0 to disable)
+    LLAMA_API void llama_set_dflash_capture_layers(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers);
+
+    // After llama_decode() with capture enabled, read back a captured layer's hidden states
+    // layer_id: which layer to read (must be in the capture list)
+    // Returns pointer to float data [n_embd * n_tokens], or nullptr if not found
+    LLAMA_API const float * llama_get_dflash_layer_output(struct llama_context * ctx, int32_t layer_id);
+
+    // Get the number of tokens in the last captured DFlash batch
+    LLAMA_API int32_t llama_get_dflash_captured_n_tokens(struct llama_context * ctx);
 
 #ifdef __cplusplus
 }

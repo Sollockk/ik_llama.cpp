@@ -2713,10 +2713,12 @@ static bool llm_load_tensors(
 #endif
         else {
             int ntensor = 0;
+            int ntensor_real = 0;  // non-GHOST tensors
             for (auto t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
                 ++ntensor;
+                if (t->type != GGML_TYPE_GHOST) ntensor_real++;
             }
-            if (ntensor > 0) {
+            if (ntensor_real > 0) {
                 ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
                 if (buf == nullptr) {
                     LLAMA_LOG_ERROR("Failed to allocate buffer type %s\n", ggml_backend_buft_name(buft));
@@ -2951,6 +2953,11 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         ml.ring_experts = params.ring_experts;
         model.ring_experts = params.ring_experts;
         model.ring_experts_mb = params.ring_experts_mb;
+        model.pim_experts = params.pim_experts;
+        model.condense_experts = params.condense_experts;
+        if (params.condense_index_path) {
+            model.condense_index_path = params.condense_index_path;
+        }
 
         model.hparams.vocab_only = params.vocab_only;
 
@@ -3786,6 +3793,11 @@ static bool prepare_mtp_graph_inputs(struct llama_context & lctx) {
 //
 // The callback chains with the user's original cb_eval if one was set.
 // ---------------------------------------------------------------------------
+
+// Forward declarations — defined later in the file with the routing predictor implementation
+static void routing_predictor_predict(llama_context * lctx, int current_layer, const float * hidden_state, int n_tokens);
+static void routing_predictor_predict_from_experts(llama_context * lctx, int current_layer, const int32_t * expert_ids, int n_expert_used, int n_tokens);
+
 static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * lctx = (llama_context *) user_data;
 
@@ -3800,12 +3812,13 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
 
     static const char * ffn_inp_prefix = "ffn_inp-";
     static const size_t ffn_inp_prefix_len = 8;
-    const bool is_ffn_inp = (!is_topk && !is_probs && lctx->gate_probe_ctx
+    const bool needs_ffn_inp = lctx->gate_probe_ctx || lctx->routing_collector_enabled;
+    const bool is_ffn_inp = (!is_topk && !is_probs && needs_ffn_inp
                              && strncmp(t->name, ffn_inp_prefix, ffn_inp_prefix_len) == 0);
 
     if (ask) {
         if (is_ffn_inp) {
-            return true; // we want hidden state data for gate probe scoring
+            return true; // we want hidden state data for gate probe scoring / routing prediction
         }
         if (is_probs) {
             return true; // we want gate probability data for entropy scoring
@@ -3884,6 +3897,15 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                 // Note: ray march SDF is now computed in the ffn_moe_probs
                 // handler using entropy (fires reliably for all MoE layers)
                 // instead of probe scores (which require ffn_inp interception).
+
+                // Routing collector: stash hidden state for this layer
+                // (will be paired with expert IDs when ffn_moe_topk fires)
+                if (lctx->routing_collector_enabled) {
+                    // Save last token's hidden state only
+                    auto & stash = lctx->routing_collector_hidden[layer_idx];
+                    stash.resize(n_embd);
+                    memcpy(stash.data(), hidden.data() + (n_tokens - 1) * n_embd, n_embd * sizeof(float));
+                }
             }
         }
 
@@ -4046,6 +4068,30 @@ static bool llama_router_eval_callback(struct ggml_tensor * t, bool ask, void * 
                 }
                 token_experts.push_back(std::move(tok_ids));
             }
+        }
+
+        // Routing collector: record (layer_idx, expert_ids) for training data
+        // Note: hidden state was captured separately via ffn_inp callback
+        if (lctx->routing_collector_enabled && lctx->routing_collector_file) {
+            FILE * f = lctx->routing_collector_file;
+            auto it = lctx->routing_collector_hidden.find(layer_idx);
+            if (it != lctx->routing_collector_hidden.end() && !it->second.empty()) {
+                // Write: [int32 layer_idx][int32 n_expert_used]
+                //        [float[n_embd] hidden_state_last_token]
+                //        [int32[n_expert_used] expert_ids_last_token]
+                int32_t hdr[2] = { (int32_t)layer_idx, (int32_t)n_expert_used };
+                fwrite(hdr, sizeof(int32_t), 2, f);
+                fwrite(it->second.data(), sizeof(float), it->second.size(), f);
+                // Write last token's expert IDs
+                const int32_t * last_tok_ids = ids.data() + (n_tokens - 1) * n_expert_used;
+                fwrite(last_tok_ids, sizeof(int32_t), n_expert_used, f);
+            }
+        }
+
+        // Routing predictor: post real routing to background worker for lookahead prefetch
+        if (lctx->routing_predictor.enabled) {
+            routing_predictor_predict_from_experts(lctx, layer_idx, ids.data(),
+                                                    (int)n_expert_used, (int)n_tokens);
         }
 
         // record into heatmap
@@ -5125,7 +5171,8 @@ static int llama_decode_internal(
             // Both features use the same callback (llama_router_eval_callback)
             // which handles router recording AND JIT sharpening based on the
             // flags set on the context (router_recording, jit_sharpening).
-            if (lctx.router_recording || lctx.jit_sharpening || lctx.gate_probe_ctx) {
+            if (lctx.router_recording || lctx.jit_sharpening || lctx.gate_probe_ctx
+                || lctx.routing_predictor.enabled || lctx.routing_collector_enabled) {
                 ggml_backend_sched_set_eval_callback(lctx.sched, llama_router_eval_callback, &lctx);
             } else {
                 ggml_backend_sched_set_eval_callback(lctx.sched, lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
@@ -5193,6 +5240,24 @@ static int llama_decode_internal(
         if (cparams.mtp_op_type != MTP_OP_NONE) {
             if (!prepare_mtp_graph_inputs(lctx)) {
                 return GGML_STATUS_FAILED;
+            }
+        }
+
+        // DFlash: copy target hidden states and fill K position tensor
+        if (lctx.inp_dflash_target && lctx.dflash_target_hidden) {
+            ggml_backend_tensor_set(lctx.inp_dflash_target, lctx.dflash_target_hidden, 0,
+                                    ggml_nbytes(lctx.inp_dflash_target));
+
+            // Fill K positions: [0, 1, ..., ctx_len - 1, ctx_len, ..., ctx_len + n_tokens - 1]
+            if (lctx.inp_dflash_pos_k) {
+                const int ctx_len = lctx.dflash_ctx_len;
+                const int total = ctx_len + (int)u_batch.n_tokens;
+                std::vector<int32_t> pos_k(total);
+                for (int i = 0; i < total; i++) {
+                    pos_k[i] = i;
+                }
+                ggml_backend_tensor_set(lctx.inp_dflash_pos_k, pos_k.data(), 0,
+                                        total * sizeof(int32_t));
             }
         }
 
@@ -5355,6 +5420,33 @@ static int llama_decode_internal(
             printf("get_embedding(...): %d us\n", int(tim2-tim1));
 #endif
         }
+        // DFlash: capture marked layer outputs (GPU → CPU) while graph is still alive
+        if (!lctx.dflash_capture_layers.empty()) {
+            const int n_cap = (int)lctx.dflash_capture_layers.size();
+            const int n_embd_cap = lctx.model.hparams.n_embd;
+            const int n_tok = (int)n_tokens;
+
+            lctx.dflash_captured_data.resize(n_cap * n_embd_cap * n_tok);
+            lctx.dflash_captured_n_tokens = n_tok;
+
+            for (int li = 0; li < n_cap; li++) {
+                char name[GGML_MAX_NAME];
+                snprintf(name, sizeof(name), "l_out-%d", lctx.dflash_capture_layers[li]);
+                bool found = false;
+                for (int i = 0; i < gf->n_nodes; i++) {
+                    if (strcmp(gf->nodes[i]->name, name) == 0) {
+                        float * dst = lctx.dflash_captured_data.data() + li * n_embd_cap * n_tok;
+                        ggml_backend_tensor_get(gf->nodes[i], dst, 0, n_embd_cap * n_tok * sizeof(float));
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    LLAMA_LOG_WARN("DFlash capture: tensor %s not found in graph\n", name);
+                }
+            }
+        }
+
         n_outputs_prev += lctx.n_outputs;
         n_outputs_prev_embd += has_mtp ? n_tokens : lctx.n_outputs;
         cur_token += n_tokens;
@@ -6215,7 +6307,10 @@ struct llama_model_params llama_model_default_params() {
         /*.dry_run                     =*/ false,
         /*.flash_attn                  =*/ true,
         /*.ring_experts                =*/ false,
-        /*.ring_experts_mb             =*/ 4096,
+        /*.ring_experts_mb             =*/ 0,
+        /*.pim_experts                 =*/ false,
+        /*.condense_experts            =*/ 0,
+        /*.condense_index_path         =*/ nullptr,
     };
 
 #ifdef GGML_USE_METAL
@@ -7057,6 +7152,15 @@ struct llama_context * llama_init_from_model(
                     if (!ggml_backend_is_cpu(be)) {
                         ggml_backend_cuda_set_sharp_vram_budget(be, model->ring_experts_mb);
                         ggml_backend_cuda_enable_sharp_ring(be, true);
+                        if (model->pim_experts) {
+                            ggml_backend_cuda_enable_pim_experts(be, true);
+                        }
+                        if (model->condense_experts > 0) {
+                            ggml_backend_cuda_enable_condensed_experts(be, model->condense_experts);
+                            if (!model->condense_index_path.empty()) {
+                                ggml_backend_cuda_load_condense_index(be, model->condense_index_path.c_str());
+                            }
+                        }
                     }
                 }
 #endif
@@ -7261,6 +7365,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_SEED_OSS:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_DFLASH:
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
@@ -10685,5 +10790,614 @@ void llama_set_offload_policy(struct llama_context * lctx, int op, bool on_or_of
 
 void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state) {
     ctx->draft_input_hidden_state = hidden_state;
+}
+
+// ---------------------------------------------------------------------------
+// Routing predictor: predict expert routing N layers ahead for ring expert prefetch
+// ---------------------------------------------------------------------------
+static void routing_predictor_worker_fn(llama_context * lctx); // forward decl
+//
+// ---------------------------------------------------------------------------
+
+int32_t llama_routing_predictor_load(struct llama_context * ctx, const char * path) {
+    auto & rp = ctx->routing_predictor;
+
+    FILE * f = fopen(path, "rb");
+    if (!f) {
+        LLAMA_LOG_ERROR("%s: failed to open routing predictor file '%s'\n", __func__, path);
+        return -1;
+    }
+
+    // File format: [int32 n_lookahead][int32 n_expert][int32 n_input][int32 n_expert_used]
+    // Weights: for each lookahead offset: [n_input * n_expert floats] + [n_expert floats bias]
+    // n_input == n_expert for co-occurrence mode (the only mode we use now)
+    int32_t header[4];
+    if (fread(header, sizeof(int32_t), 4, f) != 4) {
+        LLAMA_LOG_ERROR("%s: failed to read header\n", __func__);
+        fclose(f);
+        return -1;
+    }
+
+    rp.n_lookahead   = header[0];
+    rp.n_expert      = header[1];
+    int n_input      = header[2];  // should == n_expert for co-occurrence
+    rp.n_expert_used = header[3];
+
+    LLAMA_LOG_INFO("%s: loading routing predictor: lookahead=%d, experts=%d, input=%d, top_k=%d\n",
+                   __func__, rp.n_lookahead, rp.n_expert, n_input, rp.n_expert_used);
+
+    if (n_input != rp.n_expert) {
+        LLAMA_LOG_WARN("%s: n_input (%d) != n_expert (%d), predictor may not work correctly\n",
+                       __func__, n_input, rp.n_expert);
+    }
+
+    rp.weights.resize(rp.n_lookahead);
+    rp.biases.resize(rp.n_lookahead);
+
+    for (int i = 0; i < rp.n_lookahead; i++) {
+        rp.weights[i].resize(n_input * rp.n_expert);
+        rp.biases[i].resize(rp.n_expert);
+
+        size_t w_read = fread(rp.weights[i].data(), sizeof(float), n_input * rp.n_expert, f);
+        size_t b_read = fread(rp.biases[i].data(), sizeof(float), rp.n_expert, f);
+
+        if ((int)w_read != n_input * rp.n_expert || (int)b_read != rp.n_expert) {
+            LLAMA_LOG_ERROR("%s: failed to read weights for lookahead offset %d\n", __func__, i);
+            rp.weights.clear();
+            rp.biases.clear();
+            fclose(f);
+            return -1;
+        }
+    }
+
+    fclose(f);
+
+    rp.enabled = true;
+    rp.n_prefetches.store(0);
+
+    rp.shutdown.store(false);
+
+    // Build tensor cache: map layer_idx -> pim_delta_cache pointers
+    // Do this once so predict() never touches tensors_by_name
+    {
+        int n_cached = 0;
+        for (auto & [tname, tensor] : ctx->model.tensors_by_name) {
+            if (!tensor || !tensor->ray_march_sharp_cache) continue;
+            if (tname.find("_exps") == std::string::npos) continue;
+
+            // Parse layer index from "blk.{N}.ffn_*_exps.weight"
+            if (tname.substr(0, 4) != "blk.") continue;
+            size_t dot2 = tname.find('.', 4);
+            if (dot2 == std::string::npos) continue;
+            int layer = std::stoi(tname.substr(4, dot2 - 4));
+
+            auto * cache = (struct pim_delta_cache *)tensor->ray_march_sharp_cache;
+            auto & lc = rp.cache_map[layer];
+            if (tname.find("ffn_gate_exps") != std::string::npos) { lc.gate = cache; n_cached++; }
+            else if (tname.find("ffn_up_exps")   != std::string::npos) { lc.up   = cache; n_cached++; }
+            else if (tname.find("ffn_down_exps") != std::string::npos) { lc.down = cache; n_cached++; }
+        }
+        LLAMA_LOG_INFO("%s: cached %d expert tensors across %d layers for prefetch\n",
+                       __func__, n_cached, (int)rp.cache_map.size());
+    }
+
+    // Start background worker thread
+    rp.worker = std::thread(routing_predictor_worker_fn, ctx);
+
+    LLAMA_LOG_INFO("%s: routing predictor loaded successfully (async worker started)\n", __func__);
+    return 0;
+}
+
+void llama_routing_predictor_free(struct llama_context * ctx) {
+    auto & rp = ctx->routing_predictor;
+    if (rp.worker.joinable()) {
+        rp.shutdown.store(true);
+        rp.cv.notify_one();
+        rp.worker.join();
+    }
+    rp.enabled = false;
+    rp.weights.clear();
+    rp.biases.clear();
+    rp.cache_map.clear();
+}
+
+void llama_routing_predictor_stats(struct llama_context * ctx,
+                                    int64_t * n_predictions, int64_t * n_correct, int64_t * n_total) {
+    auto & rp = ctx->routing_predictor;
+    if (n_predictions) *n_predictions = rp.n_prefetches.load();
+    if (n_correct)     *n_correct     = 0;  // not tracked in within-batch mode
+    if (n_total)       *n_total       = 0;
+}
+
+void llama_routing_collector_start(struct llama_context * ctx, const char * path) {
+    if (ctx->routing_collector_file) {
+        fclose(ctx->routing_collector_file);
+    }
+    ctx->routing_collector_file = fopen(path, "wb");
+    if (!ctx->routing_collector_file) {
+        LLAMA_LOG_ERROR("%s: failed to open collector file '%s'\n", __func__, path);
+        return;
+    }
+    ctx->routing_collector_enabled = true;
+
+    // Write header: [int32 n_embd][int32 n_expert][int32 n_expert_used]
+    int32_t header[3] = {
+        (int32_t)ctx->model.hparams.n_embd,
+        (int32_t)ctx->model.hparams.n_expert,
+        (int32_t)ctx->model.hparams.n_expert_used
+    };
+    fwrite(header, sizeof(int32_t), 3, ctx->routing_collector_file);
+    LLAMA_LOG_INFO("%s: collecting routing data to '%s'\n", __func__, path);
+}
+
+void llama_routing_collector_stop(struct llama_context * ctx) {
+    ctx->routing_collector_enabled = false;
+    if (ctx->routing_collector_file) {
+        fclose(ctx->routing_collector_file);
+        ctx->routing_collector_file = nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batch route prediction: evaluate MoE gate projections for B draft tokens
+// using token embeddings, then prefetch all predicted experts.
+// ---------------------------------------------------------------------------
+
+int32_t llama_batch_route_init(struct llama_context * ctx) {
+    auto & brc = ctx->batch_route;
+    if (brc.initialized) return brc.n_moe_layers;
+
+    const auto & model  = ctx->model;
+    const auto & hparams = model.hparams;
+
+    brc.n_expert      = (int)hparams.n_expert;
+    brc.n_expert_used = (int)hparams.n_expert_used;
+    brc.n_embd        = (int)hparams.n_embd;
+
+    if (brc.n_expert == 0) {
+        brc.initialized = true;
+        return 0;
+    }
+
+    const int n_layer = (int)hparams.n_layer;
+
+    for (int il = 0; il < n_layer; il++) {
+        const auto & layer = model.layers[il];
+        if (!layer.ffn_gate_inp) continue;
+
+        const struct ggml_tensor * gate = layer.ffn_gate_inp;
+
+        // gate shape in ggml: ne[0] = n_embd, ne[1] = n_expert
+        // Validate dimensions
+        if ((int)gate->ne[0] != brc.n_embd || (int)gate->ne[1] != brc.n_expert) {
+            LLAMA_LOG_WARN("%s: layer %d gate_inp shape [%d,%d] != expected [%d,%d], skipping\n",
+                           __func__, il, (int)gate->ne[0], (int)gate->ne[1],
+                           brc.n_embd, brc.n_expert);
+            continue;
+        }
+
+        // Dequantize gate weights to float on CPU
+        // Layout: n_expert rows of n_embd floats (row-major, expert e at offset e*n_embd)
+        const size_t n_elem = (size_t)brc.n_embd * brc.n_expert;
+        std::vector<float> gate_f32(n_elem);
+
+        // Copy quantized data from backend to CPU
+        const size_t nbytes = ggml_nbytes(gate);
+        std::vector<uint8_t> quant_buf(nbytes);
+        ggml_backend_tensor_get(gate, quant_buf.data(), 0, nbytes);
+
+        // Dequantize each row (expert)
+        const ggml_type_traits_t traits = ggml_internal_get_type_traits(gate->type);
+        const size_t row_quant_bytes = ggml_row_size(gate->type, brc.n_embd);
+
+        for (int e = 0; e < brc.n_expert; e++) {
+            const void * src = quant_buf.data() + e * row_quant_bytes;
+            float * dst = gate_f32.data() + e * brc.n_embd;
+            if (gate->type == GGML_TYPE_F32) {
+                memcpy(dst, src, brc.n_embd * sizeof(float));
+            } else if (gate->type == GGML_TYPE_F16) {
+                for (int d = 0; d < brc.n_embd; d++) {
+                    dst[d] = ggml_fp16_to_fp32(((const ggml_fp16_t *)src)[d]);
+                }
+            } else if (traits.to_float) {
+                traits.to_float(src, dst, brc.n_embd);
+            } else {
+                LLAMA_LOG_WARN("%s: layer %d gate_inp type %s has no to_float, skipping\n",
+                               __func__, il, ggml_type_name(gate->type));
+                gate_f32.clear();
+                break;
+            }
+        }
+
+        if (gate_f32.empty()) continue;
+
+        brc.moe_layer_indices.push_back(il);
+        brc.gate_weights.push_back(std::move(gate_f32));
+    }
+
+    brc.n_moe_layers = (int)brc.moe_layer_indices.size();
+    brc.initialized = true;
+
+    // Ensure routing_predictor.cache_map is populated even if the routing
+    // predictor model was not loaded — we need it for prefetching.
+    auto & rp = ctx->routing_predictor;
+    if (rp.cache_map.empty() && brc.n_moe_layers > 0) {
+        int n_cached = 0;
+        for (auto & [tname, tensor] : ctx->model.tensors_by_name) {
+            if (!tensor || !tensor->ray_march_sharp_cache) continue;
+            if (tname.find("_exps") == std::string::npos) continue;
+            if (tname.substr(0, 4) != "blk.") continue;
+            size_t dot2 = tname.find('.', 4);
+            if (dot2 == std::string::npos) continue;
+            int layer = std::stoi(tname.substr(4, dot2 - 4));
+
+            auto * cache = (struct pim_delta_cache *)tensor->ray_march_sharp_cache;
+            auto & lc = rp.cache_map[layer];
+            if      (tname.find("ffn_gate_exps") != std::string::npos) { lc.gate = cache; n_cached++; }
+            else if (tname.find("ffn_up_exps")   != std::string::npos) { lc.up   = cache; n_cached++; }
+            else if (tname.find("ffn_down_exps") != std::string::npos) { lc.down = cache; n_cached++; }
+        }
+        if (n_cached > 0) {
+            LLAMA_LOG_INFO("%s: populated cache_map with %d expert tensors across %d layers\n",
+                           __func__, n_cached, (int)rp.cache_map.size());
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: cached %d MoE gate projections (%d x %d) as F32 for batch routing\n",
+                   __func__, brc.n_moe_layers, brc.n_embd, brc.n_expert);
+
+    return brc.n_moe_layers;
+}
+
+int32_t llama_batch_route_prefetch(
+        struct llama_context * ctx,
+        const llama_token  * draft_tokens,
+        int32_t              n_draft_tokens) {
+
+    auto & brc = ctx->batch_route;
+    if (!brc.initialized) {
+        llama_batch_route_init(ctx);
+    }
+    if (brc.n_moe_layers == 0 || n_draft_tokens <= 0) return 0;
+
+    const auto & model = ctx->model;
+    auto & rp = ctx->routing_predictor;
+
+    const int n_embd  = brc.n_embd;
+    const int n_exp   = brc.n_expert;
+    const int n_used  = brc.n_expert_used;
+
+    // --- Step 1: Dequantize embeddings for the B draft tokens ---
+    const struct ggml_tensor * tok_embd = model.tok_embd;
+    const size_t emb_row_bytes = ggml_row_size(tok_embd->type, n_embd);
+
+    const ggml_type_traits_t emb_traits = ggml_internal_get_type_traits(tok_embd->type);
+
+    std::vector<float> embeddings(n_draft_tokens * n_embd);
+    std::vector<uint8_t> emb_quant_row(emb_row_bytes);
+
+    for (int t = 0; t < n_draft_tokens; t++) {
+        const llama_token tok = draft_tokens[t];
+
+        // Bounds check
+        if (tok < 0 || tok >= (int)tok_embd->ne[1]) continue;
+
+        ggml_backend_tensor_get(tok_embd, emb_quant_row.data(),
+                                (size_t)tok * emb_row_bytes, emb_row_bytes);
+
+        float * dst = embeddings.data() + t * n_embd;
+        if (tok_embd->type == GGML_TYPE_F32) {
+            memcpy(dst, emb_quant_row.data(), n_embd * sizeof(float));
+        } else if (tok_embd->type == GGML_TYPE_F16) {
+            const ggml_fp16_t * src16 = (const ggml_fp16_t *)emb_quant_row.data();
+            for (int d = 0; d < n_embd; d++) {
+                dst[d] = ggml_fp16_to_fp32(src16[d]);
+            }
+        } else if (emb_traits.to_float) {
+            emb_traits.to_float(emb_quant_row.data(), dst, n_embd);
+        }
+    }
+
+    // --- Step 2: For each MoE layer, compute logits and find top-K per token ---
+    //     Also build a linearized Belady demand matrix (bitmask per step).
+    int total_prefetched = 0;
+
+    // Scratch buffers (reused across layers)
+    std::vector<float>   logits(n_exp);
+    std::vector<int32_t> topk(n_used);
+
+    // Demand matrix: [n_moe_layers] per-layer bitmasks (union across draft tokens).
+    // Each entry is 4 x uint64 = 256-bit expert mask.
+    std::vector<uint64_t> demand_matrix(brc.n_moe_layers * 4, 0);
+
+    for (int ml = 0; ml < brc.n_moe_layers; ml++) {
+        const int   layer_idx = brc.moe_layer_indices[ml];
+        const float * gate    = brc.gate_weights[ml].data();
+
+        // Collect union of top-K experts across all B draft tokens
+        // Use a flat bool array — faster than std::set for small n_expert
+        std::vector<bool> expert_needed(n_exp, false);
+
+        for (int t = 0; t < n_draft_tokens; t++) {
+            const float * emb = embeddings.data() + t * n_embd;
+
+            // Compute logit[e] = dot(emb, gate_row[e]) for each expert
+            for (int e = 0; e < n_exp; e++) {
+                const float * gw = gate + e * n_embd;
+                float sum = 0.0f;
+                for (int d = 0; d < n_embd; d++) {
+                    sum += emb[d] * gw[d];
+                }
+                logits[e] = sum;
+            }
+
+            // Top-K selection
+            for (int k = 0; k < n_used; k++) {
+                int   best     = 0;
+                float best_val = logits[0];
+                for (int e = 1; e < n_exp; e++) {
+                    if (logits[e] > best_val) {
+                        best_val = logits[e];
+                        best     = e;
+                    }
+                }
+                topk[k] = best;
+                expert_needed[best] = true;
+                logits[best] = -1e30f;  // mask out for next K
+            }
+        }
+
+        // Build demand bitmask for this layer (union across all draft tokens)
+        uint64_t * mask = demand_matrix.data() + ml * 4;
+        for (int e = 0; e < n_exp; e++) {
+            if (expert_needed[e]) {
+                mask[e >> 6] |= (uint64_t)1 << (e & 63);
+            }
+        }
+
+        // --- Step 3: Prefetch all needed experts for this layer ---
+        // Collect into contiguous array for pim_delta_cache_prefetch
+        std::vector<int32_t> experts_to_prefetch;
+        experts_to_prefetch.reserve(n_exp);
+        for (int e = 0; e < n_exp; e++) {
+            if (expert_needed[e]) {
+                experts_to_prefetch.push_back(e);
+            }
+        }
+
+        if (!experts_to_prefetch.empty()) {
+            auto it = rp.cache_map.find(layer_idx);
+            if (it != rp.cache_map.end()) {
+                auto & lc = it->second;
+                const int n_pf = (int)experts_to_prefetch.size();
+                if (lc.gate) pim_delta_cache_prefetch(lc.gate, experts_to_prefetch.data(), n_pf);
+                if (lc.up)   pim_delta_cache_prefetch(lc.up,   experts_to_prefetch.data(), n_pf);
+                if (lc.down) pim_delta_cache_prefetch(lc.down, experts_to_prefetch.data(), n_pf);
+                total_prefetched += n_pf;
+            }
+        }
+    }
+
+    // --- Step 4: Set Belady demand matrix on CUDA backends ---
+#ifdef GGML_USE_CUDA
+    if (brc.n_moe_layers > 0) {
+        for (auto * be : ctx->backends) {
+            if (!ggml_backend_is_cpu(be)) {
+                ggml_backend_cuda_set_expert_demand(
+                    be,
+                    (const uint64_t (*)[4])demand_matrix.data(),
+                    brc.n_moe_layers);
+            }
+        }
+        LLAMA_LOG_DEBUG("%s: set Belady demand matrix (%d layers) on CUDA backends\n",
+                        __func__, brc.n_moe_layers);
+    }
+#endif
+
+    LLAMA_LOG_DEBUG("%s: prefetched %d experts across %d layers for %d draft tokens\n",
+                    __func__, total_prefetched, brc.n_moe_layers, n_draft_tokens);
+
+    return total_prefetched;
+}
+
+// Background worker: processes prediction + prefetch work items off the main thread.
+// This ensures the eval callback returns instantly and never stalls the GPU.
+static void routing_predictor_worker_fn(llama_context * lctx) {
+    auto & rp = lctx->routing_predictor;
+
+    // Thread-local buffers
+    std::vector<float>   input_buf(rp.n_expert, 0.0f);
+    std::vector<float>   logits_buf(rp.n_expert);
+    std::vector<int32_t> topk_buf(rp.n_expert_used);
+
+    while (true) {
+        llama_context::routing_predictor_state::work_item item;
+        {
+            std::unique_lock<std::mutex> lock(rp.mtx);
+            rp.cv.wait(lock, [&]{ return rp.shutdown.load() || !rp.work_queue.empty(); });
+            if (rp.shutdown.load() && rp.work_queue.empty()) return;
+            item = rp.work_queue.front();
+            rp.work_queue.pop();
+        }
+
+        // Build multi-hot input from ALL tokens' expert IDs (batch union)
+        // This is the key advantage of within-batch prediction:
+        // with N tokens × 8 experts, we get a rich activation pattern
+        float * input = input_buf.data();
+        memset(input, 0, rp.n_expert * sizeof(float));
+        for (int k = 0; k < item.n_ids; k++) {
+            int eid = item.expert_ids[k];
+            if (eid >= 0 && eid < rp.n_expert) {
+                input[eid] += 1.0f;  // count frequency, not just presence
+            }
+        }
+
+        // Normalize by number of tokens so the weights learned from single-token
+        // co-occurrence still work (the frequency signal is a bonus)
+        int n_tokens = item.n_ids / std::max(rp.n_expert_used, 1);
+        if (n_tokens > 1) {
+            float inv = 1.0f / (float)n_tokens;
+            for (int e = 0; e < rp.n_expert; e++) {
+                input[e] *= inv;
+            }
+        }
+
+        // For each lookahead offset: compute logits, find top-k, prefetch
+        for (int offset = 0; offset < rp.n_lookahead; offset++) {
+            int target_layer = item.layer + offset + 1;
+
+            const float * w = rp.weights[offset].data();
+            const float * b = rp.biases[offset].data();
+            float * logits = logits_buf.data();
+
+            for (int e = 0; e < rp.n_expert; e++) {
+                float sum = b[e];
+                const float * we = w + e;
+                for (int d = 0; d < rp.n_expert; d++) {
+                    sum += input[d] * we[d * rp.n_expert];
+                }
+                logits[e] = sum;
+            }
+
+            for (int k = 0; k < rp.n_expert_used; k++) {
+                int best = 0;
+                float best_val = logits[0];
+                for (int e = 1; e < rp.n_expert; e++) {
+                    if (logits[e] > best_val) {
+                        best_val = logits[e];
+                        best = e;
+                    }
+                }
+                topk_buf[k] = best;
+                logits[best] = -1e30f;
+            }
+
+            // Prefetch using pre-cached tensor pointers
+            auto it = rp.cache_map.find(target_layer);
+            if (it != rp.cache_map.end()) {
+                auto & lc = it->second;
+                if (lc.gate) pim_delta_cache_prefetch(lc.gate, topk_buf.data(), rp.n_expert_used);
+                if (lc.up)   pim_delta_cache_prefetch(lc.up,   topk_buf.data(), rp.n_expert_used);
+                if (lc.down) pim_delta_cache_prefetch(lc.down, topk_buf.data(), rp.n_expert_used);
+            }
+
+            rp.n_prefetches++;
+        }
+    }
+}
+
+// No-op: hidden state prediction disabled in favor of within-batch routing
+static void routing_predictor_predict(
+        llama_context * lctx,
+        int             current_layer,
+        const float   * hidden_state,
+        int             n_tokens) {
+    (void)lctx; (void)current_layer; (void)hidden_state; (void)n_tokens;
+}
+
+// Post REAL routing data from ffn_moe_topk to background worker.
+// Called from eval callback with ALL tokens' expert IDs for this layer.
+// Returns instantly — worker does prediction + prefetch in parallel with GPU.
+static void routing_predictor_predict_from_experts(
+        llama_context * lctx,
+        int             current_layer,
+        const int32_t * expert_ids,     // [n_expert_used * n_tokens]
+        int             n_expert_used,
+        int             n_tokens) {
+
+    auto & rp = lctx->routing_predictor;
+    if (!rp.enabled) return;
+
+    // Build work item with ALL tokens' expert IDs (not just last token)
+    llama_context::routing_predictor_state::work_item item;
+    item.layer = current_layer;
+    item.n_ids = std::min(n_expert_used * n_tokens, 512);
+    memcpy(item.expert_ids, expert_ids, item.n_ids * sizeof(int32_t));
+
+    // Post to worker — non-blocking
+    {
+        std::lock_guard<std::mutex> lock(rp.mtx);
+        rp.work_queue.push(item);
+    }
+    rp.cv.notify_one();
+}
+
+// Collect training data: write (layer_idx, hidden_state, expert_ids) to file
+static void routing_collector_record(
+        llama_context * lctx,
+        int             layer_idx,
+        const float   * hidden_state,
+        int             n_tokens,
+        const int32_t * expert_ids,
+        int             n_expert_used) {
+
+    if (!lctx->routing_collector_enabled || !lctx->routing_collector_file) return;
+
+    FILE * f = lctx->routing_collector_file;
+    const int n_embd = (int)lctx->model.hparams.n_embd;
+
+    // Write record: [int32 layer_idx][int32 n_tokens][float[n_embd] hidden_state_last_token]
+    //               [int32[n_expert_used] expert_ids_last_token]
+    int32_t header[2] = { layer_idx, n_tokens };
+    fwrite(header, sizeof(int32_t), 2, f);
+
+    // Write last token's hidden state
+    fwrite(hidden_state + (n_tokens - 1) * n_embd, sizeof(float), n_embd, f);
+
+    // Write last token's expert IDs
+    const int32_t * last_tok_ids = expert_ids + (n_tokens - 1) * n_expert_used;
+    fwrite(last_tok_ids, sizeof(int32_t), n_expert_used, f);
+}
+
+int32_t llama_model_dflash_block_size(const struct llama_model * model) {
+    return model->hparams.dflash_block_size;
+}
+
+int32_t llama_model_dflash_mask_token_id(const struct llama_model * model) {
+    return model->hparams.dflash_mask_token_id;
+}
+
+int32_t llama_model_dflash_n_target_layers(const struct llama_model * model) {
+    return (int32_t)model->hparams.dflash_n_target_layer_ids;
+}
+
+const int32_t * llama_model_dflash_target_layer_ids(const struct llama_model * model) {
+    if (model->hparams.dflash_n_target_layer_ids == 0) return nullptr;
+    return model->hparams.dflash_target_layer_ids.data();
+}
+
+void llama_set_dflash_target_hidden(struct llama_context * ctx, const float * data, int32_t n_ctx_tokens) {
+    ctx->dflash_target_hidden = data;
+    ctx->dflash_ctx_len       = n_ctx_tokens;
+}
+
+void llama_set_dflash_capture_layers(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers) {
+    ctx->dflash_capture_layers.clear();
+    ctx->dflash_captured_data.clear();
+    ctx->dflash_captured_n_tokens = 0;
+    for (int32_t i = 0; i < n_layers; i++) {
+        ctx->dflash_capture_layers.push_back(layer_ids[i]);
+    }
+}
+
+const float * llama_get_dflash_layer_output(struct llama_context * ctx, int32_t layer_id) {
+    // Returns a pointer into the pre-captured CPU buffer for the given layer.
+    // The buffer is populated during llama_decode when dflash_capture_layers is non-empty.
+    // Layout: [n_captured_layers][n_embd * n_tokens], pointer to the layer's slice.
+    if (ctx->dflash_captured_data.empty() || ctx->dflash_captured_n_tokens <= 0) {
+        return nullptr;
+    }
+    const int n_embd = ctx->model.hparams.n_embd;
+    const int n_tok  = ctx->dflash_captured_n_tokens;
+    for (int i = 0; i < (int)ctx->dflash_capture_layers.size(); i++) {
+        if (ctx->dflash_capture_layers[i] == layer_id) {
+            return ctx->dflash_captured_data.data() + i * n_embd * n_tok;
+        }
+    }
+    return nullptr;
+}
+
+int32_t llama_get_dflash_captured_n_tokens(struct llama_context * ctx) {
+    return ctx->dflash_captured_n_tokens;
 }
 

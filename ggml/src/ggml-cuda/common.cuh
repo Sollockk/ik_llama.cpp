@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -914,6 +915,34 @@ struct ggml_backend_cuda_context {
         int64_t     pending_ne01 = 0;
     } delta_pipe;
 
+    // PIM full expert: CPU-side MoE computation from RAM-resident weights.
+    // On ring cache miss, instead of uploading expert to VRAM (7ms PCIe),
+    // send hidden state to CPU (0.002ms), CPU does vec_dot from RAM (~2ms),
+    // send result back (0.002ms). 3000x PCIe reduction on misses.
+    struct {
+        bool enabled = false;
+
+        // Pinned host buffers for D2H hidden state transfer
+        float *   host_src1 = nullptr;    // pinned: D2H target for hidden state
+        size_t    src1_cap  = 0;          // capacity in bytes
+
+        // Pinned + device-mapped host buffer for CPU→GPU result transfer
+        float *   host_dst  = nullptr;    // pinned: CPU writes results here
+        float *   dev_dst   = nullptr;    // device-mapped pointer (zero-copy read)
+        size_t    dst_cap   = 0;          // capacity in bytes
+
+        // Quantized input buffer (CPU-side, for vec_dot)
+        uint8_t * host_dinput = nullptr;  // Q8_0 quantized hidden state
+        size_t    dinput_cap  = 0;        // capacity in bytes
+
+        // CUDA event for D2H synchronization
+        cudaEvent_t src1_ready = nullptr; // signals D2H copy complete
+
+        // Stats
+        int n_pim_calls = 0;
+        int n_pim_experts = 0;
+    } pim_expert_pipe;
+
     // Delta ring buffer: VRAM LRU cache for delta slices (expert-aware).
     // For dense models: one slice = full tensor. For MoE: one slice = one expert.
     // Exploits temporal locality: MoE expert routing repeats ~80% between tokens.
@@ -963,10 +992,11 @@ struct ggml_backend_cuda_context {
         bool   fill_pending = false;
     } delta_ring;
 
-    // Sharp expert ring buffer: VRAM LRU cache for sharp (full-quality) expert
-    // slices.  Same mechanism as delta_ring but dispatches MMVQ with
-    // accumulate=false (replaces blurry base result instead of adding correction).
+    // Sharp expert ring buffer: VRAM cache for sharp (full-quality) expert
+    // slices.  Uses Belady-optimal eviction when expert demand matrix is
+    // available (from batch routing), falls back to LRU otherwise.
     // Wired via ray_march_sharp_cache on expert tensors.
+    static constexpr int SHARP_RING_MAX_DEMAND = 512; // max linearized demand steps (layers * tokens)
     struct {
         void * vram = nullptr;
         size_t vram_size = 0;
@@ -976,6 +1006,7 @@ struct ggml_backend_cuda_context {
             size_t offset;
             size_t bytes;
             int64_t last_used;
+            int     expert_id;    // for Belady lookup
         };
         std::unordered_map<uint64_t, slice_info> slice_map;
 
@@ -983,14 +1014,71 @@ struct ggml_backend_cuda_context {
         int    n_hits = 0;
         int    n_misses = 0;
         int    n_evictions = 0;
+        int    n_belady_evictions = 0;
         cudaEvent_t upload_done = nullptr;
         bool   upload_pending = false;
+
+        // Belady demand matrix: per-layer bitmask of needed experts.
+        // Set by llama_batch_route_prefetch via ggml_backend_cuda_set_expert_demand.
+        // demand[i] = bitmask of experts needed at linearized step i.
+        // Steps are ordered: [tok0_layer0, tok0_layer1, ..., tok1_layer0, ...]
+        uint64_t demand[SHARP_RING_MAX_DEMAND][4]; // expert_mask_t = 4 x uint64
+        int    n_demand_steps = 0;                  // how many steps in demand[]
+        int    demand_cursor  = 0;                  // current position (advances per MoE layer)
 
         static uint64_t key(const void * tensor, int expert_id) {
             uint64_t h = (uint64_t)(uintptr_t)tensor;
             h ^= (uint64_t)expert_id * 0x9E3779B97F4A7C15ULL;
             return h;
         }
+
+        // Test if expert is needed at a given demand step
+        bool demand_test(int step, int expert_id) const {
+            if (step < 0 || step >= n_demand_steps) return false;
+            return (demand[step][expert_id >> 6] >> (expert_id & 63)) & 1;
+        }
+
+        // Find next demand step where expert_id is needed, starting from `from`.
+        // Returns n_demand_steps if not needed again (= best eviction candidate).
+        int demand_next_use(int expert_id, int from) const {
+            for (int s = from; s < n_demand_steps; s++) {
+                if (demand_test(s, expert_id)) return s;
+            }
+            return n_demand_steps;
+        }
+
+        // Belady eviction: find the cached expert whose next use is furthest away.
+        // Returns expert_id to evict, or -1 if no candidates.
+        int belady_victim(int current_step, size_t min_bytes) const {
+            int best_expert = -1;
+            int best_next_use = -1;
+            for (const auto & [k, v] : slice_map) {
+                if (v.bytes < min_bytes) continue;
+                int nu = demand_next_use(v.expert_id, current_step);
+                if (nu > best_next_use) {
+                    best_next_use = nu;
+                    best_expert = v.expert_id;
+                }
+            }
+            return best_expert;
+        }
+        // Condensed expert mode: store only important rows per expert.
+        // Ring slices are n_alive * row_stride instead of ne01 * row_stride.
+        bool condensed_mode = false;
+        int  n_alive = 0;                    // alive rows per expert (from --condense-experts)
+
+        // GPU scratch buffer for MMVQ output before scatter (n_alive floats)
+        float * scatter_scratch = nullptr;
+
+        // Per-expert alive index arrays in VRAM (tiny: n_alive * sizeof(uint16_t))
+        std::unordered_map<uint64_t, uint16_t *> alive_idx_gpu;
+
+        // Staging buffer for row extraction during condensed upload (pinned host)
+        char * condensed_staging = nullptr;
+        size_t condensed_staging_cap = 0;
+
+        // Loaded condense index map (.cidx) — owned, freed on context destroy
+        struct condense_index_map * cidx_map = nullptr;
     } sharp_ring;
 
     bool    sharp_ready = false;

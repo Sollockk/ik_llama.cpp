@@ -130,6 +130,13 @@ struct llama_hparams {
 	// qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
 
+    // dflash
+    uint32_t dflash_block_size       = 16;
+    uint32_t dflash_mask_token_id    = 0;
+    uint32_t dflash_num_target_layers = 0;    // number of layers in the target model (for computing target_layer_ids)
+    uint32_t dflash_n_target_layer_ids = 0;   // how many entries in dflash_target_layer_ids are valid
+    std::array<int32_t, LLAMA_MAX_LAYERS> dflash_target_layer_ids = {}; // which target layers to sample hidden states from
+
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggerganov/llama.cpp/pull/8141
     llama_token dec_start_token_id = -1;

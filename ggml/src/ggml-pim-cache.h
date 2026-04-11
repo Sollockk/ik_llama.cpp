@@ -71,6 +71,45 @@ void pim_delta_cache_prefetch(struct pim_delta_cache * cache,
 // Returns NULL if no heap buffer (mmap fallback mode).
 char * pim_delta_cache_get_heap_buf(struct pim_delta_cache * cache, size_t * out_total_bytes);
 
+// Condensed expert index: identifies important rows per expert for two-tier serving.
+// GPU computes alive rows (in VRAM ring), CPU computes dead rows (from RAM) in parallel.
+struct condense_index {
+    uint16_t * alive_idx;     // [n_alive] original row indices (sorted)
+    uint16_t * dead_idx;      // [n_dead] complement row indices (sorted)
+    int        n_alive;       // number of important rows (e.g., 89)
+    int        n_dead;        // number of remaining rows (e.g., 4007)
+    int        n_rows_total;  // n_alive + n_dead
+};
+
+// Create a condense_index from an array of alive row indices.
+// Computes dead_idx as the complement. Caller owns the returned pointer.
+struct condense_index * condense_index_create(
+    const uint16_t * alive_indices, int n_alive, int n_rows_total);
+
+// Free a condense_index and its buffers.
+void condense_index_free(struct condense_index * idx);
+
+// Collection of condense indices loaded from a .cidx file.
+// Keyed by tensor_name + expert_id for O(1) lookup at inference time.
+struct condense_index_map {
+    // Opaque — use the functions below. Internally a flat array indexed by
+    // a hash of (tensor_name, expert_id). Implemented in C++ when compiled as C++.
+    void * _impl;
+};
+
+// Load a .cidx file produced by condense_experts.py.
+// Returns NULL on failure. Caller must free with condense_index_map_free.
+struct condense_index_map * condense_index_map_load(const char * cidx_path);
+
+// Look up the condense_index for a given tensor + expert.
+// Returns NULL if not found.
+const struct condense_index * condense_index_map_get(
+    const struct condense_index_map * map,
+    const char * tensor_name, int expert_id);
+
+// Free all indices and the map itself.
+void condense_index_map_free(struct condense_index_map * map);
+
 #ifdef __cplusplus
 }
 #endif

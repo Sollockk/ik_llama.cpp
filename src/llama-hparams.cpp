@@ -1344,6 +1344,34 @@ void llm_load_hparams(
                     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, hparams.n_embd_head_v);
                 }
             } break;
+        case LLM_ARCH_DFLASH:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,          hparams.dflash_block_size, false);
+                ml.get_key(LLM_KV_DFLASH_MASK_TOKEN_ID,       hparams.dflash_mask_token_id, false);
+                ml.get_key(LLM_KV_DFLASH_NUM_TARGET_LAYERS,   hparams.dflash_num_target_layers, false);
+
+                // non-causal attention for block diffusion
+                hparams.causal_attn = false;
+
+                // compute target layer ids from num_target_layers and n_draft_layers
+                // (uniformly sampled, matching DFlash's build_target_layer_ids)
+                if (hparams.dflash_num_target_layers > 0) {
+                    const int n_draft = hparams.n_layer;
+                    const int num_tgt = hparams.dflash_num_target_layers;
+                    hparams.dflash_n_target_layer_ids = n_draft;
+                    if (n_draft == 1) {
+                        hparams.dflash_target_layer_ids[0] = num_tgt / 2;
+                    } else {
+                        int start = 1;
+                        int end = num_tgt - 3;
+                        int span = end - start;
+                        for (int i = 0; i < n_draft; i++) {
+                            hparams.dflash_target_layer_ids[i] = (int)round(start + ((double)i * span) / (n_draft - 1));
+                        }
+                    }
+                }
+            } break;
         default: (void)0;
     }
 

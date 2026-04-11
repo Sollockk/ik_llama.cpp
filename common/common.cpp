@@ -2516,6 +2516,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "--ring-experts") {
         params.ring_experts = true;
+        params.ring_experts_mb = 4096;  // default when flag is used
         if (i + 1 < argc) {
             try {
                 int mb = std::stoi(argv[i + 1]);
@@ -2527,6 +2528,53 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
                 // Not a number — use default, don't consume argv
             }
         }
+        return true;
+    }
+    if (arg == "--pim-experts") {
+        params.pim_experts = true;
+        // Auto-enable ring experts if not already set (PIM handles misses)
+        if (!params.ring_experts) {
+            params.ring_experts = true;
+            params.ring_experts_mb = 4096;
+        }
+        return true;
+    }
+    if (arg == "--condense-experts") {
+        if (++i >= argc) {
+            fprintf(stderr, "error: --condense-experts requires N (alive rows per expert)\n");
+            return false;
+        }
+        params.condense_experts = std::stoi(argv[i]);
+        // Auto-enable ring + PIM
+        if (!params.ring_experts) {
+            params.ring_experts = true;
+            params.ring_experts_mb = 4096;
+        }
+        params.pim_experts = true;
+        return true;
+    }
+    if (arg == "--condense-index") {
+        if (++i >= argc) {
+            fprintf(stderr, "error: --condense-index requires a file path\n");
+            return false;
+        }
+        params.condense_index_path = argv[i];
+        return true;
+    }
+    if (arg == "--routing-predictor") {
+        if (++i >= argc) {
+            fprintf(stderr, "error: --routing-predictor requires a file path\n");
+            return false;
+        }
+        params.routing_predictor_path = argv[i];
+        return true;
+    }
+    if (arg == "--routing-collector") {
+        if (++i >= argc) {
+            fprintf(stderr, "error: --routing-collector requires a file path\n");
+            return false;
+        }
+        params.routing_collector_path = argv[i];
         return true;
     }
     if (arg == "--bs-no-sharp-attn" || arg == "--bs-blurry-attn") {
@@ -3661,6 +3709,20 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         }
     }
 
+    // Routing predictor for expert prefetching (optional)
+    if (!params.routing_predictor_path.empty()) {
+        int ret = llama_routing_predictor_load(lctx, params.routing_predictor_path.c_str());
+        if (ret != 0) {
+            fprintf(stderr, "%s: warning: failed to load routing predictor from '%s'\n",
+                    __func__, params.routing_predictor_path.c_str());
+        }
+    }
+
+    // Routing data collector for training (optional)
+    if (!params.routing_collector_path.empty()) {
+        llama_routing_collector_start(lctx, params.routing_collector_path.c_str());
+    }
+
     if (params.ignore_eos) {
         params.sparams.logit_bias[llama_token_eos(model)] = -INFINITY;
     }
@@ -3808,6 +3870,10 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.flash_attn      = params.flash_attn;
     mparams.ring_experts    = params.ring_experts;
     mparams.ring_experts_mb = params.ring_experts_mb;
+    mparams.pim_experts     = params.pim_experts;
+    mparams.condense_experts = params.condense_experts;
+    mparams.condense_index_path = params.condense_index_path.empty()
+        ? nullptr : params.condense_index_path.c_str();
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {

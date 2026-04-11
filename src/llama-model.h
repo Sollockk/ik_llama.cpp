@@ -399,6 +399,10 @@ struct llama_model {
     struct ggml_tensor * output_b;
     struct ggml_tensor * output_norm_enc;
 
+    // dflash
+    struct ggml_tensor * dflash_fc          = nullptr;
+    struct ggml_tensor * dflash_hidden_norm = nullptr;
+
     // gemma4 per-layer embeddings (global tensors)
     struct ggml_tensor * tok_embd_per_layer   = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
@@ -445,7 +449,10 @@ struct llama_model {
 
     // ring experts: expert data served from mmap via VRAM ring buffer
     bool ring_experts = false;
-    int  ring_experts_mb = 4096;
+    int  ring_experts_mb = 0;
+    bool pim_experts = false;  // CPU-side MoE on ring miss (RAM vec_dot instead of PCIe upload)
+    int  condense_experts = 0; // two-tier ring: N alive rows in VRAM, rest via CPU PIM
+    std::string condense_index_path;  // path to .cidx file
 
     // model memory mapped files
     llama_mmaps mappings;

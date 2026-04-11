@@ -208,7 +208,13 @@ bool server_context::load_model(const gpt_params& params_) {
         if (params_dft.n_ctx == 0) {
             params_dft.n_ctx = params_base.speculative.n_ctx;
         }
-        params_dft.n_ctx = params_dft.n_ctx == 0 ? params_base.n_ctx / params_base.n_parallel : params_dft.n_ctx;
+        // params_base.n_ctx may be 0 (auto) - use actual target context size
+        if (params_dft.n_ctx == 0) {
+            params_dft.n_ctx = llama_n_ctx(ctx) / params_base.n_parallel;
+        }
+        if (params_dft.n_ctx == 0) {
+            params_dft.n_ctx = 2048; // fallback
+        }
         params_dft.n_parallel = 1;
         params_dft.n_batch = params_dft.n_ctx;
 

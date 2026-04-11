@@ -13,6 +13,11 @@ struct llama_execution_plan;
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
 
 struct llama_kv_cell {
     llama_pos pos   = -1;
@@ -200,6 +205,21 @@ struct llama_context {
 
     const float * draft_input_hidden_state = nullptr;
 
+    // dflash: target model hidden states for KV injection
+    const float * dflash_target_hidden = nullptr; // [n_ctx_tokens, n_embd * n_target_layers]
+    int32_t       dflash_ctx_len       = 0;       // number of context tokens
+
+    // dflash graph input tensors (set during graph building, filled during eval)
+    struct ggml_tensor * inp_dflash_target = nullptr;
+    struct ggml_tensor * inp_dflash_pos_k  = nullptr; // K position IDs [ctx_len + n_tokens]
+
+    // dflash: multi-layer hidden state capture on target model
+    // Set dflash_capture_layers to a non-empty list of layer indices to capture.
+    // After llama_decode(), the captured tensors can be read from the graph.
+    std::vector<int32_t> dflash_capture_layers;  // which layers to capture (empty = disabled)
+    std::vector<float>   dflash_captured_data;   // CPU buffer: [n_captured_layers * n_embd * n_tokens]
+    int32_t              dflash_captured_n_tokens = 0; // tokens in last captured batch
+
     // -----------------------------------------------------------------------
     // MoE router expert recording
     //
@@ -240,6 +260,81 @@ struct llama_context {
     // key = layer index, value = {sum_importance, n_tokens}
     struct llama_gate_probe_context * gate_probe_ctx = nullptr;
     std::unordered_map<int32_t, std::pair<float, int32_t>> gate_probe_layer_scores;
+
+    // -----------------------------------------------------------------------
+    // Routing predictor: within-batch expert prefetching.
+    //
+    // When layer K's router fires (ffn_moe_topk), we know the REAL expert IDs
+    // for all tokens in the batch. A background thread uses these to predict
+    // which experts layers K+1..K+N will need, and prefetches them via
+    // pim_delta_cache_prefetch while layer K's expert FFN computes on GPU.
+    //
+    // Uses co-occurrence weights: [n_expert × n_expert] per lookahead offset.
+    // With a batch of N tokens × 8 experts per token, we build a multi-hot
+    // vector of ALL active experts and predict future layers from that union.
+    //
+    // Entirely optional — when not loaded, ring experts work as before.
+    // -----------------------------------------------------------------------
+    struct routing_predictor_state {
+        bool     enabled     = false;
+        int      n_lookahead = 3;      // predict this many layers ahead
+        int      n_expert    = 0;      // number of experts per layer
+        int      n_expert_used = 0;    // top-k experts per layer
+
+        // weights: one [n_expert, n_expert] projection per lookahead offset
+        std::vector<std::vector<float>> weights;
+        // bias: [n_expert] per offset
+        std::vector<std::vector<float>> biases;
+
+        // Pre-cached tensor lookups: layer_idx -> pim_delta_cache pointers
+        struct layer_caches {
+            struct pim_delta_cache * gate = nullptr;
+            struct pim_delta_cache * up   = nullptr;
+            struct pim_delta_cache * down = nullptr;
+        };
+        std::unordered_map<int, layer_caches> cache_map;
+
+        // Async worker: callback posts real routing, worker predicts + prefetches
+        std::thread             worker;
+        std::mutex              mtx;
+        std::condition_variable cv;
+        struct work_item {
+            int     layer;
+            int     n_ids;              // total expert IDs (n_expert_used * n_tokens)
+            int32_t expert_ids[512];    // all tokens' expert IDs (8 experts × up to 64 tokens)
+        };
+        std::queue<work_item>   work_queue;
+        std::atomic<bool>       shutdown{false};
+
+        // stats (updated by worker thread)
+        std::atomic<int64_t> n_prefetches{0};
+    } routing_predictor;
+
+    // -----------------------------------------------------------------------
+    // Batch route cache: dequantized gate weights for speculative expert
+    // prefetching.  After DFlash predicts B draft tokens we multiply their
+    // embeddings by every MoE layer's gate matrix on CPU to build a full
+    // expert demand matrix, then prefetch all predicted experts in one shot.
+    // -----------------------------------------------------------------------
+    struct batch_route_cache {
+        bool initialized = false;
+        int  n_moe_layers   = 0;
+        int  n_expert       = 0;
+        int  n_expert_used  = 0;
+        int  n_embd         = 0;
+
+        std::vector<int>                moe_layer_indices;  // which layers are MoE
+        std::vector<std::vector<float>> gate_weights;       // [n_moe_layers][n_embd * n_expert] dequantized F32
+    } batch_route;
+
+    // -----------------------------------------------------------------------
+    // Training data collection for routing predictor.
+    // When enabled, logs (layer_idx, hidden_state, expert_ids) tuples to a file.
+    // -----------------------------------------------------------------------
+    bool   routing_collector_enabled = false;
+    FILE * routing_collector_file    = nullptr;
+    // Stashed hidden state per layer (ffn_inp fires before topk for same layer)
+    std::unordered_map<int, std::vector<float>> routing_collector_hidden;
 
     // -----------------------------------------------------------------------
     // JIT (just-in-time) per-layer sharpening

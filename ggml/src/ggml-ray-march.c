@@ -1,4 +1,10 @@
-// ggml-ray-march.c — Neural Raymarcher: Two-Tier PIM Kernel
+// ggml-ray-march.c — Neural Raymarcher: Radiance Cascade PIM Kernel
+//
+// Four-tier cascade (radiance cascade style):
+//   SKIP:     energy ≈ 0    → zero reads
+//   COARSE:   weak energy   → base only (delta skipped, saves ~63% BW)
+//   STANDARD: medium energy → base + delta (full PIM correction)
+//   CRITICAL: strong energy → base + delta (tracked separately for stats)
 //
 // Dynamic block size: adapts to the delta quantization type.
 // Q4_0 (blck_size=32): 44 blocks for ne[0]=1408 — compatible with all tensors.
@@ -16,6 +22,13 @@
 
 // ---------------------------------------------------------------------------
 // Block energy (Level 2 SDF) — dynamic block size
+//
+// NOTE: This energy scan is meaningful for PIM delta weights (which have
+// genuinely sparse blocks) and MoE expert activations. Post-RMSNorm hidden
+// states in dense SiLU models have near-uniform block energy (p1 = 0.71x mean)
+// so the partition will produce few/no skip or coarse blocks. That's expected
+// and correct — the cascade degrades gracefully to full compute when there's
+// no sparsity to exploit.
 // ---------------------------------------------------------------------------
 
 void ggml_ray_march_block_energies(
@@ -102,7 +115,39 @@ void ggml_ray_march_partition_blocks(
 }
 
 // ---------------------------------------------------------------------------
-// Two-tier vec_dot — dynamic block size
+// Four-tier cascade partition (radiance cascade)
+// ---------------------------------------------------------------------------
+
+void ggml_ray_march_partition_cascade(
+        const float * energies,
+        int           n_blocks,
+        float         skip_threshold,
+        float         coarse_threshold,
+        float         critical_threshold,
+        struct ggml_ray_march_cascade * cascade) {
+
+    cascade->n_skip     = 0;
+    cascade->n_coarse   = 0;
+    cascade->n_standard = 0;
+    cascade->n_critical = 0;
+    cascade->n_total    = n_blocks;
+
+    for (int b = 0; b < n_blocks; b++) {
+        const float e = energies[b];
+        if (e < skip_threshold) {
+            cascade->n_skip++;
+        } else if (e < coarse_threshold) {
+            cascade->coarse_blocks[cascade->n_coarse++] = b;
+        } else if (e >= critical_threshold) {
+            cascade->critical_blocks[cascade->n_critical++] = b;
+        } else {
+            cascade->standard_blocks[cascade->n_standard++] = b;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Two-tier vec_dot — dynamic block size (legacy)
 // ---------------------------------------------------------------------------
 
 void ggml_vec_dot_ray_march(
@@ -176,6 +221,109 @@ void ggml_vec_dot_ray_march(
     }
 
     // Skip blocks: contribute ZERO. No blurry read. No delta read. The ray flew through.
+
+    *s = total;
+}
+
+// ---------------------------------------------------------------------------
+// Four-tier cascade vec_dot (radiance cascade)
+// ---------------------------------------------------------------------------
+//
+// COARSE blocks:   base vec_dot only — delta not read (saves ~63% BW per block)
+// STANDARD blocks: base + delta vec_dot (full PIM correction)
+// CRITICAL blocks: base + delta vec_dot (same compute, tracked for stats)
+// SKIP blocks:     contribute zero (not in any list)
+
+void ggml_vec_dot_cascade(
+        int                    n,
+        float                * s,
+        const void           * blurry_row,
+        ggml_ray_march_type    blurry_type_,
+        const void           * delta_row,
+        ggml_ray_march_type    delta_type_,
+        const void           * input_row,
+        const void           * input_row_delta,
+        const struct ggml_ray_march_cascade * cascade,
+        int                    block_size) {
+
+    enum ggml_type blurry_type = (enum ggml_type)blurry_type_;
+    enum ggml_type delta_type  = (enum ggml_type)delta_type_;
+
+    ggml_type_traits_t blurry_traits = ggml_internal_get_type_traits(blurry_type);
+    ggml_type_traits_t delta_traits  = ggml_internal_get_type_traits(delta_type);
+
+    // Blurry block strides
+    const size_t blurry_blk_bytes = blurry_traits.type_size;
+    const size_t blurry_qblocks_per_eblock = (blurry_traits.blck_size > 0)
+        ? block_size / blurry_traits.blck_size : 1;
+
+    // Blurry input (vec_dot_type) strides
+    enum ggml_type input_vdt = blurry_traits.vec_dot_type;
+    const size_t input_blk_bytes = ggml_type_size(input_vdt);
+    const size_t input_qblocks_per_eblock = (ggml_blck_size(input_vdt) > 0)
+        ? block_size / ggml_blck_size(input_vdt) : 1;
+
+    // Delta block strides
+    const size_t delta_blk_bytes = delta_traits.type_size;
+    const size_t delta_qblocks_per_eblock = (delta_traits.blck_size > 0)
+        ? block_size / delta_traits.blck_size : 1;
+
+    // Delta input (vec_dot_type) strides
+    enum ggml_type dinput_vdt = delta_traits.vec_dot_type;
+    const size_t dinput_blk_bytes = ggml_type_size(dinput_vdt);
+    const size_t dinput_qblocks_per_eblock = (ggml_blck_size(dinput_vdt) > 0)
+        ? block_size / ggml_blck_size(dinput_vdt) : 1;
+
+    const void * delta_input = input_row_delta ? input_row_delta : input_row;
+
+    float total = 0.0f;
+
+    // --- Tier 1: COARSE — base vec_dot only, delta NOT read ---
+    // Weak activations: the delta correction is negligible for these blocks.
+    // Saves delta_blk_bytes * delta_qblocks_per_eblock bytes per block (~63% of BW).
+    if (blurry_traits.vec_dot) {
+        for (int g = 0; g < cascade->n_coarse; g++) {
+            const int b = cascade->coarse_blocks[g];
+            float bv = 0.0f;
+            blurry_traits.vec_dot(
+                block_size, &bv, 0,
+                (const char *)blurry_row + b * blurry_qblocks_per_eblock * blurry_blk_bytes, 0,
+                (const char *)input_row  + b * input_qblocks_per_eblock  * input_blk_bytes,  0, 1);
+            total += bv;
+        }
+    }
+
+    // --- Tier 2+3: STANDARD + CRITICAL — base + delta ---
+    // Medium and strong activations: full PIM correction applied.
+    // These two tiers get identical compute; separation is for stats only.
+    const int n_full = cascade->n_standard + cascade->n_critical;
+    for (int g = 0; g < n_full; g++) {
+        const int b = (g < cascade->n_standard)
+            ? cascade->standard_blocks[g]
+            : cascade->critical_blocks[g - cascade->n_standard];
+
+        // Blurry contribution
+        if (blurry_traits.vec_dot) {
+            float bv = 0.0f;
+            blurry_traits.vec_dot(
+                block_size, &bv, 0,
+                (const char *)blurry_row + b * blurry_qblocks_per_eblock * blurry_blk_bytes, 0,
+                (const char *)input_row  + b * input_qblocks_per_eblock  * input_blk_bytes,  0, 1);
+            total += bv;
+        }
+
+        // Delta correction
+        if (delta_row && delta_traits.vec_dot) {
+            float dv = 0.0f;
+            delta_traits.vec_dot(
+                block_size, &dv, 0,
+                (const char *)delta_row   + b * delta_qblocks_per_eblock  * delta_blk_bytes,  0,
+                (const char *)delta_input + b * dinput_qblocks_per_eblock * dinput_blk_bytes, 0, 1);
+            total += dv;
+        }
+    }
+
+    // SKIP blocks: contribute zero. No reads. The ray flew through empty space.
 
     *s = total;
 }
