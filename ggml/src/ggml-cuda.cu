@@ -4256,27 +4256,81 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 (struct pim_delta_cache *)src0->ray_march_sharp_cache;
             const ggml_type stype = src0->ray_march_sharp_type;
             const size_t s_nb01 = ggml_row_size(stype, src0_row.ne[0]);
-            const size_t slice_bytes = (size_t)src0_row.ne[1] * s_nb01;
             auto & sring = ctx.sharp_ring;
             const char * sharp_ptr = nullptr;
+            bool is_condensed_hit = false;
+
+            // In condensed mode, ring slices store only alive rows
+            const bool use_condensed = sring.condensed_mode && sring.cidx_map;
+            const struct condense_index * cidx = nullptr;
+            int n_alive_this = 0;
+            if (use_condensed) {
+                cidx = condense_index_map_get(sring.cidx_map, src0->name, (int)i02);
+                n_alive_this = cidx ? cidx->n_alive : 0;
+            }
+            const size_t slice_bytes = use_condensed && n_alive_this > 0
+                ? (size_t)n_alive_this * s_nb01
+                : (size_t)src0_row.ne[1] * s_nb01;
+
+            // In condensed mode: skip GPU ring entirely, active experts go to CPU PIM.
+            if (use_condensed && cidx && ctx.pim_expert_pipe.enabled && num_src1_rows > 0) {
+                const char * host_ptr = pim_delta_cache_get(scache, (int)i02);
+                if (host_ptr) {
+                    generic_pim_experts.push_back({(int)i02, host_ptr});
+                    generic_pim_mappings.push_back({mapping_offset, num_src1_rows});
+                    goto next_expert_generic;
+                }
+            }
 
             uint64_t rk = sring.key(src0, (int)i02);
             auto sit = sring.slice_map.find(rk);
             if (sit != sring.slice_map.end()) {
-                // PIM disabled for ring hits — ring serves correctly from VRAM
                 sharp_ptr = (const char *)sring.vram + sit->second.offset;
                 sit->second.last_used = sring.token_counter;
                 sring.n_hits++;
+                is_condensed_hit = use_condensed && cidx;
             } else {
                 sring.n_misses++;
                 const char * host_ptr = pim_delta_cache_get(scache, (int)i02);
 
                 if (host_ptr && sring.vram_used + slice_bytes <= sring.vram_size) {
-                    // Space available — direct append to ring
                     size_t off = sring.vram_used;
-                    CUDA_CHECK(cudaMemcpyAsync((char *)sring.vram + off, host_ptr,
-                                               slice_bytes, cudaMemcpyHostToDevice,
-                                               ctx.jit_upload_stream()));
+
+                    if (use_condensed && cidx && n_alive_this > 0) {
+                        // Condensed upload: extract only alive rows, pack contiguous
+                        size_t staging_bytes = n_alive_this * s_nb01;
+                        if (staging_bytes > sring.condensed_staging_cap) {
+                            if (sring.condensed_staging) cudaFreeHost(sring.condensed_staging);
+                            CUDA_CHECK(cudaMallocHost(&sring.condensed_staging, staging_bytes));
+                            sring.condensed_staging_cap = staging_bytes;
+                        }
+                        for (int ai = 0; ai < n_alive_this; ai++) {
+                            memcpy(sring.condensed_staging + ai * s_nb01,
+                                   host_ptr + cidx->alive_idx[ai] * s_nb01,
+                                   s_nb01);
+                        }
+                        CUDA_CHECK(cudaMemcpyAsync((char *)sring.vram + off,
+                            sring.condensed_staging, staging_bytes,
+                            cudaMemcpyHostToDevice, ctx.jit_upload_stream()));
+
+                        // Also upload alive index array to GPU for scatter
+                        uint16_t * alive_gpu = nullptr;
+                        auto ait = sring.alive_idx_gpu.find(rk);
+                        if (ait == sring.alive_idx_gpu.end()) {
+                            CUDA_CHECK(cudaMalloc(&alive_gpu, n_alive_this * sizeof(uint16_t)));
+                            CUDA_CHECK(cudaMemcpyAsync(alive_gpu, cidx->alive_idx,
+                                n_alive_this * sizeof(uint16_t),
+                                cudaMemcpyHostToDevice, ctx.jit_upload_stream()));
+                            sring.alive_idx_gpu[rk] = alive_gpu;
+                        }
+                        is_condensed_hit = true;
+                    } else {
+                        // Full upload
+                        CUDA_CHECK(cudaMemcpyAsync((char *)sring.vram + off, host_ptr,
+                                                   slice_bytes, cudaMemcpyHostToDevice,
+                                                   ctx.jit_upload_stream()));
+                    }
+
                     sring.upload_pending = true;
                     sring.slice_map[rk] = {off, slice_bytes, sring.token_counter, (int)i02};
                     sring.vram_used += slice_bytes;
@@ -4461,6 +4515,7 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     // PIM: batch-compute all ring-miss experts on CPU (generic loop path)
+    // Optimized: bulk D2H for unique tokens, parallel experts, bulk H2D results.
     if (!generic_pim_experts.empty()) {
         auto & pipe = ctx.pim_expert_pipe;
         const int64_t ne00_src = src0->ne[0];  // input dim
@@ -4469,7 +4524,6 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // Sync GPU stream — ensure all ring-hit experts wrote their results
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // Use the weight type's vec_dot_type for correct IK-compatible quantization
         const ggml_type stype = src0->ray_march_sharp_type;
         const ggml_type_traits_t sharp_traits = ggml_internal_get_type_traits(stype);
         const size_t sharp_row_stride = ggml_row_size(stype, ne00_src);
@@ -4477,61 +4531,114 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         const ggml_type_traits_t dit = ggml_internal_get_type_traits(dinput_type);
         const size_t dinput_row_size = ggml_row_size(dinput_type, ne00_src);
 
-        // Read src1 token data on-demand from GPU using the mapping.
-        // src1 may be compacted (ne11 < ids->ne[1]), so we read each
-        // token using its original stride: src1_original + i2*nb12.
-        // nb12 = src1->nb[2] is the stride between token groups,
-        // but for MUL_MAT_ID src1 layout is [ne10, ne11, ne12, ne13].
-        // i2 indexes into the batch dimension. Use nb11 as token stride.
-
         if (sharp_traits.vec_dot) {
-            // Bulk-read the full row mapping from GPU → host (once)
+            // Bulk-read the full row mapping from GPU → host
             const size_t total_mapped = cum_moe_counts[n_as];
             std::vector<mmid_row_mapping> host_row_mapping(total_mapped);
             CUDA_CHECK(cudaMemcpy(host_row_mapping.data(), dev_row_mapping.get(),
                 total_mapped * sizeof(mmid_row_mapping), cudaMemcpyDeviceToHost));
 
-            // Buffers for one token's input (f32 + quantized) and one output row
+            // Collect all unique (i1, i2) src1 offsets needed by PIM experts.
+            // src1 layout: [ne10, ne11, ne12, ne13]
+            // k_copy_src_to_contiguous reads: src1_original + (i1 % ne11)*nb11 + i2*nb12
+            // We use the same addressing for D2H.
+            struct src1_key { int32_t i1; int32_t i2; };
+            struct src1_key_hash {
+                size_t operator()(const src1_key & k) const {
+                    return std::hash<int64_t>()(((int64_t)k.i1 << 32) | (uint32_t)k.i2);
+                }
+            };
+            struct src1_key_eq {
+                bool operator()(const src1_key & a, const src1_key & b) const {
+                    return a.i1 == b.i1 && a.i2 == b.i2;
+                }
+            };
+            std::unordered_map<int64_t, int> src1_offset_to_idx;
+            std::vector<size_t> src1_gpu_offsets;  // byte offsets into src1_original
+
+            for (size_t pi = 0; pi < generic_pim_experts.size(); pi++) {
+                const auto & pm = generic_pim_mappings[pi];
+                for (int64_t ri = 0; ri < pm.num_rows; ri++) {
+                    const auto & rm = host_row_mapping[pm.mapping_offset + ri];
+                    int32_t i11 = rm.i1 % ne11;
+                    int32_t i12 = rm.i2;
+                    size_t offset = i11 * nb11 + i12 * nb12;
+                    int64_t key = ((int64_t)i11 << 32) | (uint32_t)i12;
+                    if (src1_offset_to_idx.find(key) == src1_offset_to_idx.end()) {
+                        src1_offset_to_idx[key] = (int)src1_gpu_offsets.size();
+                        src1_gpu_offsets.push_back(offset);
+                    }
+                }
+            }
+
+            const int n_unique = (int)src1_gpu_offsets.size();
             const size_t token_f32_bytes = ne00_src * sizeof(float);
-            std::vector<float> token_f32(ne00_src);
-            std::vector<uint8_t> token_quant(dinput_row_size);
-            std::vector<float> row_buf(ne0);
+            std::vector<float> all_tokens_f32(n_unique * ne00_src);
+            std::vector<uint8_t> all_tokens_quant(n_unique * dinput_row_size);
+
+            // Bulk D2H: fetch each unique src1 row
+            for (int i = 0; i < n_unique; i++) {
+                CUDA_CHECK(cudaMemcpy(all_tokens_f32.data() + i * ne00_src,
+                    src1_original + src1_gpu_offsets[i],
+                    token_f32_bytes, cudaMemcpyDeviceToHost));
+            }
+
+            // Batch quantize
+            for (int i = 0; i < n_unique; i++) {
+                dit.from_float(all_tokens_f32.data() + i * ne00_src,
+                               all_tokens_quant.data() + i * dinput_row_size, ne00_src);
+            }
+
+            // Collect work items
+            struct pim_work_item {
+                const char * expert_weights;
+                int quant_idx;   // index into all_tokens_quant
+                char * dst_ptr;
+                int64_t ne01;
+            };
+            std::vector<pim_work_item> work_items;
 
             for (size_t pi = 0; pi < generic_pim_experts.size(); pi++) {
                 const auto & pe = generic_pim_experts[pi];
                 const auto & pm = generic_pim_mappings[pi];
-                const char * expert_weights = pe.weight_ptr;
 
-                // For each token routed to this expert
                 for (int64_t ri = 0; ri < pm.num_rows; ri++) {
-                    const mmid_row_mapping & rm = host_row_mapping[pm.mapping_offset + ri];
-                    int32_t src1_col = rm.i1;  // expert slot (0..n_ids-1)
-                    int32_t src1_row = rm.i2;  // token index in original batch
+                    const auto & rm = host_row_mapping[pm.mapping_offset + ri];
+                    int32_t i11 = rm.i1 % ne11;
+                    int32_t i12 = rm.i2;
+                    int64_t key = ((int64_t)i11 << 32) | (uint32_t)i12;
+                    int tok_idx = src1_offset_to_idx[key];
+                    char * dst_ptr = (char *)dst->data + rm.i1 * nb1 + rm.i2 * nb2;
 
-                    // Fetch this token's hidden state from GPU using original stride
-                    // src1 layout: [ne10, ...] with nb11 as token stride
-                    CUDA_CHECK(cudaMemcpy(token_f32.data(),
-                        src1_original + src1_row * nb11,
-                        token_f32_bytes, cudaMemcpyDeviceToHost));
-
-                    // Quantize to vec_dot_type
-                    dit.from_float(token_f32.data(), token_quant.data(), ne00_src);
-
-                    // Compute full output row on CPU
-                    #pragma omp parallel for schedule(static) num_threads(8)
-                    for (int64_t j = 0; j < ne01_src; j++) {
-                        float dot = 0.0f;
-                        sharp_traits.vec_dot((int)ne00_src, &dot, 0,
-                            expert_weights + j * sharp_row_stride, 0,
-                            token_quant.data(), 0, 1);
-                        row_buf[j] = dot;
-                    }
-
-                    // Write only this row back to GPU dst at the correct position
-                    char * dst_ptr = (char *)dst->data + src1_col * nb1 + src1_row * nb2;
-                    CUDA_CHECK(cudaMemcpy(dst_ptr, row_buf.data(),
-                        ne0 * sizeof(float), cudaMemcpyHostToDevice));
+                    work_items.push_back({pe.weight_ptr, tok_idx, dst_ptr, ne01_src});
                 }
+            }
+
+            // Allocate result buffers (all at once to avoid realloc)
+            const int n_work = (int)work_items.size();
+            std::vector<float> all_results(n_work * ne0);
+
+            // Parallel compute
+            for (int wi = 0; wi < n_work; wi++) {
+                const auto & w = work_items[wi];
+                float * rbuf = all_results.data() + wi * ne0;
+                const uint8_t * qinput = all_tokens_quant.data() + w.quant_idx * dinput_row_size;
+
+                #pragma omp parallel for schedule(static) num_threads(16)
+                for (int64_t j = 0; j < w.ne01; j++) {
+                    float dot = 0.0f;
+                    sharp_traits.vec_dot((int)ne00_src, &dot, 0,
+                        w.expert_weights + j * sharp_row_stride, 0,
+                        qinput, 0, 1);
+                    rbuf[j] = dot;
+                }
+            }
+
+            // Bulk H2D
+            for (int wi = 0; wi < n_work; wi++) {
+                CUDA_CHECK(cudaMemcpy(work_items[wi].dst_ptr,
+                    all_results.data() + wi * ne0,
+                    ne0 * sizeof(float), cudaMemcpyHostToDevice));
             }
         }
 
