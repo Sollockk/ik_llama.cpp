@@ -343,7 +343,8 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
     float       *  dst_d = (float       *)  dst->data;
 
     // If src0 is a temporary compute buffer, clear any potential padding.
-    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+    // Skip if buffer is NULL (e.g. ring buffer sharp-swapped src0).
+    if (src0->buffer && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         const size_t size_data  = ggml_nbytes(src0);
         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
         if (size_alloc > size_data) {

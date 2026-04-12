@@ -921,6 +921,7 @@ struct ggml_backend_cuda_context {
     // send result back (0.002ms). 3000x PCIe reduction on misses.
     struct {
         bool enabled = false;
+        int  n_threads = 0;               // CPU threads for PIM compute (0 = auto)
 
         // Pinned host buffers for D2H hidden state transfer
         float *   host_src1 = nullptr;    // pinned: D2H target for hidden state
@@ -934,6 +935,10 @@ struct ggml_backend_cuda_context {
         // Quantized input buffer (CPU-side, for vec_dot)
         uint8_t * host_dinput = nullptr;  // Q8_0 quantized hidden state
         size_t    dinput_cap  = 0;        // capacity in bytes
+
+        // Pinned result buffer for zero-copy H2D
+        float *   pinned_results = nullptr;  // cudaMallocHost'd
+        size_t    pinned_results_cap = 0;    // capacity in bytes
 
         // CUDA event for D2H synchronization
         cudaEvent_t src1_ready = nullptr; // signals D2H copy complete
@@ -1007,6 +1012,7 @@ struct ggml_backend_cuda_context {
             size_t bytes;
             int64_t last_used;
             int     expert_id;    // for Belady lookup
+            bool    is_condensed; // true = only alive rows stored, false = full expert
         };
         std::unordered_map<uint64_t, slice_info> slice_map;
 

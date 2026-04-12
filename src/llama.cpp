@@ -7153,7 +7153,7 @@ struct llama_context * llama_init_from_model(
                         ggml_backend_cuda_set_sharp_vram_budget(be, model->ring_experts_mb);
                         ggml_backend_cuda_enable_sharp_ring(be, true);
                         if (model->pim_experts) {
-                            ggml_backend_cuda_enable_pim_experts(be, true);
+                            ggml_backend_cuda_enable_pim_experts(be, true, cparams.n_threads);
                         }
                         if (model->condense_experts > 0) {
                             ggml_backend_cuda_enable_condensed_experts(be, model->condense_experts);

@@ -28,6 +28,10 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-pim-cache.h"
+#include <omp.h>
+#if GGML_USE_IQK_MULMAT
+#include "iqk/iqk_mul_mat.h"
+#endif
 
 #include "ggml-cuda/scatter-condensed.cuh"
 #include "ggml-cuda/mmvq-sparse-args.h"
@@ -4220,7 +4224,12 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     // PIM: collect ring-miss experts for CPU-side computation (generic loop path)
-    struct generic_pim_mapping { size_t mapping_offset; int64_t num_rows; };
+    struct generic_pim_mapping {
+        size_t mapping_offset;
+        int64_t num_rows;
+        const uint16_t * dead_idx;  // NULL = compute all rows, non-NULL = only dead rows
+        int n_dead;                 // number of dead rows (0 = compute all)
+    };
     std::vector<pim_expert_entry> generic_pim_experts;
     std::vector<generic_pim_mapping> generic_pim_mappings;
 
@@ -4233,6 +4242,10 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         size_t mapping_offset = cum_moe_counts[i02];
+        bool is_condensed_hit = false;
+        int n_alive_this = 0;
+        bool skip_gpu_matmul = false;
+        const struct condense_index * cidx_outer = nullptr;
 
         {
             dim3 block_dims(std::min((unsigned int)ne10, 768u));
@@ -4258,29 +4271,18 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             const size_t s_nb01 = ggml_row_size(stype, src0_row.ne[0]);
             auto & sring = ctx.sharp_ring;
             const char * sharp_ptr = nullptr;
-            bool is_condensed_hit = false;
 
             // In condensed mode, ring slices store only alive rows
             const bool use_condensed = sring.condensed_mode && sring.cidx_map;
             const struct condense_index * cidx = nullptr;
-            int n_alive_this = 0;
             if (use_condensed) {
                 cidx = condense_index_map_get(sring.cidx_map, src0->name, (int)i02);
                 n_alive_this = cidx ? cidx->n_alive : 0;
+                cidx_outer = cidx;
             }
-            const size_t slice_bytes = use_condensed && n_alive_this > 0
-                ? (size_t)n_alive_this * s_nb01
-                : (size_t)src0_row.ne[1] * s_nb01;
-
-            // In condensed mode: skip GPU ring entirely, active experts go to CPU PIM.
-            if (use_condensed && cidx && ctx.pim_expert_pipe.enabled && num_src1_rows > 0) {
-                const char * host_ptr = pim_delta_cache_get(scache, (int)i02);
-                if (host_ptr) {
-                    generic_pim_experts.push_back({(int)i02, host_ptr});
-                    generic_pim_mappings.push_back({mapping_offset, num_src1_rows});
-                    goto next_expert_generic;
-                }
-            }
+            // Three-tier ring: full slices (GPU only) > condensed slices (GPU+CPU) > PIM only.
+            // Background PCIe upload warms ring for next token.
+            const size_t full_slice_bytes = (size_t)src0_row.ne[1] * s_nb01;
 
             uint64_t rk = sring.key(src0, (int)i02);
             auto sit = sring.slice_map.find(rk);
@@ -4288,106 +4290,144 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 sharp_ptr = (const char *)sring.vram + sit->second.offset;
                 sit->second.last_used = sring.token_counter;
                 sring.n_hits++;
-                is_condensed_hit = use_condensed && cidx;
+                is_condensed_hit = sit->second.is_condensed;
             } else {
                 sring.n_misses++;
                 const char * host_ptr = pim_delta_cache_get(scache, (int)i02);
 
-                if (host_ptr && sring.vram_used + slice_bytes <= sring.vram_size) {
-                    size_t off = sring.vram_used;
-
-                    if (use_condensed && cidx && n_alive_this > 0) {
-                        // Condensed upload: extract only alive rows, pack contiguous
-                        size_t staging_bytes = n_alive_this * s_nb01;
-                        if (staging_bytes > sring.condensed_staging_cap) {
-                            if (sring.condensed_staging) cudaFreeHost(sring.condensed_staging);
-                            CUDA_CHECK(cudaMallocHost(&sring.condensed_staging, staging_bytes));
-                            sring.condensed_staging_cap = staging_bytes;
-                        }
-                        for (int ai = 0; ai < n_alive_this; ai++) {
-                            memcpy(sring.condensed_staging + ai * s_nb01,
-                                   host_ptr + cidx->alive_idx[ai] * s_nb01,
-                                   s_nb01);
-                        }
-                        CUDA_CHECK(cudaMemcpyAsync((char *)sring.vram + off,
-                            sring.condensed_staging, staging_bytes,
-                            cudaMemcpyHostToDevice, ctx.jit_upload_stream()));
-
-                        // Also upload alive index array to GPU for scatter
-                        uint16_t * alive_gpu = nullptr;
-                        auto ait = sring.alive_idx_gpu.find(rk);
-                        if (ait == sring.alive_idx_gpu.end()) {
-                            CUDA_CHECK(cudaMalloc(&alive_gpu, n_alive_this * sizeof(uint16_t)));
-                            CUDA_CHECK(cudaMemcpyAsync(alive_gpu, cidx->alive_idx,
-                                n_alive_this * sizeof(uint16_t),
-                                cudaMemcpyHostToDevice, ctx.jit_upload_stream()));
-                            sring.alive_idx_gpu[rk] = alive_gpu;
-                        }
-                        is_condensed_hit = true;
-                    } else {
-                        // Full upload
-                        CUDA_CHECK(cudaMemcpyAsync((char *)sring.vram + off, host_ptr,
-                                                   slice_bytes, cudaMemcpyHostToDevice,
-                                                   ctx.jit_upload_stream()));
-                    }
-
-                    sring.upload_pending = true;
-                    sring.slice_map[rk] = {off, slice_bytes, sring.token_counter, (int)i02};
-                    sring.vram_used += slice_bytes;
-                    sharp_ptr = (const char *)sring.vram + off;
-                } else if (host_ptr) {
-                    // Ring full — try eviction
-                    uint64_t evict_key = 0;
-                    bool found_victim = false;
-
-                    if (sring.n_demand_steps > 0) {
-                        int best_next_use = -1;
-                        for (auto & [k, v] : sring.slice_map) {
-                            if (v.bytes < slice_bytes) continue;
-                            int nu = sring.demand_next_use(v.expert_id, sring.demand_cursor);
-                            if (nu > best_next_use) {
-                                best_next_use = nu;
-                                evict_key = k;
-                                found_victim = true;
-                            }
-                        }
-                        if (found_victim) sring.n_belady_evictions++;
-                    }
-
-                    if (!found_victim) {
-                        int64_t oldest_time = INT64_MAX;
-                        for (auto & [k, v] : sring.slice_map) {
-                            if (v.last_used < oldest_time && v.bytes >= slice_bytes) {
-                                oldest_time = v.last_used;
-                                evict_key = k;
-                                found_victim = true;
-                            }
-                        }
-                        if (found_victim && oldest_time >= sring.token_counter) {
-                            found_victim = false;
-                        }
-                    }
-
-                    if (found_victim) {
-                        auto evict_it = sring.slice_map.find(evict_key);
-                        size_t off = evict_it->second.offset;
-                        sring.slice_map.erase(evict_it);
-                        CUDA_CHECK(cudaMemcpyAsync((char *)sring.vram + off, host_ptr,
-                                                   slice_bytes, cudaMemcpyHostToDevice,
-                                                   ctx.jit_upload_stream()));
-                        sring.upload_pending = true;
-                        sring.slice_map[rk] = {off, slice_bytes, sring.token_counter, (int)i02};
-                        sharp_ptr = (const char *)sring.vram + off;
-                        sring.n_evictions++;
-                    } else if (ctx.pim_expert_pipe.enabled) {
-                        // PIM fallback: ring full, no eviction possible
-                        // Defer to CPU vec_dot from RAM
-                        generic_pim_experts.push_back({(int)i02, host_ptr});
-                        generic_pim_mappings.push_back({mapping_offset, num_src1_rows});
-                        goto next_expert_generic;
-                    }
+                // CPU PIM handles this token's computation immediately
+                if (host_ptr && ctx.pim_expert_pipe.enabled) {
+                    pim_expert_entry pe_miss = {(int)i02, host_ptr};
+                    generic_pim_experts.push_back(pe_miss);
+                    generic_pim_mapping pm_miss = {mapping_offset, num_src1_rows, nullptr, 0};
+                    generic_pim_mappings.push_back(pm_miss);
+                    skip_gpu_matmul = true;
                 }
-            }
+
+                // Background PCIe upload to warm ring for next token.
+                // Try full slice (pure GPU next time), fall back to condensed.
+                if (host_ptr) {
+                    const size_t cond_slice_bytes = (use_condensed && n_alive_this > 0)
+                        ? (size_t)n_alive_this * s_nb01 : 0;
+
+                    if (sring.vram_used + full_slice_bytes <= sring.vram_size) {
+                        // Full slice fits — direct append
+                        size_t off = sring.vram_used;
+                        CUDA_CHECK(cudaMemcpyAsync((char *)sring.vram + off, host_ptr,
+                            full_slice_bytes, cudaMemcpyHostToDevice,
+                            ctx.jit_upload_stream()));
+                        sring.upload_pending = true;
+                        sring.slice_map[rk] = {off, full_slice_bytes, sring.token_counter,
+                                               (int)i02, false};
+                        sring.vram_used += full_slice_bytes;
+                    } else {
+                        // Ring full — evict LRU/Belady to make room for full slice
+                        uint64_t evict_key = 0;
+                        bool found_victim = false;
+
+                        if (sring.n_demand_steps > 0) {
+                            // Belady: evict expert whose next use is furthest
+                            int best_next_use = -1;
+                            for (auto & [k, v] : sring.slice_map) {
+                                if (v.bytes < full_slice_bytes) continue;
+                                int nu = sring.demand_next_use(v.expert_id, sring.demand_cursor);
+                                if (nu > best_next_use) {
+                                    best_next_use = nu;
+                                    evict_key = k;
+                                    found_victim = true;
+                                }
+                            }
+                            if (found_victim) sring.n_belady_evictions++;
+                        }
+                        if (!found_victim) {
+                            // LRU fallback
+                            int64_t oldest_time = INT64_MAX;
+                            for (auto & [k, v] : sring.slice_map) {
+                                if (v.last_used < oldest_time && v.bytes >= full_slice_bytes) {
+                                    oldest_time = v.last_used;
+                                    evict_key = k;
+                                    found_victim = true;
+                                }
+                            }
+                            if (found_victim && oldest_time >= sring.token_counter) {
+                                found_victim = false;
+                            }
+                        }
+                        if (found_victim) {
+                            auto evict_it = sring.slice_map.find(evict_key);
+                            size_t off = evict_it->second.offset;
+                            sring.slice_map.erase(evict_it);
+                            CUDA_CHECK(cudaMemcpyAsync((char *)sring.vram + off, host_ptr,
+                                full_slice_bytes, cudaMemcpyHostToDevice,
+                                ctx.jit_upload_stream()));
+                            sring.upload_pending = true;
+                            sring.slice_map[rk] = {off, full_slice_bytes, sring.token_counter,
+                                                   (int)i02, false};
+                            sring.n_evictions++;
+                        }
+                    }
+                    if (cond_slice_bytes > 0 && sring.slice_map.find(rk) == sring.slice_map.end()) {
+                        // Ring full for full slice — try condensed.
+                        // If no free space, evict LRU entry to make room.
+                        size_t off = 0;
+                        bool have_cond_slot = false;
+
+                        if (sring.vram_used + cond_slice_bytes <= sring.vram_size) {
+                            off = sring.vram_used;
+                            sring.vram_used += cond_slice_bytes;
+                            have_cond_slot = true;
+                        } else {
+                            // Evict LRU to free space for condensed slice
+                            int64_t oldest_time = INT64_MAX;
+                            uint64_t evict_key = 0;
+                            bool found = false;
+                            for (auto & [k, v] : sring.slice_map) {
+                                if (v.last_used < oldest_time && v.bytes >= cond_slice_bytes) {
+                                    oldest_time = v.last_used;
+                                    evict_key = k;
+                                    found = true;
+                                }
+                            }
+                            if (found && oldest_time < sring.token_counter) {
+                                auto evict_it = sring.slice_map.find(evict_key);
+                                off = evict_it->second.offset;
+                                // Note: we may use less space than evicted. Fragmentation.
+                                sring.slice_map.erase(evict_it);
+                                sring.n_evictions++;
+                                have_cond_slot = true;
+                            }
+                        }
+
+                        if (have_cond_slot) {
+                            if (cond_slice_bytes > sring.condensed_staging_cap) {
+                                if (sring.condensed_staging) cudaFreeHost(sring.condensed_staging);
+                                CUDA_CHECK(cudaMallocHost(&sring.condensed_staging, cond_slice_bytes));
+                                sring.condensed_staging_cap = cond_slice_bytes;
+                            }
+                            for (int ai = 0; ai < n_alive_this; ai++) {
+                                memcpy(sring.condensed_staging + ai * s_nb01,
+                                       host_ptr + cidx->alive_idx[ai] * s_nb01, s_nb01);
+                            }
+                            CUDA_CHECK(cudaMemcpyAsync((char *)sring.vram + off,
+                                sring.condensed_staging, cond_slice_bytes,
+                                cudaMemcpyHostToDevice, ctx.jit_upload_stream()));
+                            // Upload alive index array
+                            auto ait = sring.alive_idx_gpu.find(rk);
+                            if (ait == sring.alive_idx_gpu.end()) {
+                                uint16_t * alive_gpu = nullptr;
+                                CUDA_CHECK(cudaMalloc(&alive_gpu, n_alive_this * sizeof(uint16_t)));
+                                CUDA_CHECK(cudaMemcpyAsync(alive_gpu, cidx->alive_idx,
+                                    n_alive_this * sizeof(uint16_t),
+                                    cudaMemcpyHostToDevice, ctx.jit_upload_stream()));
+                                sring.alive_idx_gpu[rk] = alive_gpu;
+                            }
+                            sring.upload_pending = true;
+                            sring.slice_map[rk] = {off, cond_slice_bytes, sring.token_counter,
+                                                   (int)i02, true};
+                        }
+                }
+                } // if (host_ptr)
+            } // else (ring miss)
 
             if (sharp_ptr) {
                 memcpy(sharp_saved_nb, src0_row.nb, sizeof(sharp_saved_nb));
@@ -4395,12 +4435,19 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 src0_row.type = stype;
                 src0_row.nb[0] = ggml_type_size(stype);
                 src0_row.nb[1] = s_nb01;
+
+                // Condensed: override ne[1] to n_alive so matmul only computes alive rows
+                int64_t saved_ne1 = src0_row.ne[1];
+                if (is_condensed_hit && n_alive_this > 0) {
+                    src0_row.ne[1] = n_alive_this;
+                }
+
                 for (int d = 2; d < GGML_MAX_DIMS; d++)
                     src0_row.nb[d] = src0_row.nb[d-1] * src0_row.ne[d-1];
-                // Clear sharp cache to prevent the mul_mat sharp dispatch
-                // from firing AGAIN inside the matmul and overwriting this
-                // expert's correct result with expert 0's data.
                 src0_row.ray_march_sharp_cache = nullptr;
+                // Clear buffer pointer — ring VRAM is not a ggml buffer.
+                // Prevents MMQ padding memset from accessing invalid GHOST buffer.
+                src0_row.buffer = nullptr;
                 sharp_swapped = true;
 
                 static int loop_sharp_diag = 0;
@@ -4440,10 +4487,17 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src1_row.nb[2] = num_src1_rows*nb11;
         src1_row.nb[3] = num_src1_rows*nb11;
 
+        if (!skip_gpu_matmul) {
+        // For condensed matmul, dst output has n_alive values per token, not ne0
+        {
+        int64_t dst_ne0 = (is_condensed_hit && n_alive_this > 0) ? n_alive_this : ne0;
+        size_t dst_nb1 = dst_ne0 * sizeof(float);
+        dst_row.ne[0] = dst_ne0;
         dst_row.ne[1] = num_src1_rows;
-        dst_row.nb[1] = nb1;
-        dst_row.nb[2] = num_src1_rows*nb1;
-        dst_row.nb[3] = num_src1_rows*nb1;
+        dst_row.nb[0] = sizeof(float);
+        dst_row.nb[1] = dst_nb1;
+        dst_row.nb[2] = num_src1_rows * dst_nb1;
+        dst_row.nb[3] = num_src1_rows * dst_nb1;
 
         {
             static int pre_mm_diag = 0;
@@ -4494,13 +4548,42 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         // Restore src0_row after sharp swap
         if (sharp_swapped) {
+            src0_row.ne[1] = src0->ne[1];
             src0_row.data = sharp_saved_data;
             src0_row.type = sharp_saved_type;
+            src0_row.buffer = src0->buffer;
             memcpy(src0_row.nb, sharp_saved_nb, sizeof(sharp_saved_nb));
             src0_row.ray_march_sharp_cache = src0->ray_march_sharp_cache;
         }
 
-        {
+        if (is_condensed_hit && n_alive_this > 0) {
+            // Condensed: scatter n_alive values to correct positions via alive_idx
+            uint64_t rk_scat = ctx.sharp_ring.key(src0, (int)i02);
+            auto ait = ctx.sharp_ring.alive_idx_gpu.find(rk_scat);
+            if (ait != ctx.sharp_ring.alive_idx_gpu.end()) {
+                launch_scatter_condensed_batch(
+                    (const float *)dst_contiguous.get(), dst_original,
+                    (const int32_t *)(dev_row_mapping.get() + mapping_offset),
+                    ait->second,
+                    n_alive_this, (int)num_src1_rows,
+                    nb1, nb2, stream);
+                CUDA_CHECK(cudaGetLastError());
+            }
+
+            // Queue ONLY dead rows for CPU PIM (GPU already handled alive rows)
+            if (ctx.pim_expert_pipe.enabled && cidx_outer) {
+                const char * host_ptr = pim_delta_cache_get(
+                    (struct pim_delta_cache *)src0->ray_march_sharp_cache, (int)i02);
+                if (host_ptr) {
+                    pim_expert_entry pe_entry = {(int)i02, host_ptr};
+                    generic_pim_experts.push_back(pe_entry);
+                    generic_pim_mapping pm_entry = {mapping_offset, num_src1_rows,
+                        cidx_outer->dead_idx, cidx_outer->n_dead};
+                    generic_pim_mappings.push_back(pm_entry);
+                }
+            }
+        } else {
+            // Normal: scatter all ne0 values
             dim3 block_dims(std::min((unsigned int)ne0, 768u));
             dim3 grid_dims(num_src1_rows);
             k_copy_dst_from_contiguous<<<grid_dims, block_dims, 0, stream>>>(
@@ -4511,7 +4594,8 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             CUDA_CHECK(cudaGetLastError());
         }
 
-        next_expert_generic:;
+        } // dst_ne0/dst_nb1 scope
+        } // if (!skip_gpu_matmul)
     }
 
     // PIM: batch-compute all ring-miss experts on CPU (generic loop path)
@@ -4576,14 +4660,45 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             std::vector<float> all_tokens_f32(n_unique * ne00_src);
             std::vector<uint8_t> all_tokens_quant(n_unique * dinput_row_size);
 
-            // Bulk D2H: fetch each unique src1 row
-            for (int i = 0; i < n_unique; i++) {
-                CUDA_CHECK(cudaMemcpy(all_tokens_f32.data() + i * ne00_src,
-                    src1_original + src1_gpu_offsets[i],
-                    token_f32_bytes, cudaMemcpyDeviceToHost));
+            // Bulk D2H: try to batch contiguous token ranges into fewer copies
+            if (n_unique > 0) {
+                // Sort offsets and check if they're contiguous
+                std::vector<std::pair<size_t,int>> sorted_offsets(n_unique);
+                for (int i = 0; i < n_unique; i++) sorted_offsets[i] = {src1_gpu_offsets[i], i};
+                std::sort(sorted_offsets.begin(), sorted_offsets.end());
+
+                // Batch contiguous ranges
+                int batch_start = 0;
+                while (batch_start < n_unique) {
+                    int batch_end = batch_start + 1;
+                    while (batch_end < n_unique &&
+                           sorted_offsets[batch_end].first ==
+                           sorted_offsets[batch_end-1].first + token_f32_bytes) {
+                        batch_end++;
+                    }
+                    int batch_count = batch_end - batch_start;
+                    size_t batch_bytes = batch_count * token_f32_bytes;
+
+                    // Single large D2H copy for this contiguous batch
+                    std::vector<float> batch_buf(batch_count * ne00_src);
+                    CUDA_CHECK(cudaMemcpy(batch_buf.data(),
+                        src1_original + sorted_offsets[batch_start].first,
+                        batch_bytes, cudaMemcpyDeviceToHost));
+
+                    // Distribute to correct positions in all_tokens_f32
+                    for (int bi = 0; bi < batch_count; bi++) {
+                        int orig_idx = sorted_offsets[batch_start + bi].second;
+                        memcpy(all_tokens_f32.data() + orig_idx * ne00_src,
+                               batch_buf.data() + bi * ne00_src, token_f32_bytes);
+                    }
+                    batch_start = batch_end;
+                }
             }
 
-            // Batch quantize
+            // Batch quantize (parallel, using configured PIM thread count)
+            const int n_pim_threads = pipe.n_threads > 0 ? pipe.n_threads
+                : std::max(1, (int)std::thread::hardware_concurrency());
+            #pragma omp parallel for schedule(static) num_threads(n_pim_threads)
             for (int i = 0; i < n_unique; i++) {
                 dit.from_float(all_tokens_f32.data() + i * ne00_src,
                                all_tokens_quant.data() + i * dinput_row_size, ne00_src);
@@ -4592,9 +4707,11 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             // Collect work items
             struct pim_work_item {
                 const char * expert_weights;
-                int quant_idx;   // index into all_tokens_quant
+                int quant_idx;          // index into all_tokens_quant
                 char * dst_ptr;
-                int64_t ne01;
+                int64_t ne01;           // total output rows
+                const uint16_t * dead_idx; // NULL = all rows, non-NULL = only these rows
+                int n_dead;             // number of dead rows (0 = all rows)
             };
             std::vector<pim_work_item> work_items;
 
@@ -4610,36 +4727,71 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     int tok_idx = src1_offset_to_idx[key];
                     char * dst_ptr = (char *)dst->data + rm.i1 * nb1 + rm.i2 * nb2;
 
-                    work_items.push_back({pe.weight_ptr, tok_idx, dst_ptr, ne01_src});
+                    work_items.push_back({pe.weight_ptr, tok_idx, dst_ptr, ne01_src,
+                                         pm.dead_idx, pm.n_dead});
                 }
             }
 
-            // Allocate result buffers (all at once to avoid realloc)
+            // Use iqk_mul_mat for batch matmul: computes ALL rows at once with
+            // internal SIMD tiling (4 rows at a time on AVX2). Much faster than
+            // per-row vec_dot. For condensed mode, compute all rows (not just dead)
+            // since IQK needs contiguous weights and the alive-row overhead is <2%.
             const int n_work = (int)work_items.size();
-            std::vector<float> all_results(n_work * ne0);
+            const size_t results_bytes = n_work * ne0 * sizeof(float);
 
-            // Parallel compute
+            // Use pinned memory for results — avoids CUDA's internal bounce buffer
+            // on H2D and enables cudaMemcpyAsync without blocking
+            if (results_bytes > pipe.pinned_results_cap) {
+                if (pipe.pinned_results) cudaFreeHost(pipe.pinned_results);
+                CUDA_CHECK(cudaMallocHost(&pipe.pinned_results, results_bytes));
+                pipe.pinned_results_cap = results_bytes;
+            }
+            float * all_results = pipe.pinned_results;
+
+            // Process work items using IQK batch matmul.
+            const int n_omp_threads = pipe.n_threads > 0 ? pipe.n_threads
+                : std::max(1, (int)std::thread::hardware_concurrency());
+
             for (int wi = 0; wi < n_work; wi++) {
                 const auto & w = work_items[wi];
-                float * rbuf = all_results.data() + wi * ne0;
                 const uint8_t * qinput = all_tokens_quant.data() + w.quant_idx * dinput_row_size;
+                float * rbuf = all_results + wi * ne0;
 
-                #pragma omp parallel for schedule(static) num_threads(16)
-                for (int64_t j = 0; j < w.ne01; j++) {
-                    float dot = 0.0f;
-                    sharp_traits.vec_dot((int)ne00_src, &dot, 0,
-                        w.expert_weights + j * sharp_row_stride, 0,
-                        qinput, 0, 1);
-                    rbuf[j] = dot;
+                bool iqk_ok = false;
+#if GGML_USE_IQK_MULMAT
+                #pragma omp parallel num_threads(n_omp_threads)
+                {
+                    int ith = omp_get_thread_num();
+                    int nth = omp_get_num_threads();
+                    iqk_mul_mat(
+                        /*Nx=*/ w.ne01, /*Ny=*/ 1, /*ne00=*/ ne00_src,
+                        /*typeA=*/ (int)stype, /*A=*/ w.expert_weights, /*strideA=*/ (long)sharp_row_stride,
+                        /*typeB=*/ (int)dinput_type, /*B=*/ qinput, /*strideB=*/ (long)dinput_row_size,
+                        /*C=*/ rbuf, /*stride_C=*/ (long)sizeof(float),
+                        /*ith=*/ ith, /*nth=*/ nth);
+                }
+                iqk_ok = true;
+#endif
+                if (!iqk_ok) {
+                    #pragma omp parallel for schedule(static) num_threads(n_omp_threads)
+                    for (int64_t j = 0; j < w.ne01; j++) {
+                        float dot = 0.0f;
+                        sharp_traits.vec_dot((int)ne00_src, &dot, 0,
+                            w.expert_weights + j * sharp_row_stride, 0,
+                            qinput, 0, 1);
+                        rbuf[j] = dot;
+                    }
                 }
             }
 
-            // Bulk H2D
+            // Bulk H2D: async write from pinned memory (no bounce buffer)
             for (int wi = 0; wi < n_work; wi++) {
-                CUDA_CHECK(cudaMemcpy(work_items[wi].dst_ptr,
-                    all_results.data() + wi * ne0,
-                    ne0 * sizeof(float), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpyAsync(work_items[wi].dst_ptr,
+                    all_results + wi * ne0,
+                    ne0 * sizeof(float), cudaMemcpyHostToDevice, stream));
             }
+            // Must sync before returning — next graph node reads dst
+            CUDA_CHECK(cudaStreamSynchronize(stream));
         }
 
         static int gen_pim_diag = 0;
@@ -4649,6 +4801,26 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     src0->name, generic_pim_experts.size(), (long long)ne11);
         } else {
             gen_pim_diag++;
+        }
+    }
+
+    // Tier breakdown diagnostic
+    {
+        static int tier_diag = 0;
+        tier_diag++;
+        if (tier_diag <= 10 || (tier_diag % 200 == 0)) {
+            auto & sr = ctx.sharp_ring;
+            int n_condensed = 0, n_full = 0;
+            for (auto & [k, v] : sr.slice_map) {
+                if (v.is_condensed) n_condensed++; else n_full++;
+            }
+            fprintf(stderr, "[tier#%d] %s: hits=%d misses=%d evict=%d pim=%zu "
+                    "ring=%.1f/%.1fMB (full=%d cond=%d)\n",
+                    tier_diag, src0->name, sr.n_hits, sr.n_misses, sr.n_evictions,
+                    generic_pim_experts.size(),
+                    sr.vram_used / (1024.0 * 1024.0),
+                    sr.vram_size / (1024.0 * 1024.0),
+                    n_full, n_condensed);
         }
     }
 
@@ -5113,7 +5285,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
                                                slice_bytes, cudaMemcpyHostToDevice,
                                                ctx.jit_upload_stream()));
                     sring.upload_pending = true;
-                    sring.slice_map[rk] = {off, slice_bytes, sring.token_counter, (int)i02};
+                    sring.slice_map[rk] = {off, slice_bytes, sring.token_counter, (int)i02, false};
                     sring.vram_used += slice_bytes;
                     sharp_ptr = (const char *)sring.vram + off;
                 } else if (host_ptr) {
@@ -5159,7 +5331,7 @@ static int ggml_cuda_moe_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_ten
                                                    slice_bytes, cudaMemcpyHostToDevice,
                                                    ctx.jit_upload_stream()));
                         sring.upload_pending = true;
-                        sring.slice_map[rk] = {off, slice_bytes, sring.token_counter, (int)i02};
+                        sring.slice_map[rk] = {off, slice_bytes, sring.token_counter, (int)i02, false};
                         sharp_ptr = (const char *)sring.vram + off;
                         sring.n_evictions++;
                     }
@@ -7781,11 +7953,13 @@ void ggml_backend_cuda_enable_sharp_ring(ggml_backend_t backend, bool enable) {
 
 // ---- PIM full expert: CPU-side MoE on ring miss ----
 
-void ggml_backend_cuda_enable_pim_experts(ggml_backend_t backend, bool enable) {
+void ggml_backend_cuda_enable_pim_experts(ggml_backend_t backend, bool enable, int n_threads) {
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)backend->context;
     ctx->pim_expert_pipe.enabled = enable;
+    ctx->pim_expert_pipe.n_threads = n_threads > 0 ? n_threads : (int)std::thread::hardware_concurrency();
     if (enable) {
-        fprintf(stderr, "[cuda-pim] PIM expert mode enabled: ring misses → CPU vec_dot from RAM\n");
+        fprintf(stderr, "[cuda-pim] PIM expert mode enabled: %d threads, ring misses → CPU vec_dot from RAM\n",
+                ctx->pim_expert_pipe.n_threads);
     }
 }
 

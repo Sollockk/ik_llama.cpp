@@ -80,7 +80,7 @@ GGML_API void ggml_backend_cuda_enable_sharp_ring(ggml_backend_t backend, bool e
 
 // PIM full expert: on ring cache miss, compute expert matmul on CPU from
 // RAM-resident weights instead of uploading to VRAM.  3000x PCIe reduction.
-GGML_API void ggml_backend_cuda_enable_pim_experts(ggml_backend_t backend, bool enable);
+GGML_API void ggml_backend_cuda_enable_pim_experts(ggml_backend_t backend, bool enable, int n_threads);
 
 // Condensed expert ring: store only N important rows per expert in VRAM ring.
 // GPU computes N rows instantly, CPU fills remaining rows from RAM in parallel.
